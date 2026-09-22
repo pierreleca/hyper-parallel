@@ -78,6 +78,7 @@ class _BaseHyperAutoModelClass:
         cls,
         pretrained_model_name_or_path: str,
         *model_args: Any,
+        config: Optional[PretrainedConfig] = None,
         distributed_setup: Optional[DistributedSetup] = None,
         backend: Optional[Any] = None,
         peft_config: Optional[Any] = None,
@@ -104,6 +105,11 @@ class _BaseHyperAutoModelClass:
         ③ AutoConfig.from_pretrained → hf_config
         ④ get_is_hf_model → custom/HF path
         ⑤ _build_model → meta + shard + load
+
+        As in Transformers, a ``config`` passed by the caller replaces step ③
+        and is used as given. Checkpoint tensors that it does not declare,
+        such as the layers beyond a reduced ``num_hidden_layers``, are skipped
+        with a warning.
         """
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
@@ -122,9 +128,12 @@ class _BaseHyperAutoModelClass:
         )
 
         # ③ Get HF config
-        hf_config = get_hf_config(
-            pretrained_model_name_or_path, attn_implementation, torch_dtype, **kwargs
-        )
+        if config is None:
+            hf_config = get_hf_config(
+                pretrained_model_name_or_path, attn_implementation, torch_dtype, **kwargs
+            )
+        else:
+            hf_config = config
 
         # ④ Determine model path
         is_hf_model = get_is_hf_model(hf_config, force_hf)

@@ -16,6 +16,8 @@
 
 - ``allow_uncovered_params`` reaches the sharding planner through the
   ``DistributedSetup`` that infrastructure is built from.
+- A ``config`` passed to ``from_pretrained`` is used as given, as in
+  Transformers; without one the configuration is read from the checkpoint path.
 
 Infrastructure and the model build are mocked, so no checkpoint, Hub access or
 device is needed.
@@ -99,6 +101,47 @@ class TestAllowUncoveredParams(_MockedBuildTestCase):
 
         flag = getattr(setup, "allow_uncovered_params", False)
         self.assertFalse(flag, f"allow_uncovered_params must default to off, got {flag}")
+
+
+class TestFromPretrainedConfig(_MockedBuildTestCase):
+    """Which configuration ``from_pretrained`` builds the model with."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_supplied_config_is_used_as_given(self):
+        """A caller's config skips resolution and is the one the model is built with."""
+        supplied = SimpleNamespace(architectures=["Supplied"], num_hidden_layers=12)
+
+        auto_model.HyperAutoModelForCausalLM.from_pretrained(
+            _PATH, config=supplied, local_files_only=True
+        )
+
+        self.assertEqual(self.get_hf_config.call_count, 0,
+                         f"get_hf_config called {self.get_hf_config.call_count} times with a supplied config")
+        build_kwargs = self.build_model.call_args.kwargs
+        self.assertIs(build_kwargs["hf_config"], supplied,
+                      f"expected the supplied config, got {build_kwargs['hf_config']}")
+        self.assertNotIn("config", build_kwargs,
+                         f"config must not also reach the build kwargs: {sorted(build_kwargs)}")
+        self.assertEqual(build_kwargs["local_files_only"], True,
+                         f"loading kwargs must still reach the build: {build_kwargs}")
+        self.assertEqual(self.build_model.call_args.args, (_PATH,),
+                         f"expected the checkpoint path, got {self.build_model.call_args.args}")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_config_is_read_from_path_by_default(self):
+        """Without a config, the one resolved from the checkpoint path is built."""
+        auto_model.HyperAutoModelForCausalLM.from_pretrained(
+            _PATH, attn_implementation="eager", torch_dtype="bfloat16", local_files_only=True
+        )
+
+        self.get_hf_config.assert_called_once_with(
+            _PATH, "eager", "bfloat16", local_files_only=True
+        )
+        build_config = self.build_model.call_args.kwargs["hf_config"]
+        self.assertIs(build_config, self.read_config,
+                      f"expected the config read from the path, got {build_config}")
 
 
 if __name__ == "__main__":
