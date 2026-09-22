@@ -93,6 +93,7 @@ class _BaseHyperAutoModelClass:
         swap_inputs: bool = False,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
+        allow_uncovered_params: bool = False,
         **kwargs: Any,
     ) -> PreTrainedModel:
         """HF-compatible from_pretrained entry point.
@@ -106,6 +107,12 @@ class _BaseHyperAutoModelClass:
         """
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
+        if allow_uncovered_params:
+            # Planner coverage escape hatch (read by instantiate_infrastructure):
+            # parameters that no sharding spec declares stay plain FSDP
+            # parameters, and the plan-time coverage check warns instead of
+            # failing.
+            distributed_setup.allow_uncovered_params = True
         mesh = distributed_setup.mesh_context
 
         # ② Instantiate infrastructure
@@ -169,6 +176,7 @@ class _BaseHyperAutoModelClass:
         swap_inputs: bool = False,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
+        allow_uncovered_params: bool = False,
         **kwargs: Any,
     ) -> PreTrainedModel:
         """Build model from PretrainedConfig (no weight loading).
@@ -177,6 +185,12 @@ class _BaseHyperAutoModelClass:
         """
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
+        if allow_uncovered_params:
+            # Planner coverage escape hatch (read by instantiate_infrastructure):
+            # parameters that no sharding spec declares stay plain FSDP
+            # parameters, and the plan-time coverage check warns instead of
+            # failing.
+            distributed_setup.allow_uncovered_params = True
         mesh = distributed_setup.mesh_context
 
         sharding_planner, fsdp2_manager = instantiate_infrastructure(
