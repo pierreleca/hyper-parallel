@@ -1,0 +1,266 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+# Licensed under the Apache License, Version 2.0
+# ============================================================================
+"""Expert-parallel imbalance instrumentation: recorder and its analysis.
+
+The recorder is exercised single-process on CPU, where it falls back to the
+host clock and reports no allocator bytes; the analysis is exercised on
+synthetic records with a known imbalance, so the reported factors can be
+checked against arithmetic.
+"""
+
+# The recorder is a module-level singleton and the tests read its private
+# bookkeeping to assert what it captured.
+# pylint: disable=protected-access
+
+import importlib.util
+import json
+import pathlib
+import socket
+
+import pytest
+import torch
+import torch.distributed as dist
+from torch import nn
+
+from hyper_parallel.distributed.expert_parallel.experts import (
+    bind_local_expert_forward,
+    ep_routed_forward,
+)
+from hyper_parallel.distributed.expert_parallel.instrument import EP_INSTRUMENT
+from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
+
+_ANALYZER = pathlib.Path(__file__).parents[3] / "examples" / "qwen3_vl_30b_perf" / "analyze_ep_instrument.py"
+
+
+def _load_analyzer():
+    """Import the example analysis script by path."""
+    spec = importlib.util.spec_from_file_location("analyze_ep_instrument", _ANALYZER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _Experts(nn.Module):
+    """Stacked SwiGLU experts in the fused gate_up layout."""
+
+    def __init__(self, num_experts=8, hidden=16, inter=8):
+        """Create expert weights small enough for a CPU test."""
+        super().__init__()
+        self.num_experts = num_experts
+        self.gate_up_proj = nn.Parameter(torch.randn(num_experts, 2 * inter, hidden) * 0.02)
+        self.down_proj = nn.Parameter(torch.randn(num_experts, hidden, inter) * 0.02)
+
+
+class _Moe(nn.Module):
+    """Minimal MoE block with the interface ep_routed_forward expects."""
+
+    def __init__(self, num_experts=8, hidden=16, inter=8, top_k=2):
+        """Build the router and the stacked experts."""
+        super().__init__()
+        self.gate = nn.Linear(hidden, num_experts, bias=False)
+        self.experts = _Experts(num_experts, hidden, inter)
+        self.top_k = top_k
+
+
+@pytest.fixture(name="world_one_group")
+def fixture_world_one_group():
+    """Provide a single-process gloo group for the all-to-all primitives."""
+    created = False
+    if not dist.is_initialized():
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        dist.init_process_group(
+            "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=0, world_size=1
+        )
+        created = True
+    yield dist.group.WORLD
+    if created:
+        dist.destroy_process_group()
+
+
+@pytest.fixture(name="recorder_off")
+def fixture_recorder_off():
+    """Leave the module-level recorder disabled after each test."""
+    yield
+    EP_INSTRUMENT.configure(enabled=False, output_dir="")
+    EP_INSTRUMENT.close()
+    EP_INSTRUMENT._header_written = False
+
+
+def test_recorder_captures_every_pass(tmp_path, world_one_group, recorder_off):
+    """A checkpointed step yields forward, recompute and backward records."""
+    from hyper_parallel.core.activation_memory.checkpoint import checkpoint
+
+    EP_INSTRUMENT.configure(
+        enabled=True, output_dir=str(tmp_path), align_steps=False
+    )
+    model = nn.ModuleList([_Moe(), _Moe()])
+    for block in model:
+        bind_local_expert_forward(block, ep_size=1)
+    EP_INSTRUMENT.register_modules(model)
+
+    EP_INSTRUMENT.begin_step(1)
+    hidden = torch.randn(1, 6, 16, requires_grad=True)
+    out = hidden
+    for block in model:
+        out = checkpoint(
+            lambda x, block=block: ep_routed_forward(
+                block, x, router_fn=MOE_ROUTER_ADAPTERS["default"],
+                ep_group=world_one_group,
+            ),
+            out,
+        )
+    out.sum().backward()
+    record = EP_INSTRUMENT.end_step()
+    EP_INSTRUMENT.close()
+
+    passes = {mark[1] for mark in record["marks"]}
+    assert passes == {"step", "fwd", "recompute", "bwd"}, "every pass is recorded"
+    fwd_names = [mark[3] for mark in record["marks"] if mark[1] == "fwd" and mark[0] == 0]
+    assert fwd_names == ["start", "routed", "dispatched", "experts", "combined", "end"]
+    bwd_names = [mark[3] for mark in record["marks"] if mark[1] == "bwd" and mark[0] == 0]
+    assert bwd_names == ["start", "aggregate", "combine", "experts", "dispatch", "end"]
+    assert [mark[4] for mark in record["marks"]] == sorted(mark[4] for mark in record["marks"]), \
+        "stamps are resolved in recording order"
+
+    forward_calls = [call for call in record["calls"] if call["pass"] == "fwd"]
+    assert len(forward_calls) == 2, "one forward call per MoE block"
+    for call in forward_calls:
+        assert sum(call["expert_counts"]) == call["tokens"] * call["top_k"]
+        assert sum(call["send"]) == sum(call["recv"]) == call["tokens"] * call["top_k"]
+    assert all("expert_counts" not in call for call in record["calls"]
+               if call["pass"] == "recompute"), "counts are taken once per step"
+
+    digest = EP_INSTRUMENT.step_summary(record)
+    assert digest["pairs"] == sum(sum(call["recv"]) for call in forward_calls)
+    assert digest["fwd_ms"] > 0 and digest["recompute_ms"] > 0 and digest["bwd_ms"] > 0
+
+    lines = [
+        json.loads(line)
+        for line in (tmp_path / "rank000.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert lines[0]["kind"] == "header"
+    assert lines[0]["layers"] == {"0": "0", "1": "1"}
+    assert lines[0]["num_experts"] == 8 and lines[0]["intermediate"] == 8
+    assert lines[1]["kind"] == "step" and lines[1]["step"] == 1
+
+
+def test_disabled_recorder_leaves_the_forward_untouched(world_one_group, recorder_off):
+    """With the recorder off, the routed forward records nothing."""
+    EP_INSTRUMENT.configure(enabled=False, output_dir="")
+    block = _Moe()
+    bind_local_expert_forward(block, ep_size=1)
+    hidden = torch.randn(1, 4, 16, requires_grad=True)
+    out = ep_routed_forward(
+        block, hidden, router_fn=MOE_ROUTER_ADAPTERS["default"], ep_group=world_one_group
+    )
+    out.sum().backward()
+    assert EP_INSTRUMENT.open_call(block, world_one_group) is None
+    assert EP_INSTRUMENT.end_step() is None
+
+
+def test_fold_peaks_survives_segment_resets(recorder_off):
+    """The recorder returns its own running peak once it resets the counters."""
+    EP_INSTRUMENT.configure(enabled=True, output_dir="", segment_peaks=True)
+    EP_INSTRUMENT._run_peaks = [4096, 8192]
+    assert EP_INSTRUMENT.fold_peaks(10, 20) == (4096, 8192)
+    assert EP_INSTRUMENT.fold_peaks(9000, 100) == (9000, 8192)
+    EP_INSTRUMENT.configure(enabled=True, output_dir="", segment_peaks=False)
+    assert EP_INSTRUMENT.fold_peaks(10, 20) == (10, 20), "untouched when peaks are not read"
+
+
+def _synthetic_records(directory, loads, peaks):
+    """Write one file per rank with a known load and memory profile.
+
+    Rank ``r`` receives ``loads[r]`` pairs in every layer, its expert GEMM
+    lasts one millisecond per ten pairs, and its step peak is ``peaks[r]``.
+    """
+    for rank, load in enumerate(loads):
+        header = {
+            "kind": "header", "rank": rank, "world_size": len(loads), "host": "test",
+            "device_type": "npu", "time_source": "device", "segment_peaks": True,
+            "layers": {"0": "layers.0", "1": "layers.1"},
+            "num_experts": 8, "top_k": 2, "hidden": 16, "element_size": 2,
+            "local_experts": 2, "intermediate": 8, "expert_element_size": 2,
+        }
+        lines = [json.dumps(header)]
+        for step in (1, 2):
+            marks, calls, time_ms = [[-1, "step", 0, "start", 0.0, 0, 0]], [], 1.0
+            for layer in (0, 1):
+                for name, span in (("start", 0.0), ("routed", 1.0), ("dispatched", 1.0),
+                                   ("experts", load / 10.0), ("combined", 1.0), ("end", 0.5)):
+                    time_ms += span
+                    marks.append([layer, "fwd", 0, name, round(time_ms, 3), 0, peaks[rank]])
+                time_ms += 3.0  # the gap a transfer could hide in
+                calls.append({
+                    "layer": layer, "pass": "fwd", "occurrence": 0, "tokens": 100,
+                    "top_k": 2, "hidden": 16, "send": [load], "recv": [load],
+                    "expert_counts": [load // 8] * 8,
+                })
+            marks.append([-1, "step", 0, "end", round(time_ms, 3), 0, peaks[rank]])
+            lines.append(json.dumps({
+                "kind": "step", "step": step, "wall_s": 0.1,
+                "memory": {"step_peak_allocated": peaks[rank], "step_peak_reserved": peaks[rank]},
+                "marks": marks, "calls": calls,
+            }))
+        (directory / f"rank{rank:03d}.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_analysis_reports_known_imbalance(tmp_path, capsys):
+    """The analysis recovers the imbalance, the idle time and the headroom."""
+    analyzer = _load_analyzer()
+    loads = [150, 100, 80, 70]  # mean 100, so lambda = 1.5
+    peaks = [8 * 1024 ** 3, 6 * 1024 ** 3, 6 * 1024 ** 3, 6 * 1024 ** 3]
+    _synthetic_records(tmp_path, loads, peaks)
+
+    headers, steps = analyzer.load_records(str(tmp_path), skip=0)
+    collected = analyzer.collect(headers, steps)
+    table = analyzer._by_step_layer(collected["rows"])
+    out = []
+
+    routing = analyzer.report_routing(table, collected["ranks"], out)
+    assert routing["lambda_mean"] == pytest.approx(1.5), "max / mean of the loads"
+    assert routing["lambda_max"] == pytest.approx(1.5)
+    assert "r0 100%" in "\n".join(out), "rank 0 is always the busiest"
+
+    persistence = analyzer.report_persistence(collected, out)
+    assert persistence["lambda_step_mean"] == pytest.approx(1.5), "same rank in every layer"
+
+    timing = analyzer.report_time(table, collected["ranks"], out)
+    assert timing["expert_time_lambda_mean"] == pytest.approx(1.5), "time follows the load"
+    # Rank 3 waits (150 - 70) / 10 ms per layer, over two layers.
+    assert timing["idle_ms_per_step"]["3"] == pytest.approx(16.0)
+    assert timing["idle_ms_per_step"]["0"] == pytest.approx(0.0)
+
+    memory = analyzer.report_memory(collected, out)
+    assert memory["peak_allocated_gib"]["0"] == pytest.approx(8.0)
+    assert memory["peak_spread_gib"] == pytest.approx(2.0)
+
+    offload = analyzer.report_offload(collected, headers, table, out)
+    # (hidden 16 + 3 x intermediate 8) x 2 B = 80 B per pair, 50 pairs above the mean.
+    assert offload["bytes_per_pair"] == 80
+    assert offload["excess_mib_per_layer"] == pytest.approx(50 * 80 / 1024 ** 2)
+    assert offload["median_gap_ms"] == pytest.approx(3.0)
+
+    analyzer.write_outputs(collected, str(tmp_path / "analysis"))
+    rows = (tmp_path / "analysis" / "layer_step.csv").read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 1 + len(loads) * 2 * 2, "header, then one row per rank, layer and step"
+    capsys.readouterr()
+
+
+def test_analysis_subtracts_the_recompute_from_the_backward(tmp_path):
+    """Recompute time inside a backward phase is not counted twice."""
+    analyzer = _load_analyzer()
+    marks = [
+        [0, "bwd", 0, "start", 0.0, 0, 0],
+        [0, "recompute", 0, "start", 1.0, 0, 0],
+        [0, "recompute", 0, "end", 4.0, 0, 0],
+        [0, "bwd", 0, "aggregate", 5.0, 0, 0],
+        [0, "bwd", 0, "combine", 6.0, 0, 0],
+    ]
+    times = analyzer.phase_times({"marks": marks})
+    assert times[(0, "bwd", "aggregate bwd")] == pytest.approx(2.0), "5 ms minus 3 ms of recompute"
+    assert times[(0, "bwd", "combine a2a bwd")] == pytest.approx(1.0)
+    assert tmp_path.exists()

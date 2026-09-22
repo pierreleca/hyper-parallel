@@ -48,6 +48,7 @@ from hyper_parallel.distributed._builder.forward_rewriter import (
 from hyper_parallel.distributed.expert_parallel.collectives import (
     ep_all_to_all,
 )
+from hyper_parallel.distributed.expert_parallel.instrument import EP_INSTRUMENT
 
 
 @dataclass(frozen=True)
@@ -269,14 +270,32 @@ def _run_ep_local_experts(
     receive_counts: list[int],
     ep_group: Any,
     expert_offset: int,
+    probe: Any = None,
 ) -> torch.Tensor:
-    """Dispatch tokens, run local experts, and return combined expert outputs."""
+    """Dispatch tokens, run local experts, and return combined expert outputs.
+
+    ``probe`` is the optional measurement handle of
+    ``expert_parallel.instrument``: it marks the boundary between the two
+    all-to-alls and the local experts, in this pass and in the backward one.
+    """
+    if probe is not None:
+        dispatched_states = probe.wrap(dispatched_states, "dispatch")
     received_states = ep_all_to_all(dispatched_states, send_counts, receive_counts, ep_group)
     received_indices = ep_all_to_all(
         dispatched_indices, send_counts, receive_counts, ep_group
     ).squeeze(-1)
+    if probe is not None:
+        probe.mark("dispatched")
+        received_states = probe.wrap(received_states, "experts")
     local_outputs = module.experts(received_states, received_indices - expert_offset)
-    return ep_all_to_all(local_outputs.contiguous(), receive_counts, send_counts, ep_group)
+    if probe is not None:
+        probe.mark("experts")
+        local_outputs = probe.wrap(local_outputs, "combine")
+    combined = ep_all_to_all(local_outputs.contiguous(), receive_counts, send_counts, ep_group)
+    if probe is None:
+        return combined
+    probe.mark("combined")
+    return probe.wrap(combined, "aggregate")
 
 
 def _aggregate_ep_outputs(
@@ -352,6 +371,11 @@ def ep_routed_forward(
     global_expert_count = local_expert_count * ep_size
     expert_offset = ep_rank * local_expert_count
 
+    probe = EP_INSTRUMENT.open_call(module, ep_group)
+    if probe is not None:
+        hidden_states = probe.wrap(hidden_states, "end")
+        probe.mark("start")
+
     output_shape = tuple(hidden_states.shape)
     topk_indices, topk_weights = router_fn(module, hidden_states)  # [T, K]
     dispatch = _prepare_ep_dispatch(
@@ -363,6 +387,15 @@ def ep_routed_forward(
         ep_size=ep_size,
         ep_group=ep_group,
     )
+    if probe is not None:
+        probe.routing(
+            topk_indices=topk_indices,
+            hidden_states=hidden_states,
+            send_counts=dispatch.send_counts,
+            receive_counts=dispatch.receive_counts,
+            global_expert_count=global_expert_count,
+        )
+        probe.mark("routed")
     combined_expert_outputs = _run_ep_local_experts(
         module,
         dispatch.states,
@@ -371,14 +404,20 @@ def ep_routed_forward(
         dispatch.receive_counts,
         ep_group,
         expert_offset,
+        probe=probe,
     )
-    return _aggregate_ep_outputs(
+    output = _aggregate_ep_outputs(
         combined_expert_outputs,
         dispatch.expert_weights,
         dispatch.source_indices,
         dispatch.dispatch_order,
         output_shape,
     )
+    if probe is None:
+        return output
+    output = probe.wrap(output, "start")
+    probe.mark("end")
+    return output
 
 
 def require_attrs(module: Any, *names: str, owner: str = "") -> None:

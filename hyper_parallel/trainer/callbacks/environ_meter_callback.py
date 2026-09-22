@@ -20,6 +20,7 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from hyper_parallel.distributed.expert_parallel.instrument import EP_INSTRUMENT
 from hyper_parallel.trainer.runtime.distributed import get_world_size_safe
 from hyper_parallel.trainer.runtime.distributed import all_reduce
 from hyper_parallel.data.constants import IGNORE_INDEX
@@ -217,8 +218,15 @@ class EnvironMeterCallback(Callback):
         if get_device_type() == "cpu":
             return {}
         device = get_torch_device()
-        allocated = self._reduce(device.max_memory_allocated(), op="max")
-        reserved = self._reduce(device.max_memory_reserved(), op="max")
+        # The EP instrument reads a peak per phase, which resets the
+        # allocator's peak counters; it keeps the running peaks so this
+        # metric still reports the peak of the whole run.
+        local_allocated, local_reserved = EP_INSTRUMENT.fold_peaks(
+            device.max_memory_allocated(),
+            device.max_memory_reserved(),
+        )
+        allocated = self._reduce(local_allocated, op="max")
+        reserved = self._reduce(local_reserved, op="max")
         gibibyte = 1024 ** 3
         return {
             "memory/device_max_allocated_gb": allocated / gibibyte,
