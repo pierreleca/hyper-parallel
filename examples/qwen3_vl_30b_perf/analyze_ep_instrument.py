@@ -170,6 +170,30 @@ def moe_gaps(record: dict) -> list[float]:
     ]
 
 
+def layer_memory(record: dict) -> dict[int, tuple[int, int]]:
+    """Return {layer: (retained, transient)} bytes of the forward pass of one step.
+
+    ``retained`` is what the MoE block leaves allocated: its output, plus the
+    tensors saved for backward when the block is not recomputed. ``transient``
+    is the highest the allocator went above the block's starting point while
+    the block ran.
+    """
+    starts: dict[int, int] = {}
+    highest: dict[int, int] = {}
+    result: dict[int, tuple[int, int]] = {}
+    for layer, pass_name, occurrence, name, _time_ms, alloc, peak in record["marks"]:
+        if layer < 0 or pass_name != "fwd" or occurrence != 0 or alloc is None:
+            continue
+        if name == "start":
+            starts[layer] = alloc
+            highest[layer] = alloc
+        elif layer in starts:
+            highest[layer] = max(highest[layer], peak or alloc, alloc)
+            if name == "end":
+                result[layer] = (alloc - starts[layer], highest[layer] - starts[layer])
+    return result
+
+
 def imbalance(values: list[float]) -> float:
     """Return max / mean, the imbalance factor used throughout the report."""
     mean = statistics.fmean(values) if values else 0.0
@@ -186,6 +210,7 @@ def collect(headers: dict, steps: dict) -> dict[str, Any]:
             step = record["step"]
             times = phase_times(record)
             loads = call_loads(record)
+            memory_by_layer = layer_memory(record)
             memory = record.get("memory", {})
             per_step_rank[(step, rank)] = {
                 "wall_s": record.get("wall_s"),
@@ -204,6 +229,8 @@ def collect(headers: dict, steps: dict) -> dict[str, Any]:
                     "send": load["send"],
                     "tokens": load["tokens"],
                     "expert_counts": load["expert_counts"],
+                    "retained": memory_by_layer.get(layer, (None, None))[0],
+                    "transient": memory_by_layer.get(layer, (None, None))[1],
                 }
                 for pass_name, phases in (("fwd", FWD_PHASES), ("recompute", FWD_PHASES),
                                           ("bwd", BWD_PHASES)):
@@ -423,6 +450,109 @@ def report_offload(
     return summary
 
 
+def report_layer_memory(table: dict, ranks: list[int], out: list[str]) -> dict[str, Any]:
+    """Report each MoE block's own memory cost, per rank.
+
+    With the block recomputed, ``retained`` is little more than its output;
+    without, it is the activations the block saves, which scale with the
+    tokens the rank received in that layer.
+    """
+    per_layer: dict[int, dict[int, list[tuple[int, int, int]]]] = {}
+    for (_step, layer), per_rank in table.items():
+        for rank, row in per_rank.items():
+            if row.get("retained") is not None:
+                per_layer.setdefault(layer, {}).setdefault(rank, []).append(
+                    (row["retained"], row["transient"], row["recv"])
+                )
+    if not per_layer:
+        return {}
+    mib = 1024 ** 2
+    out.append("MEMORY PER MoE BLOCK (forward pass, MiB, mean over steps)")
+    out.append("  layer  retained per rank" + " " * 26 + "max/mean  transient max  B/pair")
+    retained_totals = {rank: 0.0 for rank in ranks}
+    factors, bytes_per_pair = [], []
+    for layer in sorted(per_layer):
+        retained = {
+            rank: statistics.fmean(entry[0] for entry in per_layer[layer].get(rank, [(0, 0, 0)]))
+            for rank in ranks
+        }
+        transient = max(entry[1] for entries in per_layer[layer].values() for entry in entries)
+        pairs = [entry for entries in per_layer[layer].values() for entry in entries if entry[2]]
+        per_pair = statistics.median(entry[0] / entry[2] for entry in pairs) if pairs else 0.0
+        for rank in ranks:
+            retained_totals[rank] += retained[rank]
+        factor = imbalance(list(retained.values()))
+        factors.append(factor)
+        bytes_per_pair.append(per_pair)
+        out.append(
+            f"  L{layer:<5}" + "".join(f"{retained[rank] / mib:9.1f}" for rank in ranks)
+            + f"{factor:12.2f}{transient / mib:14.1f}{per_pair:9.0f}"
+        )
+    summary = {
+        "retained_lambda_per_layer_mean": statistics.fmean(factors),
+        "retained_lambda_summed": imbalance(list(retained_totals.values())),
+        "retained_bytes_per_pair": statistics.median(bytes_per_pair),
+    }
+    out.append(
+        f"  per-layer max/mean {summary['retained_lambda_per_layer_mean']:.2f}, "
+        f"summed over layers {summary['retained_lambda_summed']:.2f}"
+    )
+    return summary
+
+
+def report_capacity(
+        table: dict,
+        ranks: list[int],
+        per_pair: float,
+        per_pair_source: str,
+        out: list[str],
+) -> list[dict[str, float]]:
+    """Sweep a per-rank capacity: memory reserved against tokens over capacity.
+
+    A capacity factor C sizes every rank's MoE buffers for C times the mean
+    load of a layer. Tokens above it are dropped, or with host overflow, keep
+    their activations in host memory; the sweep reports both sides.
+    """
+    loads_all = [row["recv"] for per_rank in table.values() for row in per_rank.values()]
+    if not loads_all:
+        return []
+    mean_load = statistics.fmean(loads_all)
+    mib = 1024 ** 2
+    host_bandwidth = 26e9  # A2, one NPU's host link used alone (only the hot rank spills)
+    out.append(f"CAPACITY SWEEP (per rank and layer; {per_pair:.0f} B per routed pair, {per_pair_source})")
+    out.append("  C     reserved MiB   layers over   tokens over   hot-rank spill MiB   host ms")
+    out.append("                                                    mean      max          max")
+    rows = []
+    for factor in (1.0, 1.1, 1.2, 1.3, 1.5, 1.75, 2.0):
+        over, total, spilling, spills = 0.0, 0.0, 0, []
+        for per_rank in table.values():
+            loads = [per_rank[rank]["recv"] for rank in ranks if rank in per_rank]
+            if len(loads) < len(ranks) or not sum(loads):
+                continue
+            capacity = factor * statistics.fmean(loads)
+            excess = [max(0.0, load - capacity) for load in loads]
+            over += sum(excess)
+            total += sum(loads)
+            spilling += any(excess)
+            spills.append(max(excess) * per_pair)
+        row = {
+            "capacity_factor": factor,
+            "reserved_mib": factor * mean_load * per_pair / mib,
+            "layers_over_share": spilling / max(1, len(spills)),
+            "tokens_over_share": over / total if total else 0.0,
+            "hot_spill_mean_mib": statistics.fmean(spills) / mib if spills else 0.0,
+            "hot_spill_max_mib": max(spills) / mib if spills else 0.0,
+        }
+        row["host_ms_max"] = row["hot_spill_max_mib"] * mib / host_bandwidth * 1e3
+        rows.append(row)
+        out.append(
+            f"  {factor:<5.2f}{row['reserved_mib']:10.0f}{row['layers_over_share']:13.0%}"
+            f"{row['tokens_over_share']:14.2%}{row['hot_spill_mean_mib']:11.1f}"
+            f"{row['hot_spill_max_mib']:9.1f}{row['host_ms_max']:13.1f}"
+        )
+    return rows
+
+
 def write_csv(path: str, rows: list[dict], columns: list[str]) -> None:
     """Write one CSV with the given column order."""
     with open(path, "w", encoding="utf-8", newline="") as stream:
@@ -540,6 +670,20 @@ def main() -> int:
     summary["memory"] = report_memory(collected, out)
     out.append("")
     summary["offload"] = report_offload(collected, headers, table, out, args.intermediate)
+    out.append("")
+    summary["layer_memory"] = report_layer_memory(table, collected["ranks"], out)
+    out.append("")
+    estimate = summary["offload"].get("bytes_per_pair", 0)
+    measured = summary["layer_memory"].get("retained_bytes_per_pair", 0)
+    # A measured cost close to the estimate means the block was not recomputed
+    # and its saved activations are what the allocator saw; otherwise the
+    # retained bytes are only the block's output.
+    if measured and measured >= 0.5 * estimate:
+        per_pair, source = measured, "measured, MoE block not recomputed"
+    else:
+        per_pair, source = estimate, "estimated, MoE block recomputed"
+    if per_pair:
+        summary["capacity"] = report_capacity(table, collected["ranks"], per_pair, source, out)
     print("\n".join(out))
 
     out_dir = args.out_dir or os.path.join(args.record_dir, "analysis")

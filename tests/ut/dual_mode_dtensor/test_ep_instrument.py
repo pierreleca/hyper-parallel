@@ -192,7 +192,9 @@ def _synthetic_records(directory, loads, peaks):
                 for name, span in (("start", 0.0), ("routed", 1.0), ("dispatched", 1.0),
                                    ("experts", load / 10.0), ("combined", 1.0), ("end", 0.5)):
                     time_ms += span
-                    marks.append([layer, "fwd", 0, name, round(time_ms, 3), 0, peaks[rank]])
+                    # The block keeps 4 KiB per routed pair once it ends.
+                    alloc = 2 ** 30 + (load * 4096 if name == "end" else 0)
+                    marks.append([layer, "fwd", 0, name, round(time_ms, 3), alloc, peaks[rank]])
                 time_ms += 3.0  # the gap a transfer could hide in
                 calls.append({
                     "layer": layer, "pass": "fwd", "occurrence": 0, "tokens": 100,
@@ -303,3 +305,30 @@ def test_register_modules_reads_the_grouped_experts_layout(recorder_off):
     EP_INSTRUMENT._experts = {}
     EP_INSTRUMENT.register_modules(nn.ModuleList([block]))
     assert EP_INSTRUMENT._experts["intermediate"] == 12
+
+
+def test_analysis_reports_layer_memory_and_capacity(tmp_path, capsys):
+    """Per-block memory follows the load, and the capacity sweep spills the excess."""
+    analyzer = _load_analyzer()
+    loads = [150, 100, 80, 70]
+    _synthetic_records(tmp_path, loads, [2 ** 31] * 4)
+    headers, steps = analyzer.load_records(str(tmp_path), skip=0)
+    collected = analyzer.collect(headers, steps)
+    table = analyzer._by_step_layer(collected["rows"])
+    out = []
+
+    layer_memory = analyzer.report_layer_memory(table, collected["ranks"], out)
+    assert layer_memory["retained_bytes_per_pair"] == pytest.approx(4096)
+    assert layer_memory["retained_lambda_per_layer_mean"] == pytest.approx(1.5)
+    assert layer_memory["retained_lambda_summed"] == pytest.approx(1.5)
+
+    rows = {row["capacity_factor"]: row for row in analyzer.report_capacity(
+        table, collected["ranks"], 4096, "measured", out)}
+    # Mean load 100: at C = 1 rank 0 is 50 pairs over, 50 / 400 of the tokens.
+    assert rows[1.0]["tokens_over_share"] == pytest.approx(0.125)
+    assert rows[1.0]["layers_over_share"] == pytest.approx(1.0)
+    assert rows[1.0]["hot_spill_max_mib"] == pytest.approx(50 * 4096 / 1024 ** 2)
+    assert rows[1.2]["tokens_over_share"] == pytest.approx(30 / 400)
+    assert rows[1.5]["tokens_over_share"] == 0.0 and rows[1.5]["hot_spill_max_mib"] == 0.0
+    assert rows[1.5]["reserved_mib"] == pytest.approx(1.5 * 100 * 4096 / 1024 ** 2)
+    capsys.readouterr()
