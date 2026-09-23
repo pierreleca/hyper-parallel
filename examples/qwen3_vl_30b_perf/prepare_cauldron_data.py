@@ -62,7 +62,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
-import pyarrow.parquet as pq
 from PIL import Image
 
 _REPO = "HuggingFaceM4/the_cauldron"
@@ -119,7 +118,15 @@ def _plain(text: str) -> str:
 
 
 def read_conversations(files: list[tuple[str, Path]]) -> list[Conversation]:
-    """Load every conversation of the downloaded subsets."""
+    """Load every conversation of the downloaded subsets.
+
+    pyarrow is imported here, after the tokenizer has imported torch: a pip
+    pyarrow wheel loads the system libstdc++, and once that older copy is in
+    the process, torch_npu's own imports (sqlite3 through the environment's
+    ICU) fail to find the C++ ABI they need.
+    """
+    import pyarrow.parquet as pq  # pylint: disable=import-outside-toplevel
+
     conversations = []
     for subset, path in files:
         table = pq.read_table(path, columns=["images", "texts"])
