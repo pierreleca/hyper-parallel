@@ -16,6 +16,13 @@
 # moments and add roughly 10 GiB of MoE activations. If that still runs out of
 # memory, --model.num_hidden_layers=4 leaves about 7 GiB more room.
 #
+# Fragmentation: the MoE buffers change size every step with the routing, and
+# the first 6-layer run failed at step 21 asking for the 9.28 GiB fp32 logits
+# gradient with 42.5 GiB allocated, 53.5 GiB reserved and only 6 GiB left on the
+# die: 11 GiB were cached but no free block was large enough. Growing segments
+# in place avoids that; set it before launching:
+#   export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+#
 # Run from the repository root. Generate the dataset once (240 samples, 60 steps
 # at 4 ranks, so the DataLoader does not restart during the run):
 #   python examples/qwen3_vl_30b_perf/prepare_perf_data.py \

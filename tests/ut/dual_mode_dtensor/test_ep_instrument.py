@@ -321,6 +321,8 @@ def test_analysis_reports_layer_memory_and_capacity(tmp_path, capsys):
     assert layer_memory["retained_bytes_per_pair"] == pytest.approx(4096)
     assert layer_memory["retained_lambda_per_layer_mean"] == pytest.approx(1.5)
     assert layer_memory["retained_lambda_summed"] == pytest.approx(1.5)
+    assert layer_memory["bytes_per_received_pair"] == pytest.approx(4096)
+    assert layer_memory["fixed_bytes"] == pytest.approx(0.0, abs=1e-6)
 
     rows = {row["capacity_factor"]: row for row in analyzer.report_capacity(
         table, collected["ranks"], 4096, "measured", out)}
@@ -332,3 +334,14 @@ def test_analysis_reports_layer_memory_and_capacity(tmp_path, capsys):
     assert rows[1.5]["tokens_over_share"] == 0.0 and rows[1.5]["hot_spill_max_mib"] == 0.0
     assert rows[1.5]["reserved_mib"] == pytest.approx(1.5 * 100 * 4096 / 1024 ** 2)
     capsys.readouterr()
+
+
+def test_fit_separates_the_receive_side_from_the_fixed_part():
+    """Only the slope on received pairs follows the routing."""
+    analyzer = _load_analyzer()
+    # retained = 100 B per received pair + 5000 B the rank holds regardless.
+    entries = [(100 * pairs + 5000, 0, pairs) for pairs in (70, 80, 100, 150)]
+    fit = analyzer._fit_receive_side(entries)
+    assert fit["bytes_per_received_pair"] == pytest.approx(100)
+    assert fit["fixed_bytes"] == pytest.approx(5000)
+    assert fit["r_squared"] == pytest.approx(1.0)

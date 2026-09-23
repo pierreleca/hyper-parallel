@@ -497,7 +497,49 @@ def report_layer_memory(table: dict, ranks: list[int], out: list[str]) -> dict[s
         f"  per-layer max/mean {summary['retained_lambda_per_layer_mean']:.2f}, "
         f"summed over layers {summary['retained_lambda_summed']:.2f}"
     )
+    fit = _fit_receive_side(
+        [entry for entries in per_layer.values() for rows in entries.values() for entry in rows]
+    )
+    if fit is not None:
+        summary.update(fit)
+        out.append(
+            f"  fit retained = a x received pairs + b: a = {fit['bytes_per_received_pair']:.0f} B, "
+            f"b = {fit['fixed_bytes'] / mib:.0f} MiB, R^2 = {fit['r_squared']:.2f}"
+        )
+        out.append(
+            "  Only a follows the routing: the rest is sized by the rank's own tokens"
+        )
+        out.append(
+            "  (the combined output, the send buffer), which every rank has the same of."
+        )
     return summary
+
+
+def _fit_receive_side(entries: list[tuple[int, int, int]]) -> dict[str, float] | None:
+    """Fit retained bytes = a x received pairs + b by least squares.
+
+    The block keeps two kinds of tensors: those sized by the tokens the rank
+    received (expert inputs and intermediates), which follow the routing, and
+    those sized by its own tokens (the combined output), which do not. The
+    slope ``a`` is what a capacity limit acts on.
+    """
+    points = [(entry[2], entry[0]) for entry in entries if entry[2]]
+    if len(points) < 3:
+        return None
+    mean_x = statistics.fmean(x for x, _ in points)
+    mean_y = statistics.fmean(y for _, y in points)
+    var_x = sum((x - mean_x) ** 2 for x, _ in points)
+    if var_x == 0:
+        return None
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in points) / var_x
+    intercept = mean_y - slope * mean_x
+    total = sum((y - mean_y) ** 2 for _, y in points)
+    residual = sum((y - slope * x - intercept) ** 2 for x, y in points)
+    return {
+        "bytes_per_received_pair": slope,
+        "fixed_bytes": intercept,
+        "r_squared": 1.0 - residual / total if total else 0.0,
+    }
 
 
 def report_capacity(
@@ -506,6 +548,7 @@ def report_capacity(
         per_pair: float,
         per_pair_source: str,
         out: list[str],
+        fixed_bytes: float = 0.0,
 ) -> list[dict[str, float]]:
     """Sweep a per-rank capacity: memory reserved against tokens over capacity.
 
@@ -519,7 +562,10 @@ def report_capacity(
     mean_load = statistics.fmean(loads_all)
     mib = 1024 ** 2
     host_bandwidth = 26e9  # A2, one NPU's host link used alone (only the hot rank spills)
-    out.append(f"CAPACITY SWEEP (per rank and layer; {per_pair:.0f} B per routed pair, {per_pair_source})")
+    out.append(
+        f"CAPACITY SWEEP (per rank and layer; {per_pair:.0f} B per received pair"
+        f" + {fixed_bytes / mib:.0f} MiB fixed, {per_pair_source})"
+    )
     out.append("  C     reserved MiB   layers over   tokens over   hot-rank spill MiB   host ms")
     out.append("                                                    mean      max          max")
     rows = []
@@ -537,7 +583,7 @@ def report_capacity(
             spills.append(max(excess) * per_pair)
         row = {
             "capacity_factor": factor,
-            "reserved_mib": factor * mean_load * per_pair / mib,
+            "reserved_mib": (fixed_bytes + factor * mean_load * per_pair) / mib,
             "layers_over_share": spilling / max(1, len(spills)),
             "tokens_over_share": over / total if total else 0.0,
             "hot_spill_mean_mib": statistics.fmean(spills) / mib if spills else 0.0,
@@ -674,16 +720,20 @@ def main() -> int:
     summary["layer_memory"] = report_layer_memory(table, collected["ranks"], out)
     out.append("")
     estimate = summary["offload"].get("bytes_per_pair", 0)
-    measured = summary["layer_memory"].get("retained_bytes_per_pair", 0)
-    # A measured cost close to the estimate means the block was not recomputed
-    # and its saved activations are what the allocator saw; otherwise the
-    # retained bytes are only the block's output.
-    if measured and measured >= 0.5 * estimate:
-        per_pair, source = measured, "measured, MoE block not recomputed"
+    layer_memory_summary = summary["layer_memory"]
+    slope = layer_memory_summary.get("bytes_per_received_pair", 0)
+    # A fitted slope close to the shape estimate means the block was not
+    # recomputed and its saved activations are what the allocator saw; with
+    # the block recomputed only its output remains, which the routing does
+    # not size.
+    if slope and slope >= 0.5 * estimate and layer_memory_summary.get("r_squared", 0) > 0.5:
+        per_pair, fixed, source = slope, layer_memory_summary["fixed_bytes"], "fitted, MoE kept"
     else:
-        per_pair, source = estimate, "estimated, MoE block recomputed"
+        per_pair, fixed, source = estimate, 0.0, "shape estimate, MoE recomputed"
     if per_pair:
-        summary["capacity"] = report_capacity(table, collected["ranks"], per_pair, source, out)
+        summary["capacity"] = report_capacity(
+            table, collected["ranks"], per_pair, source, out, fixed_bytes=fixed
+        )
     print("\n".join(out))
 
     out_dir = args.out_dir or os.path.join(args.record_dir, "analysis")
