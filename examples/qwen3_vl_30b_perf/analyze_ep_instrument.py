@@ -420,25 +420,22 @@ def _thirds(values: list[float]) -> tuple[float, float]:
 
 
 def _report_reserved(collected: dict, out: list[str]) -> dict[str, Any]:
-    """Report the reserved peak and the cached bytes no tensor uses, per rank.
+    """Report the reserved peak and the reserve held above the allocated peak.
 
-    Reserved minus allocated is memory the caching allocator holds without a
-    tensor in it. A value that grows over the steps is fragmentation building
-    up: the cache holds enough bytes, but not in blocks large enough.
+    Reserved minus allocated at a given moment says little: the cache keeps
+    memory freed late in the backward. What fragmentation changes is how much
+    more the cache must reserve than the step's live peak, so the report
+    compares each step's reserved peak with its allocated peak, and how that
+    gap moves over the run.
     """
     ranks = collected["ranks"]
     reserved_peak: dict[int, list[int]] = {rank: [] for rank in ranks}
-    unused: dict[int, list[tuple[int, int]]] = {rank: [] for rank in ranks}
-    for (step, rank), entry in sorted(collected["per_step_rank"].items()):
+    overhead: dict[int, list[int]] = {rank: [] for rank in ranks}
+    for (_step, rank), entry in sorted(collected["per_step_rank"].items()):
         if entry.get("peak_reserved"):
             reserved_peak[rank].append(entry["peak_reserved"])
-        gaps = [
-            reserved - alloc
-            for *_head, alloc, _peak, reserved, _reserved_peak in marks(entry)
-            if reserved is not None and alloc is not None
-        ]
-        if gaps:
-            unused[rank].append((step, max(gaps)))
+            if entry.get("peak_allocated"):
+                overhead[rank].append(entry["peak_reserved"] - entry["peak_allocated"])
     if not any(reserved_peak.values()):
         return {}
     summary = {
@@ -449,19 +446,19 @@ def _report_reserved(collected: dict, out: list[str]) -> dict[str, Any]:
     out.append("  peak reserved, GiB: " + ", ".join(
         f"r{rank} {value:.2f}" for rank, value in sorted(summary["peak_reserved_gib"].items())
     ))
-    if any(unused.values()):
+    if any(overhead.values()):
         trend = {}
-        for rank, series in unused.items():
+        for rank, series in overhead.items():
             if series:
-                first, last = _thirds([gap / GIB for _step, gap in series])
+                first, last = _thirds([gap / GIB for gap in series])
                 trend[str(rank)] = {"first_third": first, "last_third": last}
-        summary["unused_reserved_gib"] = trend
-        out.append("  cached but unused (reserved - allocated), max per step, GiB, first -> last third:")
+        summary["reserve_above_peak_gib"] = trend
+        out.append("  reserved peak - allocated peak, per step, GiB, first -> last third:")
         out.append("    " + ", ".join(
             f"r{rank} {values['first_third']:.2f} -> {values['last_third']:.2f}"
             for rank, values in sorted(trend.items())
         ))
-        out.append("    growth over the steps is fragmentation building up")
+        out.append("    a gap that grows over the steps is fragmentation building up")
     return summary
 
 
@@ -607,6 +604,63 @@ def _fit_receive_side(entries: list[tuple[int, int, int]]) -> dict[str, float] |
         "fixed_bytes": intercept,
         "r_squared": 1.0 - residual / total if total else 0.0,
     }
+
+
+def report_step_budget(table: dict, out: list[str]) -> dict[str, Any]:
+    """Compare one budget for all MoE layers with one budget per layer.
+
+    Per-layer loads swing more than a rank's total over the layers, so a
+    budget on the total needs less reserve for the same safety. For every
+    (step, rank) the total is the sum of what its blocks retained; the sweep
+    reports how often a budget of f times the mean total is exceeded, and by
+    how much, which is what would have to be evicted to host.
+    """
+    per_step: dict[tuple[int, int], list[int]] = {}
+    per_layer_max: dict[int, int] = {}
+    for (step, layer), per_rank in table.items():
+        for rank, row in per_rank.items():
+            if row.get("retained") is None:
+                continue
+            per_step.setdefault((step, rank), []).append(row["retained"])
+            per_layer_max[layer] = max(per_layer_max.get(layer, 0), row["retained"])
+    layers = len(per_layer_max)
+    totals = [sum(values) for values in per_step.values() if len(values) == layers]
+    if not totals or not layers:
+        return {}
+    mean_total = statistics.fmean(totals)
+    summary: dict[str, Any] = {
+        "mean_total_gib": mean_total / GIB,
+        "max_total_gib": max(totals) / GIB,
+        "per_layer_worst_sum_gib": sum(per_layer_max.values()) / GIB,
+    }
+    out.append("ONE BUDGET FOR ALL MoE LAYERS (per rank and step, MoE block memory summed over layers)")
+    out.append(
+        f"  total: mean {summary['mean_total_gib']:.2f} GiB, worst {summary['max_total_gib']:.2f} GiB"
+        f" ({max(totals) / mean_total:.3f}x the mean)"
+    )
+    out.append(
+        f"  reserve with no eviction: one budget {summary['max_total_gib']:.2f} GiB, per-layer budgets"
+        f" {summary['per_layer_worst_sum_gib']:.2f} GiB (each layer at its own worst)"
+    )
+    out.append("  budget (x mean)   GiB    (step, rank) over   worst eviction GiB   host ms")
+    rows = []
+    for factor in (1.0, 1.02, 1.05, 1.1, 1.15):
+        budget = factor * mean_total
+        overs = [total - budget for total in totals if total > budget]
+        row = {
+            "factor": factor,
+            "budget_gib": budget / GIB,
+            "over_share": len(overs) / len(totals),
+            "worst_eviction_gib": max(overs) / GIB if overs else 0.0,
+        }
+        row["host_ms"] = row["worst_eviction_gib"] * GIB / 26e9 * 1e3
+        rows.append(row)
+        out.append(
+            f"  {factor:<16.2f}{row['budget_gib']:7.2f}{row['over_share']:17.0%}"
+            f"{row['worst_eviction_gib']:18.2f}{row['host_ms']:12.1f}"
+        )
+    summary["sweep"] = rows
+    return summary
 
 
 def report_capacity(
@@ -864,6 +918,8 @@ def main() -> int:
         summary["capacity"] = report_capacity(
             table, collected["ranks"], per_pair, source, out, fixed_bytes=fixed
         )
+    out.append("")
+    summary["step_budget"] = report_step_budget(table, out)
     print("\n".join(out))
 
     out_dir = args.out_dir or os.path.join(args.record_dir, "analysis")

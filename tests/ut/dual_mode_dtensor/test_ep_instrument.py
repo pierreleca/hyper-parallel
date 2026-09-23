@@ -372,7 +372,8 @@ def test_analysis_reports_reserved_memory_and_its_growth(tmp_path, capsys):
     out = []
     memory = analyzer.report_memory(collected, out)
     assert memory["peak_reserved_gib"]["0"] == pytest.approx(4.0), "mean of 3 and 5 GiB"
-    assert memory["unused_reserved_gib"]["0"] == {"first_third": 1.0, "last_third": 3.0}
+    # Reserved peak minus allocated peak: 1 GiB in step 1, 3 GiB in step 2.
+    assert memory["reserve_above_peak_gib"]["0"] == {"first_third": 1.0, "last_third": 3.0}
 
     routing = analyzer.report_routing(table, collected["ranks"], out)
     assert routing["lambda_first_third"] == pytest.approx(1.5)
@@ -402,3 +403,24 @@ def test_compare_finds_the_first_diverging_step(tmp_path):
     summary = analyzer.compare_runs(str(first), str(second), out)
     assert summary["first_differing_step"] == 2 and summary["records_differing"] == 1
     assert "step 2, rank 2, layer 1 (3 token-expert assignments moved)" in "\n".join(out)
+
+
+def test_step_budget_compares_one_budget_with_per_layer_budgets(tmp_path, capsys):
+    """Totals over the layers, their worst case and the eviction a budget implies."""
+    analyzer = _load_analyzer()
+    loads = [150, 100, 80, 70]
+    _synthetic_records(tmp_path, loads, [2 ** 31] * 4)
+    headers, steps = analyzer.load_records(str(tmp_path), skip=0)
+    collected = analyzer.collect(headers, steps)
+    table = analyzer._by_step_layer(collected["rows"])
+    out = []
+    budget = analyzer.report_step_budget(table, out)
+    # Each rank keeps 4 KiB per received pair in each of 2 layers.
+    mean_total = 2 * 100 * 4096
+    assert budget["mean_total_gib"] * 2 ** 30 == pytest.approx(mean_total)
+    assert budget["max_total_gib"] * 2 ** 30 == pytest.approx(1.5 * mean_total)
+    assert budget["per_layer_worst_sum_gib"] == pytest.approx(budget["max_total_gib"])
+    at_mean = budget["sweep"][0]
+    assert at_mean["factor"] == 1.0 and at_mean["over_share"] == pytest.approx(0.25), "only rank 0"
+    assert at_mean["worst_eviction_gib"] * 2 ** 30 == pytest.approx(0.5 * mean_total)
+    capsys.readouterr()
