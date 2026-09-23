@@ -666,6 +666,59 @@ def report_capacity(
     return rows
 
 
+def _routing_by_step(steps: dict[int, list[dict]]) -> dict[tuple[int, int, int], tuple]:
+    """Return {(step, rank, layer): (per-rank counts, per-expert counts)} of the forward passes."""
+    routing = {}
+    for rank, records in steps.items():
+        for record in records:
+            for call in record["calls"]:
+                if call["pass"] == "fwd" and "recv" in call:
+                    routing[(record["step"], rank, call["layer"])] = (
+                        tuple(call["recv"]), tuple(call.get("expert_counts") or ()),
+                    )
+    return routing
+
+
+def compare_runs(first_dir: str, second_dir: str, out: list[str]) -> dict[str, Any]:
+    """Compare the routing of two runs step by step.
+
+    With full determinism, step i routes the same tokens to the same experts
+    in every run; the first step where the counts differ is where the runs
+    diverge.
+    """
+    _headers_a, steps_a = load_records(first_dir, 0)
+    _headers_b, steps_b = load_records(second_dir, 0)
+    routing_a, routing_b = _routing_by_step(steps_a), _routing_by_step(steps_b)
+    common = sorted(set(routing_a) & set(routing_b))
+    if not common:
+        out.append("COMPARE: the runs share no (step, rank, layer) record")
+        return {}
+    differing = [key for key in common if routing_a[key] != routing_b[key]]
+    steps = sorted({step for step, _rank, _layer in common})
+    summary = {
+        "steps_compared": len(steps),
+        "records_compared": len(common),
+        "records_differing": len(differing),
+        "first_differing_step": min(step for step, _rank, _layer in differing) if differing else None,
+    }
+    out.append(f"COMPARE {first_dir}  vs  {second_dir}")
+    out.append(
+        f"  {len(common)} (step, rank, layer) routing records over steps {steps[0]}-{steps[-1]}: "
+        f"{len(differing)} differ"
+    )
+    if differing:
+        step, rank, layer = min(differing)
+        counts_a, counts_b = routing_a[(step, rank, layer)][1], routing_b[(step, rank, layer)][1]
+        moved = sum(abs(a - b) for a, b in zip(counts_a, counts_b)) // 2
+        out.append(
+            f"  first difference: step {step}, rank {rank}, layer {layer}"
+            f" ({moved} token-expert assignments moved)"
+        )
+    else:
+        out.append("  the runs route identically: step i gives the same result in both")
+    return summary
+
+
 def write_csv(path: str, rows: list[dict], columns: list[str]) -> None:
     """Write one CSV with the given column order."""
     with open(path, "w", encoding="utf-8", newline="") as stream:
@@ -751,10 +804,20 @@ def main() -> int:
     parser.add_argument("--trace", action="store_true", help="also write a Chrome trace")
     parser.add_argument("--trace-step", type=int, default=None, help="step to trace")
     parser.add_argument(
+        "--compare", default=None, metavar="OTHER_DIR",
+        help="compare the routing of this run with another, step by step, and stop",
+    )
+    parser.add_argument(
         "--intermediate", type=int, default=None,
         help="expert intermediate size, overriding the recorded one (768 for Qwen3-VL-30B)",
     )
     args = parser.parse_args()
+
+    if args.compare:
+        out = []
+        compare_runs(args.record_dir, args.compare, out)
+        print("\n".join(out))
+        return 0
 
     headers, steps = load_records(args.record_dir, args.skip)
     collected = collect(headers, steps)

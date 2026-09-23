@@ -378,3 +378,27 @@ def test_analysis_reports_reserved_memory_and_its_growth(tmp_path, capsys):
     assert routing["lambda_first_third"] == pytest.approx(1.5)
     assert "drift: mean lambda" in "\n".join(out)
     capsys.readouterr()
+
+
+def test_compare_finds_the_first_diverging_step(tmp_path):
+    """Two identical runs compare equal; a changed step is located."""
+    analyzer = _load_analyzer()
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    _synthetic_records(first, [150, 100, 80, 70], [2 ** 31] * 4)
+    _synthetic_records(second, [150, 100, 80, 70], [2 ** 31] * 4)
+
+    out = []
+    assert analyzer.compare_runs(str(first), str(second), out)["records_differing"] == 0
+    assert "route identically" in "\n".join(out)
+
+    path = second / "rank002.jsonl"
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    lines[2]["calls"][1]["expert_counts"][0] += 3   # step 2, layer 1
+    lines[2]["calls"][1]["expert_counts"][1] -= 3
+    path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+    out = []
+    summary = analyzer.compare_runs(str(first), str(second), out)
+    assert summary["first_differing_step"] == 2 and summary["records_differing"] == 1
+    assert "step 2, rank 2, layer 1 (3 token-expert assignments moved)" in "\n".join(out)
