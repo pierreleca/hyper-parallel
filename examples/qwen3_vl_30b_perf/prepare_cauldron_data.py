@@ -43,7 +43,9 @@ not resize them again.
       --processor-path /home/pl/Qwen3-VL-30B-A3B-Instruct
 
 Downloads go to ``--download-dir`` and are reused; ``HF_ENDPOINT`` selects a
-mirror of huggingface.co.
+mirror of huggingface.co. Behind a proxy that re-signs TLS traffic, point
+``SSL_CERT_FILE`` at its CA certificate, or pass ``--insecure`` to skip the
+verification.
 """
 
 from __future__ import annotations
@@ -55,6 +57,7 @@ import math
 import os
 import random
 import shutil
+import ssl
 import tempfile
 import time
 import urllib.request
@@ -94,9 +97,21 @@ class Conversation:
     turns: list[tuple[str, str]]
 
 
-def download(download_dir: Path) -> list[tuple[str, Path]]:
-    """Fetch the Parquet files that are not already in ``download_dir``."""
+def download(download_dir: Path, insecure: bool = False) -> list[tuple[str, Path]]:
+    """Fetch the Parquet files that are not already in ``download_dir``.
+
+    ``insecure`` skips TLS certificate verification, for a proxy that
+    re-signs traffic with a certificate the environment does not trust.
+    Pointing ``SSL_CERT_FILE`` at the proxy's CA certificate keeps
+    verification on instead.
+    """
     endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+    context = None
+    if insecure:
+        print("warning: TLS certificate verification is disabled (--insecure)")
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
     download_dir.mkdir(parents=True, exist_ok=True)
     files = []
     for subset, remote in _SUBSETS:
@@ -105,7 +120,8 @@ def download(download_dir: Path) -> list[tuple[str, Path]]:
             url = f"{endpoint}/datasets/{_REPO}/resolve/main/{remote}"
             print(f"downloading {url}")
             partial = target.with_suffix(".part")
-            with urllib.request.urlopen(url) as response, partial.open("wb") as handle:  # nosec B310
+            with urllib.request.urlopen(url, context=context) as response, \
+                    partial.open("wb") as handle:  # nosec B310
                 shutil.copyfileobj(response, handle, length=1 << 20)
             partial.rename(target)
         files.append((subset, target))
@@ -287,7 +303,7 @@ def prepare(args: argparse.Namespace) -> None:
     from transformers import AutoTokenizer  # pylint: disable=C0415
 
     tokenizer = AutoTokenizer.from_pretrained(args.processor_path, local_files_only=True)
-    conversations = read_conversations(download(args.download_dir))
+    conversations = read_conversations(download(args.download_dir, insecure=args.insecure))
     random.Random(args.seed).shuffle(conversations)
     stream = iter(conversations)
 
@@ -341,6 +357,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=Path("/home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/data/cauldron_parquet"),
     )
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument(
+        "--insecure", action="store_true",
+        help="skip TLS certificate verification (a proxy with its own certificate)",
+    )
     parser.add_argument(
         "--verify", type=int, default=0,
         help="records checked with the Trainer transform; 0 checks every record (about 1 s each)",
