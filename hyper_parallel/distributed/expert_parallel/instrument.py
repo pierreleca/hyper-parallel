@@ -103,6 +103,12 @@ class _DeviceProbe:
             return None
         return int(self.device.memory_allocated())
 
+    def reserved(self) -> Optional[int]:
+        """Return the bytes the caching allocator holds from the device."""
+        if self.device is None:
+            return None
+        return int(self.device.memory_reserved())
+
     def peaks(self) -> tuple[Optional[int], Optional[int]]:
         """Return the allocated and reserved peaks since the last reset."""
         if self.device is None:
@@ -392,7 +398,7 @@ class EPInstrument:
         # A recompute stops as soon as the last saved tensor is back, so a
         # pass is measured from its first to its last mark, not start to end.
         spans: dict[tuple[int, str, int], list[float]] = {}
-        for layer, pass_name, occurrence, _name, time_ms, _alloc, _peak in record["marks"]:
+        for layer, pass_name, occurrence, _name, time_ms, *_memory in record["marks"]:
             if layer < 0:
                 continue
             spans.setdefault((layer, pass_name, occurrence), []).append(time_ms)
@@ -410,12 +416,19 @@ class EPInstrument:
         }
 
     def mark(self, layer: int, pass_name: str, occurrence: int, name: str) -> None:
-        """Record one phase boundary: a time stamp and the allocator state."""
+        """Record one phase boundary: a time stamp and the allocator state.
+
+        The allocator state is the allocated and reserved bytes now and, with
+        ``segment_peaks``, their peaks since the previous boundary. Reserved
+        minus allocated is memory the cache holds but no tensor uses: when it
+        grows over the steps, the cache is fragmenting.
+        """
         if not self._active:
             return
         stamp = self._probe.stamp()
         allocated = self._probe.allocated()
-        peak = None
+        reserved_now = self._probe.reserved()
+        peak = reserved = None
         if self.segment_peaks:
             peak, reserved = self._probe.peaks()
             if peak is not None:
@@ -428,7 +441,9 @@ class EPInstrument:
                     max(self._step_peaks[1], reserved),
                 ]
             self._probe.reset_peaks()
-        self._marks.append([layer, pass_name, occurrence, name, stamp, allocated, peak])
+        self._marks.append(
+            [layer, pass_name, occurrence, name, stamp, allocated, peak, reserved_now, reserved]
+        )
 
     def open_call(self, module: Any, ep_group: Any) -> Optional[_CallProbe]:
         """Return a probe for one MoE block call, or None when inactive."""
@@ -488,8 +503,13 @@ class EPInstrument:
         self._counts = []
 
     def _resolve(self, mark: list[Any]) -> list[Any]:
-        """Turn one recorded boundary into times and bytes."""
-        layer, pass_name, occurrence, name, stamp, allocated, peak = mark
+        """Turn one recorded boundary into times and bytes.
+
+        Fields: layer, pass, occurrence, name, ms since the step start,
+        allocated bytes, allocated peak since the previous boundary, reserved
+        bytes, reserved peak since the previous boundary.
+        """
+        layer, pass_name, occurrence, name, stamp, allocated, peak, reserved, reserved_peak = mark
         return [
             layer,
             pass_name,
@@ -498,6 +518,8 @@ class EPInstrument:
             round(self._probe.elapsed_ms(self._start_stamp, stamp), 4),
             allocated,
             peak,
+            reserved,
+            reserved_peak,
         ]
 
     def _header(self) -> dict[str, Any]:

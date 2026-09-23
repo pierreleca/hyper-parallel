@@ -145,6 +145,12 @@ def test_recorder_captures_every_pass(tmp_path, world_one_group, recorder_off):
     assert lines[0]["layers"] == {"0": "0", "1": "1"}
     assert lines[0]["num_experts"] == 8 and lines[0]["intermediate"] == 8
     assert lines[1]["kind"] == "step" and lines[1]["step"] == 1
+    assert all(len(mark) == 9 for mark in lines[1]["marks"]), "reserved bytes and their peak recorded"
+
+    analyzer = _load_analyzer()
+    headers, steps = analyzer.load_records(str(tmp_path), skip=0)
+    collected = analyzer.collect(headers, steps)
+    assert {row["layer"] for row in collected["rows"]} == {0, 1}, "the analysis reads real records"
 
 
 def test_disabled_recorder_leaves_the_forward_untouched(world_one_group, recorder_off):
@@ -345,3 +351,30 @@ def test_fit_separates_the_receive_side_from_the_fixed_part():
     assert fit["bytes_per_received_pair"] == pytest.approx(100)
     assert fit["fixed_bytes"] == pytest.approx(5000)
     assert fit["r_squared"] == pytest.approx(1.0)
+
+
+def test_analysis_reports_reserved_memory_and_its_growth(tmp_path, capsys):
+    """Cached-but-unused bytes that grow over the steps show up as a trend."""
+    analyzer = _load_analyzer()
+    _synthetic_records(tmp_path, [150, 100, 80, 70], [2 ** 31] * 4)
+    for path in tmp_path.glob("rank*.jsonl"):
+        lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        for record in lines[1:]:
+            # Reserved runs 1 GiB above allocated in step 1, 3 GiB in step 2.
+            extra = (2 * record["step"] - 1) * 2 ** 30
+            record["marks"] = [mark + [(mark[5] or 0) + extra, None] for mark in record["marks"]]
+            record["memory"]["step_peak_reserved"] = 2 ** 31 + extra
+        path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+
+    headers, steps = analyzer.load_records(str(tmp_path), skip=0)
+    collected = analyzer.collect(headers, steps)
+    table = analyzer._by_step_layer(collected["rows"])
+    out = []
+    memory = analyzer.report_memory(collected, out)
+    assert memory["peak_reserved_gib"]["0"] == pytest.approx(4.0), "mean of 3 and 5 GiB"
+    assert memory["unused_reserved_gib"]["0"] == {"first_third": 1.0, "last_third": 3.0}
+
+    routing = analyzer.report_routing(table, collected["ranks"], out)
+    assert routing["lambda_first_third"] == pytest.approx(1.5)
+    assert "drift: mean lambda" in "\n".join(out)
+    capsys.readouterr()

@@ -80,6 +80,15 @@ def load_records(record_dir: str, skip: int) -> tuple[dict[int, dict], dict[int,
     return headers, steps
 
 
+def marks(record: dict) -> list[tuple]:
+    """Return a record's marks as 9-tuples; older records lack the reserved fields.
+
+    Fields: layer, pass, occurrence, name, ms, allocated, allocated peak,
+    reserved, reserved peak.
+    """
+    return [tuple(mark) + (None,) * (9 - len(mark)) for mark in record["marks"]]
+
+
 def mark_spans(record: dict) -> dict[tuple[int, str, int], tuple[float, float]]:
     """Return {(layer, pass, occurrence): (first mark, last mark)} in ms.
 
@@ -87,7 +96,7 @@ def mark_spans(record: dict) -> dict[tuple[int, str, int], tuple[float, float]]:
     is back, so a pass is bounded by the marks it did reach, not by ``end``.
     """
     spans: dict[tuple[int, str, int], tuple[float, float]] = {}
-    for layer, pass_name, occurrence, _name, time_ms, _alloc, _peak in record["marks"]:
+    for layer, pass_name, occurrence, _name, time_ms, _alloc, _peak, *_reserved in marks(record):
         if layer < 0:
             continue
         key = (layer, pass_name, occurrence)
@@ -112,7 +121,7 @@ def phase_times(record: dict) -> dict[tuple[int, str, str], float]:
     it stays visible under the ``recompute`` pass.
     """
     stamps: dict[tuple[int, str, int, str], float] = {}
-    for layer, pass_name, occurrence, name, time_ms, _alloc, _peak in record["marks"]:
+    for layer, pass_name, occurrence, name, time_ms, _alloc, _peak, *_reserved in marks(record):
         stamps[(layer, pass_name, occurrence, name)] = time_ms
     recompute_spans = [
         span for (_layer, pass_name, _occurrence), span in mark_spans(record).items()
@@ -181,7 +190,7 @@ def layer_memory(record: dict) -> dict[int, tuple[int, int]]:
     starts: dict[int, int] = {}
     highest: dict[int, int] = {}
     result: dict[int, tuple[int, int]] = {}
-    for layer, pass_name, occurrence, name, _time_ms, alloc, peak in record["marks"]:
+    for layer, pass_name, occurrence, name, _time_ms, alloc, peak, *_reserved in marks(record):
         if layer < 0 or pass_name != "fwd" or occurrence != 0 or alloc is None:
             continue
         if name == "start":
@@ -279,6 +288,11 @@ def report_routing(table: dict, ranks: list[int], out: list[str]) -> dict[str, A
     out.append("  busiest rank, share of (step, layer) pairs: " + ", ".join(
         f"r{rank} {count / len(lambdas):.0%}" for rank, count in sorted(hot_counts.items())
     ))
+    first, last = _thirds(lambdas)
+    summary["lambda_first_third"], summary["lambda_last_third"] = first, last
+    out.append(
+        f"  drift: mean lambda {first:.3f} in the first third of the steps, {last:.3f} in the last"
+    )
     worst = sorted(per_layer.items(), key=lambda item: -statistics.fmean(item[1]))[:5]
     out.append("  layers with the highest mean lambda: " + ", ".join(
         f"L{layer} {statistics.fmean(values):.2f}" for layer, values in worst
@@ -371,7 +385,7 @@ def report_memory(collected: dict, out: list[str]) -> dict[str, Any]:
         if entry["peak_allocated"]:
             peaks[rank].append(entry["peak_allocated"])
         previous = "step:start"
-        for layer, pass_name, _occurrence, name, _time_ms, _alloc, peak in entry["marks"]:
+        for layer, pass_name, _occurrence, name, _time_ms, _alloc, peak, *_reserved in marks(entry):
             label = f"{'step' if layer < 0 else 'L*'}:{pass_name}:{name}"
             if peak:
                 segment_peak.setdefault(f"{previous} -> {label}", []).append(peak)
@@ -395,6 +409,59 @@ def report_memory(collected: dict, out: list[str]) -> dict[str, Any]:
     out.append("  segments holding the highest peaks:")
     for label, values in ranked:
         out.append(f"    {max(values) / GIB:7.2f} GiB  {label}")
+    summary.update(_report_reserved(collected, out))
+    return summary
+
+
+def _thirds(values: list[float]) -> tuple[float, float]:
+    """Return the means of the first and the last third of a series."""
+    third = max(1, len(values) // 3)
+    return statistics.fmean(values[:third]), statistics.fmean(values[-third:])
+
+
+def _report_reserved(collected: dict, out: list[str]) -> dict[str, Any]:
+    """Report the reserved peak and the cached bytes no tensor uses, per rank.
+
+    Reserved minus allocated is memory the caching allocator holds without a
+    tensor in it. A value that grows over the steps is fragmentation building
+    up: the cache holds enough bytes, but not in blocks large enough.
+    """
+    ranks = collected["ranks"]
+    reserved_peak: dict[int, list[int]] = {rank: [] for rank in ranks}
+    unused: dict[int, list[tuple[int, int]]] = {rank: [] for rank in ranks}
+    for (step, rank), entry in sorted(collected["per_step_rank"].items()):
+        if entry.get("peak_reserved"):
+            reserved_peak[rank].append(entry["peak_reserved"])
+        gaps = [
+            reserved - alloc
+            for *_head, alloc, _peak, reserved, _reserved_peak in marks(entry)
+            if reserved is not None and alloc is not None
+        ]
+        if gaps:
+            unused[rank].append((step, max(gaps)))
+    if not any(reserved_peak.values()):
+        return {}
+    summary = {
+        "peak_reserved_gib": {
+            str(rank): statistics.fmean(values) / GIB for rank, values in reserved_peak.items() if values
+        }
+    }
+    out.append("  peak reserved, GiB: " + ", ".join(
+        f"r{rank} {value:.2f}" for rank, value in sorted(summary["peak_reserved_gib"].items())
+    ))
+    if any(unused.values()):
+        trend = {}
+        for rank, series in unused.items():
+            if series:
+                first, last = _thirds([gap / GIB for _step, gap in series])
+                trend[str(rank)] = {"first_third": first, "last_third": last}
+        summary["unused_reserved_gib"] = trend
+        out.append("  cached but unused (reserved - allocated), max per step, GiB, first -> last third:")
+        out.append("    " + ", ".join(
+            f"r{rank} {values['first_third']:.2f} -> {values['last_third']:.2f}"
+            for rank, values in sorted(trend.items())
+        ))
+        out.append("    growth over the steps is fragmentation building up")
     return summary
 
 
@@ -651,7 +718,7 @@ def write_trace(collected: dict, headers: dict, path: str, step: int | None) -> 
         events.append({"ph": "M", "pid": rank, "name": "process_name",
                        "args": {"name": f"rank {rank} ({headers[rank].get('host', '')})"}})
         stamps: dict[tuple[int, str, int, str], float] = {}
-        for layer, pass_name, occurrence, name, time_ms, _alloc, _peak in entry["marks"]:
+        for layer, pass_name, occurrence, name, time_ms, _alloc, _peak, *_reserved in marks(entry):
             stamps[(layer, pass_name, occurrence, name)] = time_ms
         for (layer, pass_name, occurrence, name), begin in stamps.items():
             if name != "start" or layer < 0:
@@ -667,7 +734,7 @@ def write_trace(collected: dict, headers: dict, path: str, step: int | None) -> 
                     "ts": start * 1e3, "dur": max(end - start, 0.0) * 1e3,
                     "args": {"layer": layer, "occurrence": occurrence},
                 })
-        for layer, pass_name, _occurrence, name, time_ms, alloc, _peak in entry["marks"]:
+        for layer, pass_name, _occurrence, name, time_ms, alloc, _peak, *_reserved in marks(entry):
             if alloc is not None:
                 events.append({"ph": "C", "pid": rank, "name": "allocated_MiB",
                                "ts": time_ms * 1e3, "args": {"MiB": alloc / (1024 ** 2)}})
