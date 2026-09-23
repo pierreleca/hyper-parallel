@@ -23,11 +23,14 @@
 # in place avoids that; set it before launching:
 #   export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 #
-# Weights: the learning rate is 0. Every step still computes gradients and runs
-# the optimizer, so time and memory are those of training, but the router keeps
-# its pretrained weights: routing then depends on the data alone, instead of
-# drifting as the model fits the batches (the loss fell from 7.4 to 6.3 in six
-# steps on the synthetic data, and the imbalance grew with it).
+# Reproducibility: training.enable_full_determinism makes step i give the same
+# result in every run (same samples, same routing, same losses), so two runs,
+# or a run with a change, compare step by step. It seeds every generator,
+# enables deterministic NPU kernels and sets HCCL_DETERMINISTIC=true for the
+# reductions (export HCCL_DETERMINISTIC=strict beforehand for the stricter
+# mode). Deterministic kernels can be slower: compare times only between runs
+# in the same mode. Check two runs agree with the analysis's --compare option.
+# The weights do train, and the routing imbalance grows as they do.
 #
 # Data: real image-text conversations from four subsets of the_cauldron (0.8 GB
 # download), joined into 16384-token samples by prepare_cauldron_data.py.
@@ -77,6 +80,8 @@ training:
   loss_aggregation: token_weighted
   max_grad_norm: 1.0
   seed: 42
+  # Step i gives the same result in every run (see the header).
+  enable_full_determinism: true
   logging_steps: 1
 
 accelerator:
@@ -181,8 +186,7 @@ optimizer:
   _target_: hyper_parallel.components.optim.AdamW
   no_decay_params: [bias, norm, ln_]
   adamw_config:
-    # 0: measure with the pretrained router (see the header).
-    adamw_lr: 0.0
+    adamw_lr: 1.0e-5
     adamw_weight_decay: 0.01
     adamw_betas: [0.9, 0.999]
     adamw_eps: 1.0e-8
