@@ -218,7 +218,7 @@ class _CallProbe:
             global_expert_count=global_expert_count,
             top_k=int(topk_indices.shape[-1]),
             hidden=int(hidden_states.shape[-1]),
-            element_size=int(hidden_states.element_size()),
+            element_size=int(hidden_states.dtype.itemsize),
         )
         if self.pass_name == FWD and self.recorder.record_counts:
             self.recorder.hold_expert_counts(
@@ -302,7 +302,7 @@ class EPInstrument:
         self._experts = {
             "local_experts": int(experts.local_expert_count),
             "intermediate": int(weight.shape[1]) // 2,
-            "expert_element_size": int(weight.element_size()),
+            "expert_element_size": int(weight.dtype.itemsize),
         }
 
     def note_model(

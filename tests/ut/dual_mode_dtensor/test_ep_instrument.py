@@ -264,3 +264,26 @@ def test_analysis_subtracts_the_recompute_from_the_backward(tmp_path):
     assert times[(0, "bwd", "aggregate bwd")] == pytest.approx(2.0), "5 ms minus 3 ms of recompute"
     assert times[(0, "bwd", "combine a2a bwd")] == pytest.approx(1.0)
     assert tmp_path.exists()
+
+
+def test_register_modules_reads_dtensor_expert_weights(make_mesh, recorder_off):
+    """Expert weights are DTensors once sharded; reading their shape must not dispatch.
+
+    ``element_size()`` has no DTensor layout rule and raised at train begin;
+    attribute reads such as ``dtype`` and ``shape`` pass through.
+    """
+    from hyper_parallel.core.dtensor.dtensor import DTensor
+    from hyper_parallel.core.dtensor.placement_types import Replicate
+
+    mesh = make_mesh((1,), ("ep",))
+    block = _Moe(inter=8)
+    bind_local_expert_forward(block, ep_size=1)
+    local = block.experts.gate_up_proj.detach().to(torch.bfloat16)
+    block.experts.gate_up_proj = nn.Parameter(DTensor.from_local(local, mesh, [Replicate()]))
+
+    EP_INSTRUMENT.configure(enabled=True, output_dir="", align_steps=False)
+    EP_INSTRUMENT._experts = {}
+    EP_INSTRUMENT.register_modules(nn.ModuleList([block]))
+    assert EP_INSTRUMENT._experts == {
+        "local_experts": 8, "intermediate": 8, "expert_element_size": 2,
+    }
