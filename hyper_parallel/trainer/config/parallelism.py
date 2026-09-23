@@ -54,11 +54,14 @@ class AcceleratorConfig:
 class ActivationCheckpointConfig:
     """Activation-checkpoint options exposed by the initial YAML schema.
 
-    ``swap_inputs`` is consumed only when ``mode`` is ``"full"`` or
-    ``"selective"``.
+    ``mode``: ``"full"`` recomputes every transformer block, ``"selective"``
+    recomputes part of every block's operators, and ``"full_except_moe"``
+    recomputes every block except the MoE of the blocks that have one (their
+    attention and norms are still recomputed), so the MoE keeps its
+    activations. ``swap_inputs`` is consumed by every mode except ``"off"``.
     """
 
-    mode: Optional[Literal["off", "full", "selective"]] = "off"
+    mode: Optional[Literal["off", "full", "selective", "full_except_moe"]] = "off"
     swap_inputs: bool = False
 
     def __post_init__(self) -> None:

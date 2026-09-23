@@ -750,9 +750,9 @@ def _validate_activation_checkpoint_config(
     Raises:
         ValueError: The mode or ``swap_inputs`` has an unsupported value.
     """
-    if activation_checkpoint not in ("full", "selective"):
+    if activation_checkpoint not in ("full", "selective", "full_except_moe"):
         raise ValueError(
-            "activation_checkpoint.mode must be 'full' or 'selective', but got "
+            "activation_checkpoint.mode must be 'full', 'selective' or 'full_except_moe', but got "
             f"{activation_checkpoint!r}"
         )
     if not isinstance(swap_inputs, bool):
@@ -913,6 +913,83 @@ def _apply_full_checkpointing(
     return _wrap_layer_containers(containers, full_checkpoint_wrapper)
 
 
+_MLP_ATTRS = ("mlp", "feed_forward", "ffn", "block_sparse_moe")
+_ATTENTION_ATTRS = ("self_attn", "attention", "attn", "linear_attn")
+_PRE_ATTENTION_NORM_ATTRS = ("input_layernorm", "attention_norm", "layer_norm1", "norm1")
+_PRE_MLP_NORM_ATTRS = ("post_attention_layernorm", "ffn_norm", "layer_norm2", "norm2")
+
+
+def _has_moe_mlp(block: nn.Module) -> bool:
+    """Return whether a transformer block's MLP is a mixture of experts.
+
+    The structural contract is an ``experts`` child on the block's MLP, which
+    every MoE block of the supported families exposes.
+    """
+    for attr in _MLP_ATTRS:
+        mlp = getattr(block, attr, None)
+        if isinstance(mlp, nn.Module):
+            inner = _get_checkpoint_wrapped_module(mlp) or mlp
+            return isinstance(getattr(inner, "experts", None), nn.Module)
+    return False
+
+
+def _apply_full_except_moe_checkpointing(
+    containers: list[_LayerContainerInfo],
+    has_kv_sharing: bool,
+    *,
+    enable_compile: bool,
+    swap_inputs: bool,
+) -> int:
+    """Recompute every block in full, except the MoE of the blocks that have one.
+
+    A block without an MoE MLP (a dense decoder layer, a vision block) is
+    wrapped whole, as in ``full`` mode. A block with one gets its attention
+    and its two norms wrapped instead, so the MoE keeps the activations it
+    saves: the memory those take, and how it varies with the tokens each
+    expert-parallel rank receives, is what this mode exists to expose.
+
+    Args:
+        containers: The repeated-block containers to wrap.
+        has_kv_sharing: Whether attention submodules must stay outside the
+            recomputation regions.
+        enable_compile: Whether the wrapped regions will be compiled.
+        swap_inputs: Whether checkpoint inputs should be offloaded in eager
+            execution. Ignored in compile mode.
+
+    Returns:
+        The number of wrapped modules.
+    """
+    checkpoint_kwargs = {} if enable_compile else _eager_checkpoint_kwargs(swap_inputs)
+
+    def wrapper(module: nn.Module) -> nn.Module:
+        """Wrap one block or one block submodule for recomputation."""
+        return checkpoint_wrapper(module, **checkpoint_kwargs)
+
+    wrapped_count = 0
+    moe_blocks = 0
+    for container_info in containers:
+        for block_info in container_info.blocks:
+            block = getattr(block_info.parent, block_info.child_name, None)
+            if not isinstance(block, nn.Module) or _is_checkpoint_wrapped(block):
+                continue
+            if not _has_moe_mlp(block):
+                setattr(block_info.parent, block_info.child_name, wrapper(block))
+                wrapped_count += 1
+                continue
+            moe_blocks += 1
+            wrapped_count += _wrap_first_existing_attr(
+                block, _ATTENTION_ATTRS, wrapper, skip=has_kv_sharing
+            )
+            wrapped_count += _wrap_first_existing_attr(block, _PRE_ATTENTION_NORM_ATTRS, wrapper)
+            wrapped_count += _wrap_first_existing_attr(block, _PRE_MLP_NORM_ATTRS, wrapper)
+    logger.info(
+        "full_except_moe: %d MoE block(s) keep their MoE activations; their attention "
+        "and norms are recomputed, and every other block is recomputed whole",
+        moe_blocks,
+    )
+    return wrapped_count
+
+
 def _apply_activation_checkpointing(
     model: nn.Module,
     activation_checkpoint: Optional[str],
@@ -938,7 +1015,15 @@ def _apply_activation_checkpointing(
     if hasattr(model, "gradient_checkpointing_disable"):
         model.gradient_checkpointing_disable()
 
-    if activation_checkpoint == "selective":
+    if activation_checkpoint == "full_except_moe":
+        wrapped_count = _apply_full_except_moe_checkpointing(
+            containers,
+            has_kv_sharing,
+            enable_compile=enable_compile,
+            swap_inputs=swap_inputs,
+        )
+        _warn_if_nothing_wrapped(wrapped_count, activation_checkpoint, containers)
+    elif activation_checkpoint == "selective":
         wrapped_count = _apply_selective_checkpointing(
             containers,
             ac_layers,
