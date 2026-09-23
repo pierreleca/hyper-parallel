@@ -180,11 +180,13 @@ class _CallProbe:
     def wrap(self, tensor: torch.Tensor, name: str) -> torch.Tensor:
         """Attach a backward boundary to ``tensor``, when one can run.
 
-        Only the model's own forward pass builds the graph the backward pass
-        walks: hyper-parallel checkpointing is non-reentrant, so the graph of
-        a recompute is discarded.
+        Exactly one pass builds the graph the backward pass walks: the
+        model's own forward pass under non-reentrant checkpointing (the
+        recompute's graph is then discarded, so its boundaries never fire),
+        or the recompute under reentrant checkpointing (whose forward runs
+        without grad). Marking every pass that records a graph covers both.
         """
-        if self.pass_name != FWD or not torch.is_grad_enabled():
+        if not torch.is_grad_enabled():
             return tensor
         if not isinstance(tensor, torch.Tensor) or not tensor.requires_grad:
             return tensor
