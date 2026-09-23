@@ -287,3 +287,19 @@ def test_register_modules_reads_dtensor_expert_weights(make_mesh, recorder_off):
     assert EP_INSTRUMENT._experts == {
         "local_experts": 8, "intermediate": 8, "expert_element_size": 2,
     }
+
+
+def test_register_modules_reads_the_grouped_experts_layout(recorder_off):
+    """GroupedExperts stores gate_up as [E, H, 2I]; the intermediate size is still I.
+
+    Halving axis 1 gave H / 2 (1024 instead of 768 for Qwen3-VL-30B).
+    """
+    block = _Moe(hidden=16, inter=12)
+    bind_local_expert_forward(block, ep_size=1)
+    block.experts.gate_up_proj = nn.Parameter(torch.zeros(8, 16, 24))  # [E, H, 2I]
+    block.experts.down_proj = nn.Parameter(torch.zeros(8, 12, 16))     # [E, I, H]
+
+    EP_INSTRUMENT.configure(enabled=True, output_dir="", align_steps=False)
+    EP_INSTRUMENT._experts = {}
+    EP_INSTRUMENT.register_modules(nn.ModuleList([block]))
+    assert EP_INSTRUMENT._experts["intermediate"] == 12

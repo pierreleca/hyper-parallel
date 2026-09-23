@@ -296,13 +296,24 @@ class EPInstrument:
         """Keep the expert shapes that turn token counts into bytes."""
         if "intermediate" in self._experts:
             return
-        weight = getattr(experts, "gate_up_proj", None)
-        if weight is None or weight.dim() != 3:
+        gate_up = getattr(experts, "gate_up_proj", None)
+        down = getattr(experts, "down_proj", None)
+        if gate_up is None or down is None or gate_up.dim() != 3 or down.dim() != 3:
             return
+        # Layouts differ ([E, H, 2I] in GroupedExperts, [E, 2I, H] in HF), but
+        # the hidden size is the dimension gate_up and down share, and the
+        # intermediate size is the other dimension of down.
+        down_dims = (int(down.shape[1]), int(down.shape[2]))
+        shared = {int(gate_up.shape[1]), int(gate_up.shape[2])} & set(down_dims)
+        if len(shared) == 1:
+            hidden = shared.pop()
+            intermediate = down_dims[0] if down_dims[1] == hidden else down_dims[1]
+        else:
+            intermediate = min(down_dims)
         self._experts = {
             "local_experts": int(experts.local_expert_count),
-            "intermediate": int(weight.shape[1]) // 2,
-            "expert_element_size": int(weight.dtype.itemsize),
+            "intermediate": intermediate,
+            "expert_element_size": int(gate_up.dtype.itemsize),
         }
 
     def note_model(

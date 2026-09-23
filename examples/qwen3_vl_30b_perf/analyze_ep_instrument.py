@@ -371,11 +371,21 @@ def report_memory(collected: dict, out: list[str]) -> dict[str, Any]:
     return summary
 
 
-def report_offload(collected: dict, headers: dict, table: dict, out: list[str]) -> dict[str, Any]:
-    """Report the bytes above the mean on the busiest rank, and the idle windows."""
+def report_offload(
+        collected: dict,
+        headers: dict,
+        table: dict,
+        out: list[str],
+        intermediate: int | None = None,
+) -> dict[str, Any]:
+    """Report the bytes above the mean on the busiest rank, and the idle windows.
+
+    ``intermediate`` overrides the header's expert intermediate size, which
+    earlier records read from the wrong axis of the expert weight.
+    """
     header = headers[min(headers)]
     hidden = header.get("hidden")
-    intermediate = header.get("intermediate")
+    intermediate = intermediate or header.get("intermediate")
     element = header.get("expert_element_size") or header.get("element_size") or 2
     if not hidden or not intermediate:
         return {}
@@ -497,6 +507,10 @@ def main() -> int:
     parser.add_argument("--out-dir", default=None, help="where to write the CSVs")
     parser.add_argument("--trace", action="store_true", help="also write a Chrome trace")
     parser.add_argument("--trace-step", type=int, default=None, help="step to trace")
+    parser.add_argument(
+        "--intermediate", type=int, default=None,
+        help="expert intermediate size, overriding the recorded one (768 for Qwen3-VL-30B)",
+    )
     args = parser.parse_args()
 
     headers, steps = load_records(args.record_dir, args.skip)
@@ -511,7 +525,8 @@ def main() -> int:
         f"{sum(len(records) for records in steps.values())} step records kept, "
         f"time source {header.get('time_source')}",
         f"model: {header.get('num_experts')} experts, top-{header.get('top_k')}, "
-        f"hidden {header.get('hidden')}, intermediate {header.get('intermediate')}, "
+        f"hidden {header.get('hidden')}, "
+        f"intermediate {args.intermediate or header.get('intermediate')}, "
         f"{len(header.get('layers', {}))} MoE blocks",
         "",
     ]
@@ -524,7 +539,7 @@ def main() -> int:
     out.append("")
     summary["memory"] = report_memory(collected, out)
     out.append("")
-    summary["offload"] = report_offload(collected, headers, table, out)
+    summary["offload"] = report_offload(collected, headers, table, out, args.intermediate)
     print("\n".join(out))
 
     out_dir = args.out_dir or os.path.join(args.record_dir, "analysis")
