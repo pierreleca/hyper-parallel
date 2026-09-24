@@ -106,6 +106,10 @@ class EPHostSwapConfig:
 
     enabled: bool = False
     capacity_factor: float = 1.2
+    # What goes to host: "rows" moves about the excess only (the kept rows of the
+    # split tensor cost a device copy each way); "tensors" moves whole saved
+    # tensors, with no device copy but up to a whole tensor more host traffic.
+    granularity: str = "rows"
     # Saved tensors with fewer bytes per routed pair (indices) stay on device.
     min_row_bytes: int = 1024
     # One JSON Lines file per rank: bytes moved, copy times and waits per step.
@@ -115,6 +119,8 @@ class EPHostSwapConfig:
         """Reject a budget that cannot hold anything."""
         if self.capacity_factor <= 0:
             raise ValueError("ep_host_swap.capacity_factor must be positive")
+        if self.granularity not in ("rows", "tensors"):
+            raise ValueError(f"ep_host_swap.granularity must be 'rows' or 'tensors', not {self.granularity!r}")
 
 
 @dataclass

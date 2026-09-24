@@ -220,6 +220,9 @@ ep_instrument:
 ep_host_swap:
   enabled: true
   capacity_factor: 1.2
+  # rows: move about the excess only, at the cost of a device copy of the kept
+  # rows of one tensor each way; tensors: move whole saved tensors.
+  granularity: rows
   # Index tensors (8 bytes per pair) stay on device.
   min_row_bytes: 1024
   output_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/ep_host_swap_cauldron/ep_host_swap

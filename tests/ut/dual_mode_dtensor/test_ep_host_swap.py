@@ -26,16 +26,17 @@ import torch.nn.functional as F
 from torch import nn
 
 from hyper_parallel.distributed.expert_parallel.experts import bind_local_expert_forward, ep_routed_forward
-from hyper_parallel.distributed.expert_parallel.host_swap import HOST_SWAP, EPHostSwap, choose_offload
+from hyper_parallel.distributed.expert_parallel.host_swap import HOST_SWAP, EPHostSwap, choose_offload, plan_rows
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
 
 HIDDEN, INTER = 16, 8
 
 
-@pytest.fixture(name="swap")
-def fixture_swap(tmp_path: pathlib.Path) -> Iterator[EPHostSwap]:
-    """Enable the swap with a small row threshold; disable it after the test."""
-    HOST_SWAP.configure(enabled=True, capacity_factor=1.0, min_row_bytes=16, output_dir=str(tmp_path))
+@pytest.fixture(name="swap", params=["rows", "tensors"])
+def fixture_swap(tmp_path: pathlib.Path, request: pytest.FixtureRequest) -> Iterator[EPHostSwap]:
+    """Enable the swap, in each granularity, with a small row threshold; disable it after the test."""
+    HOST_SWAP.configure(enabled=True, capacity_factor=1.0, min_row_bytes=16, output_dir=str(tmp_path),
+                        granularity=request.param)
     HOST_SWAP.begin_step(1)
     yield HOST_SWAP
     HOST_SWAP.close()
@@ -79,6 +80,19 @@ def test_choose_offload_takes_the_smallest_covering_set():
     assert choose_offload(sizes, 9000) == [0, 1, 2]
 
 
+def test_plan_rows_moves_about_the_excess_and_splits_the_cheapest_tensor():
+    """Rows of the smallest tensor cover a small excess; bigger ones add whole tensors first."""
+    tensors = [(100, 4096), (100, 3072), (100, 1536)]
+    assert plan_rows(tensors, 0) == []
+    assert plan_rows(tensors, 10 * 1536) == [(2, 10)], "ten rows of the smallest: least kept on device"
+    # Past the smallest tensor: 51 rows of the middle one move the same bytes as the whole
+    # smallest plus one row, and keep 49 rows on device instead of 99.
+    assert plan_rows(tensors, 100 * 1536 + 3072) == [(1, 51)]
+    moved = plan_rows(tensors, 500_000)
+    assert sum(rows * tensors[index][1] for index, rows in moved) >= 500_000
+    assert plan_rows(tensors, 10 ** 9) == [(0, 100), (1, 100), (2, 100)]
+
+
 def test_swapped_layers_give_the_same_gradients(swap):
     """Layers over budget move tensors to host and back; the gradients do not change."""
     rows = [12, 6, 15]  # budget 8 rows: layers 0 and 2 are over it
@@ -91,7 +105,10 @@ def test_swapped_layers_give_the_same_gradients(swap):
     for layer in layers:
         excess_bytes = (layer.rows - layer.capacity) * sum(item.nbytes for item in layer.saved) / layer.rows
         assert layer.swapped_bytes >= excess_bytes, "the layer ends within its budget"
-        assert all(item.device is None for item in layer.swapped), "nothing kept on device after backward"
+        assert all(item.device is None and item.kept is None for item in layer.swapped), "all released"
+        if swap.granularity == "rows":
+            row_bytes = max(item.row_bytes for item in layer.saved)
+            assert layer.swapped_bytes < excess_bytes + row_bytes, "rows move about the excess only"
     assert layers[0].prefetched and not layers[1].prefetched, "layer 0 came back while layer 2 ran backward"
 
 
@@ -174,10 +191,11 @@ def _ep_grads(world_one_group, swap_on: bool) -> list[torch.Tensor]:
 
 def test_ep_blocks_swap_and_keep_their_gradients(world_one_group, swap):
     """Through ep_routed_forward, a budget below the load swaps every layer and changes nothing."""
+    granularity = swap.granularity
     swap.configure(enabled=False, capacity_factor=1.0, min_row_bytes=16, output_dir="")
     expected = _ep_grads(world_one_group, swap_on=False)
     # One rank receives what it sends; a budget of half of that puts every layer over it.
-    swap.configure(enabled=True, capacity_factor=0.5, min_row_bytes=16, output_dir="")
+    swap.configure(enabled=True, capacity_factor=0.5, min_row_bytes=16, output_dir="", granularity=granularity)
     swap.begin_step(1)
     got = _ep_grads(world_one_group, swap_on=True)
     for want, have in zip(expected, got):
