@@ -41,6 +41,12 @@ from typing import Any, Callable, Iterable, Optional
 COMPUTE_PROCESS = "Ascend Hardware"
 KERNEL_PREFIX = "aclnn"
 STEP_PATTERN = re.compile(r"ProfilerStep#(\d+)")
+# Stream synchronization tasks on the device: a stream that waits for an event
+# recorded by another stream (the communication stream, usually) shows an
+# EVENT WAIT that lasts until the other stream gets there. They are not compute.
+SYNC_PATTERN = re.compile(r"^(EVENT WAIT|EVENT RECORD|NOTIFY WAIT|NOTIFY RECORD|Notify_Wait|Notify_Record)",
+                          re.IGNORECASE)
+HOST_PROCESS = "Python"
 COMM_PATTERN = re.compile(r"alltoall|all_to_all|allreduce|all_reduce|allgather|all_gather|reduce_?scatter|"
                           r"broadcast|hcom|hccl|send|recv", re.IGNORECASE)
 
@@ -176,6 +182,26 @@ class Trace:
             raise ValueError(f"no '{prefix}' events in a process named like '{process}'")
         return counts.most_common(1)[0][0]
 
+    def streams(self, process: str = COMPUTE_PROCESS, prefix: str = KERNEL_PREFIX) -> list[dict[str, Any]]:
+        """Return, per device stream: label, events, ``prefix`` kernels, sync tasks, busy us."""
+        pids = set(self.find_processes(process))
+        rows = []
+        for key, events in self.by_thread().items():
+            if key[0] not in pids:
+                continue
+            compute, sync = split_sync(events)
+            rows.append({"key": key, "label": self.thread_label(key), "events": len(events),
+                         "kernels": sum(1 for event in events if event.name.startswith(prefix)),
+                         "sync": len(sync), "busy_us": busy_time(compute)})
+        return sorted(rows, key=lambda row: -row["kernels"])
+
+    def host_threads(self, process: str = HOST_PROCESS) -> list[tuple[Any, Any]]:
+        """Return the (pid, tid) of the host threads, busiest first."""
+        pids = set(self.find_processes(process))
+        groups = self.by_thread()
+        keys = [key for key in groups if key[0] in pids]
+        return sorted(keys, key=lambda key: -len(groups[key]))
+
     def thread_events(self, key: tuple[Any, Any]) -> list[Event]:
         """Return the events of one thread, in time order."""
         return [event for event in self.events if (event.pid, event.tid) == key]
@@ -229,6 +255,29 @@ def gaps(events: list[Event]) -> list[tuple[float, Event, Event]]:
     return result
 
 
+def is_sync(event: Event) -> bool:
+    """Return whether an event is a stream synchronization task, not compute."""
+    return bool(SYNC_PATTERN.match(event.name))
+
+
+def split_sync(events: list[Event]) -> tuple[list[Event], list[Event]]:
+    """Split a stream's events into (compute tasks, synchronization tasks)."""
+    compute, sync = [], []
+    for event in events:
+        (sync if is_sync(event) else compute).append(event)
+    return compute, sync
+
+
+def overlapping(events: Iterable[Event], start: float, end: float) -> list[Event]:
+    """Return the events whose interval intersects [start, end)."""
+    return [event for event in events if event.ts < end and event.end > start]
+
+
+def comm_name(name: str) -> str:
+    """Return a collective's name without the numbers that make every instance unique."""
+    return re.sub(r"[_#:]*\d[\w.]*", "", name).strip("_ ") or name
+
+
 def base_name(name: str) -> str:
     """Return an operator name without the aclnn launcher's repeated suffixes."""
     return name.split("_", 1)[0] if name.startswith(KERNEL_PREFIX) else name
@@ -255,21 +304,26 @@ def summarize(events: list[Event], key: Callable[[str], str] = base_name) -> lis
     return sorted(rows, key=lambda row: -row["total_us"])
 
 
-def around(events: list[Event], pattern: str, before: int, after: int, limit: int) -> list[list[tuple]]:
-    """Return the kernels around the first ``limit`` matches of ``pattern``.
+def around(events: list[Event], pattern: str, before: int, after: int, limit: int,
+           skip: int = 0) -> list[list[tuple]]:
+    """Return the tasks around the matches of ``pattern``, skipping the first ``skip``.
 
     Each context is a list of (offset, gap before in us, event), offset 0
-    being the match; the gap shows where the stream waited, for the host or
-    for another stream.
+    being the match; the gap shows where the stream sat idle. A match that
+    falls inside the previous context is not shown again.
     """
     regex = re.compile(pattern)
     ordered = sorted(events)
-    contexts = []
+    contexts, seen, last_shown = [], 0, -1
     for index, event in enumerate(ordered):
         if not regex.search(event.name):
             continue
+        seen += 1
+        if seen <= skip or index <= last_shown:
+            continue
         rows = []
-        for position in range(max(0, index - before), min(len(ordered), index + after + 1)):
+        last_shown = min(len(ordered), index + after + 1) - 1
+        for position in range(max(0, index - before), last_shown + 1):
             previous = ordered[position - 1] if position > 0 else None
             gap = ordered[position].ts - previous.end if previous is not None else 0.0
             rows.append((position - index, max(gap, 0.0), ordered[position]))
@@ -280,6 +334,7 @@ def around(events: list[Event], pattern: str, before: int, after: int, limit: in
 
 
 __all__ = [
-    "CATEGORIES", "COMM_PATTERN", "COMPUTE_PROCESS", "Event", "KERNEL_PREFIX", "STEP_PATTERN", "Trace",
-    "around", "base_name", "busy_time", "category", "find_trace_files", "gaps", "summarize", "window",
+    "CATEGORIES", "COMM_PATTERN", "COMPUTE_PROCESS", "Event", "HOST_PROCESS", "KERNEL_PREFIX", "STEP_PATTERN",
+    "SYNC_PATTERN", "Trace", "around", "base_name", "busy_time", "category", "comm_name", "find_trace_files",
+    "gaps", "is_sync", "overlapping", "split_sync", "summarize", "window",
 ]

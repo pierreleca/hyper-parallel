@@ -63,7 +63,10 @@ def fixture_trace_path(tmp_path: pathlib.Path) -> pathlib.Path:
             _x("aclnnGroupedMatmulV4_GroupedMatmul_GroupedMatmul", base + 420, 200, 2, 10),
             _x("aclnnAdd_Add_Add", base + 620, 50, 2, 10),
             _x("aclnnCast_Cast_Cast", base + 700, 5, 2, 11),
+            _x("EVENT WAIT", base + 680, 100, 2, 10),
             _x("hcom_alltoallv_", base + 300, 100, 3, 20),
+            _x("forward", base + 5, 900, 1, 1),
+            _x("aten::_local_scalar_dense", base + 115, 310, 1, 1),
         ]
     output = tmp_path / "run_ascend_pt" / "ASCEND_PROFILER_OUTPUT"
     output.mkdir(parents=True)
@@ -78,8 +81,12 @@ def test_layout_steps_and_gaps(trace_path):
     assert trace.compute_thread() == (2, 10), "the stream with the most aclnn kernels"
     assert trace.steps() == [(6, 1000.0, 2000.0), (7, 2000.0, 3000.0)]
 
-    kernels = lib.window(trace.thread_events((2, 10)), 1000.0, 2000.0)
+    tasks = lib.window(trace.thread_events((2, 10)), 1000.0, 2000.0)
+    kernels, sync = lib.split_sync(tasks)
+    assert [event.name for event in sync] == ["EVENT WAIT"], "stream waits are not compute"
     assert lib.busy_time(kernels) == pytest.approx(360.0)
+    assert [row["kernels"] for row in trace.streams()] == [8, 2]
+    assert trace.host_threads() == [(1, 1)]
     widest, before, after = max(lib.gaps(kernels), key=lambda item: item[0])
     assert widest == pytest.approx(300.0)
     assert before.name.startswith("aclnnSort") and after.name.startswith("aclnnGroupedMatmul")
@@ -96,16 +103,23 @@ def test_layout_steps_and_gaps(trace_path):
 
     collectives = lib.window(trace.collectives(), 1000.0, 2000.0)
     assert [event.name for event in collectives] == ["hcom_alltoallv_"]
+    assert lib.comm_name("hcom_allGather__123_4_1") == "hcom_allGather"
+
+    later = lib.around(tasks, "aclnn", before=0, after=1, limit=5, skip=1)
+    assert [context[0][2].name[:10] for context in later] == ["aclnnSort_", "aclnnAdd_A"], "no overlapping contexts"
 
 
 def test_report_runs_end_to_end(trace_path, capsys, monkeypatch):
     """The report prints every section and writes its tables."""
+    _load("ascend_trace")  # the report imports its library by name, as a script run would find it
     report = _load("analyze_npu_trace")
-    monkeypatch.setattr(sys, "argv", ["analyze_npu_trace.py", str(trace_path), "--around", "GroupedMatmul"])
+    monkeypatch.setattr(sys, "argv", ["analyze_npu_trace.py", str(trace_path), "--around", "GroupedMatmul",
+                                     "--host-min-gap", "200"])
     assert report.main() == 0
     printed = capsys.readouterr().out
     for heading in ("compute stream: Ascend Hardware / Stream 2", "step 6:", "DETAIL: step 7",
-                    "longest", "collectives", "around 'GroupedMatmul'"):
+                    "+ wait on other streams    0.1 ( 10%)", "aten::_local_scalar_dense (0.3 ms) < forward",
+                    "longest 1 waits", "collectives", "around 'GroupedMatmul'"):
         assert heading in printed, heading
     analysis = next(trace_path.rglob("analysis"))
-    assert (analysis / "kernels.csv").read_text(encoding="utf-8").count("\n") == 1 + 4
+    assert (analysis / "kernels.csv").read_text(encoding="utf-8").count("\n") == 1 + 5
