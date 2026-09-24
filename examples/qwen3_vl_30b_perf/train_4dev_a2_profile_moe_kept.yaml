@@ -21,7 +21,7 @@
 #   export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 #   torchrun --nproc_per_node=4 --master_port=29500 \
 #     scripts/train_vl.py examples/qwen3_vl_30b_perf/train_4dev_a2_profile_moe_kept.yaml
-#   T=/home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/profile_moe_cauldron_ranks
+#   T=/home/pl/runs/qwen3_vl_30b_perf/profile_moe_cauldron_ranks
 #   python examples/qwen3_vl_30b_perf/analyze_npu_trace.py $T --rank 0
 #   python examples/qwen3_vl_30b_perf/analyze_npu_trace.py $T --ranks --list-matched
 #
@@ -137,7 +137,7 @@ compile:
 dataset:
   _target_: hyper_parallel.data.vlm.build_vlm_dataset
   # Built by prepare_cauldron_data.py for this sequence length (see the header).
-  data_path: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/data/cauldron_seq16384_n240/vlm_conversations.json
+  data_path: /home/pl/data/qwen3_vl_30b_perf/cauldron_seq16384_n240/vlm_conversations.json
   data_config:
     source_type: online
   model_assets:
@@ -181,7 +181,7 @@ lr_scheduler:
 
 checkpoint:
   save_ckpt: false
-  checkpoint_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/checkpoints
+  checkpoint_dir: /home/pl/runs/qwen3_vl_30b_perf/checkpoints
 
 debug:
   check_nan_inf: false
@@ -193,7 +193,7 @@ profiling:
   rank: -1
   start_step: 6
   end_step: 10
-  trace_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/profile_moe_cauldron_ranks
+  trace_dir: /home/pl/runs/qwen3_vl_30b_perf/profile_moe_cauldron_ranks
   record_shapes: true
   profile_memory: false
   with_stack: false
@@ -204,7 +204,7 @@ profiling:
 # end_step 0 records to the end of the run.
 ep_instrument:
   enabled: false
-  output_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/ep_instrument_cauldron
+  output_dir: /home/pl/runs/qwen3_vl_30b_perf/ep_instrument_cauldron
   start_step: 3
   end_step: 0
   # Read a peak per phase boundary, which resets the allocator's peak counters;

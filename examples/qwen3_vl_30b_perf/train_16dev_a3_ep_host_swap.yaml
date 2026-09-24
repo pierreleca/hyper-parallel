@@ -21,9 +21,12 @@
 # layers fit a 64 GB die next to the vision tower and the loss. If it runs out
 # of memory: --model.num_hidden_layers=8; with headroom, raise it.
 #
-# Paths: data and outputs are relative to the repository, where cluster-kit
-# runs every job and from where `cluster gather` pulls; the checkpoint path is
-# absolute (model.pretrained_model_name_or_path) and must exist on every node.
+# Paths, the same on A2 and on every A3 node, all outside the repository (the
+# code travels as a zip; data and runs stay put): the checkpoint in
+# /home/pl/Qwen3-VL-30B-A3B-Instruct, the raw cauldron Parquet files in
+# /home/pl/data/the_cauldron, the prepared datasets in
+# /home/pl/data/qwen3_vl_30b_perf/<name>, the run outputs in
+# /home/pl/runs/qwen3_vl_30b_perf/<run>. See A3_RUNS.md.
 #
 # Launch with cluster-kit (NPROC_PER_NODE=16 in cluster.env). REMOTE_ENV_SETUP
 # must export, next to the toolkit and the Python environment:
@@ -136,7 +139,7 @@ compile:
 dataset:
   _target_: hyper_parallel.data.vlm.build_vlm_dataset
   # Built by prepare_cauldron_data.py for this sequence length (see the header).
-  data_path: outputs/qwen3_vl_30b_perf/data/cauldron_seq16384_n320/vlm_conversations.json
+  data_path: /home/pl/data/qwen3_vl_30b_perf/cauldron_seq16384_n320/vlm_conversations.json
   data_config:
     source_type: online
   model_assets:
@@ -180,7 +183,7 @@ lr_scheduler:
 
 checkpoint:
   save_ckpt: false
-  checkpoint_dir: outputs/qwen3_vl_30b_perf/checkpoints
+  checkpoint_dir: /home/pl/runs/qwen3_vl_30b_perf/checkpoints
 
 debug:
   check_nan_inf: false
@@ -191,7 +194,7 @@ profiling:
   rank: 0
   start_step: 6
   end_step: 8
-  trace_dir: outputs/qwen3_vl_30b_perf/a3_16dev_profile
+  trace_dir: /home/pl/runs/qwen3_vl_30b_perf/a3_16dev_profile
   record_shapes: false
   profile_memory: false
   with_stack: false
@@ -202,7 +205,7 @@ profiling:
 # end_step 0 records to the end of the run.
 ep_instrument:
   enabled: true
-  output_dir: outputs/qwen3_vl_30b_perf/a3_16dev_swap/instrument
+  output_dir: /home/pl/runs/qwen3_vl_30b_perf/a3_16dev_swap/instrument
   start_step: 3
   end_step: 0
   # Read a peak per phase boundary, which resets the allocator's peak counters;
@@ -224,4 +227,4 @@ ep_host_swap:
   granularity: tensors
   # Index tensors (8 bytes per pair) stay on device.
   min_row_bytes: 1024
-  output_dir: outputs/qwen3_vl_30b_perf/a3_16dev_swap/ep_host_swap
+  output_dir: /home/pl/runs/qwen3_vl_30b_perf/a3_16dev_swap/ep_host_swap

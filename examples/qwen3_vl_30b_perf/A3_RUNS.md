@@ -7,11 +7,62 @@ Two runs per configuration, identical except for the swap, then the reports:
 | `train_16dev_a3_ep_host_swap.yaml` | 1 | FSDP 16, EP 16 | 320 |
 | `train_64dev_a3_ep_host_swap.yaml` | 4 | FSDP 64, EP 16, experts FSDP-sharded over the nodes | 1280 |
 
-Everything runs from the control node with cluster-kit (`NPROC_PER_NODE=16`).
-Nodes have no shared disk: data is built on every node, and outputs are gathered
-before the reports, which need only the Python standard library.
+The A3 nodes have no internet and no shared disk, and the code reaches them as a
+zip of the A2 checkout. So nothing but code lives in the repository: data and
+run outputs sit at fixed paths under `/home/pl`, the same on A2 and on every A3
+node.
 
-## Once: environment
+## Where things live
+
+| What | Path | A2 | A3 |
+| --- | --- | --- | --- |
+| checkpoint | `/home/pl/Qwen3-VL-30B-A3B-Instruct` | there | on every node |
+| raw cauldron Parquet files (0.8 GB, 4 files) | `/home/pl/data/the_cauldron` | downloaded once | copied once, then synced to every node |
+| prepared datasets (JSON + images) | `/home/pl/data/qwen3_vl_30b_perf/<name>` | built there | built on every node from the raw files, offline |
+| run outputs (records, profiles) | `/home/pl/runs/qwen3_vl_30b_perf/<run>` | written there | written on each node, gathered for the reports |
+
+`prepare_cauldron_data.py` reads `--download-dir` (default
+`/home/pl/data/the_cauldron`) and downloads only the files it does not find, so
+it runs offline once the raw files are in place. A prepared dataset refers to
+its images relative to its JSON file, so its directory can move as a whole.
+
+## Once on A2: move data and runs out of the repository
+
+```bash
+O=/home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf
+du -sh $O/* $O/data/*                    # see what is there first
+mkdir -p /home/pl/data/qwen3_vl_30b_perf /home/pl/runs/qwen3_vl_30b_perf
+mv $O/data/cauldron_parquet /home/pl/data/the_cauldron
+mv $O/data/* /home/pl/data/qwen3_vl_30b_perf/          # prepared datasets
+rmdir $O/data
+rm -rf $O/profile_moe_cauldron $O/profile_moe_cauldron_ranks $O/train_4dev_a2_profile   # traces, results already read
+mv $O/* /home/pl/runs/qwen3_vl_30b_perf/               # the remaining run records (small)
+```
+
+The A2 configs now read and write these paths, so the A2 runs work as before.
+Zip without outputs, in case a run wrote there:
+
+```bash
+cd /home/pl && zip -qr hyper-parallel.zip hyper-parallel -x 'hyper-parallel/outputs/*'
+```
+
+## Once on A3: place the raw data on every node
+
+Copy the raw files to the control node, the way the zip travels:
+
+```bash
+scp -r /home/pl/data/the_cauldron <a3 control node>:/home/pl/data/     # from A2
+```
+
+Then add `/home/pl/data/the_cauldron` to `SYNC_DIRS` in the A3 `cluster.env`:
+`cluster sync` then mirrors it to the nodes, a no-op once they have it. Sync the
+whole pool once, so a later node selection finds it everywhere:
+
+```bash
+cluster -c <path to the full-pool cluster.env> sync
+```
+
+## Environment
 
 `REMOTE_ENV_SETUP` in `cluster.env` must export, next to the toolkit and the
 Python environment:
@@ -20,9 +71,7 @@ Python environment:
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True TASK_QUEUE_ENABLE=2 CPU_AFFINITY_CONF=1 HCCL_CONNECT_TIMEOUT=1800
 ```
 
-The checkpoint path in the YAMLs (`model.pretrained_model_name_or_path`) must
-exist on every node. `outputs/` must be in `SYNC_EXCLUDES`, so runs stay
-node-local.
+Full determinism sets `HCCL_DETERMINISTIC` itself.
 
 ## 16 dies, one node
 
@@ -30,14 +79,14 @@ node-local.
 cluster select -a 1                      # or pick the node by hand
 cluster sync
 cluster exec -p 'python examples/qwen3_vl_30b_perf/prepare_cauldron_data.py \
-  --output-dir outputs/qwen3_vl_30b_perf/data/cauldron_seq16384_n320 \
+  --output-dir /home/pl/data/qwen3_vl_30b_perf/cauldron_seq16384_n320 \
   --seq-len 16384 --num-samples 320 --processor-path /home/pl/Qwen3-VL-30B-A3B-Instruct'
 
 C=examples/qwen3_vl_30b_perf/train_16dev_a3_ep_host_swap.yaml
-R=outputs/qwen3_vl_30b_perf
+R=/home/pl/runs/qwen3_vl_30b_perf
 cluster torchrun scripts/train_vl.py $C \
   --ep_host_swap.enabled=false --ep_instrument.output_dir=$R/a3_16dev_noswap/instrument
-cluster logs                             # Ctrl-C detaches; cluster status says when it is done
+cluster logs                             # Ctrl-C detaches; wait until `cluster status` says it finished
 cluster torchrun scripts/train_vl.py $C  # swap on
 # profile of the swap run: every rank, steps 6-9, instrument off
 cluster torchrun scripts/train_vl.py $C \
@@ -45,6 +94,9 @@ cluster torchrun scripts/train_vl.py $C \
   --profiling.enabled=true --profiling.rank=-1 --profiling.start_step=6 --profiling.end_step=10 \
   --ep_host_swap.output_dir=$R/a3_16dev_profile/ep_host_swap
 ```
+
+`cluster torchrun` returns at once: start each run after the previous one ends.
+The dataset build is skipped where the dataset already exists.
 
 Reports. The profile traces stay on the node, where the trace report runs; the
 small instrument and swap records come back to the control node:
@@ -67,7 +119,7 @@ python examples/qwen3_vl_30b_perf/analyze_ep_instrument.py $A/a3_16dev_swap/inst
 cluster select -a 4
 cluster sync
 cluster exec -p 'python examples/qwen3_vl_30b_perf/prepare_cauldron_data.py \
-  --output-dir outputs/qwen3_vl_30b_perf/data/cauldron_seq16384_n1280 \
+  --output-dir /home/pl/data/qwen3_vl_30b_perf/cauldron_seq16384_n1280 \
   --seq-len 16384 --num-samples 1280 --processor-path /home/pl/Qwen3-VL-30B-A3B-Instruct'
 ```
 
@@ -76,7 +128,7 @@ every node and lower `--training.train_iters` to samples / 64, the same in both 
 
 ```bash
 C=examples/qwen3_vl_30b_perf/train_64dev_a3_ep_host_swap.yaml
-R=outputs/qwen3_vl_30b_perf
+R=/home/pl/runs/qwen3_vl_30b_perf
 cluster torchrun scripts/train_vl.py $C \
   --ep_host_swap.enabled=false --ep_instrument.output_dir=$R/a3_64dev_noswap/instrument
 cluster torchrun scripts/train_vl.py $C
@@ -93,8 +145,8 @@ table shows the cross-node all-gathers and reduce-scatters next to the swap:
 ```bash
 cluster exec -p "python examples/qwen3_vl_30b_perf/analyze_npu_trace.py $R/a3_64dev_profile --ranks"
 # one rank per node in detail: node N holds ranks 16N..16N+15
-cluster exec 'python examples/qwen3_vl_30b_perf/analyze_npu_trace.py outputs/qwen3_vl_30b_perf/a3_64dev_profile \
-  --rank $(ls -d outputs/qwen3_vl_30b_perf/a3_64dev_profile/rank*_ascend_pt | head -1 | sed "s/.*rank\([0-9]*\)_.*/\1/") --waits 5 --top 10'
+cluster exec 'python examples/qwen3_vl_30b_perf/analyze_npu_trace.py /home/pl/runs/qwen3_vl_30b_perf/a3_64dev_profile \
+  --rank $(ls -d /home/pl/runs/qwen3_vl_30b_perf/a3_64dev_profile/rank*_ascend_pt | head -1 | sed "s/.*rank\([0-9]*\)_.*/\1/") --waits 5 --top 10'
 ```
 
 The instrument needs every rank's records in one directory:

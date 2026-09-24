@@ -38,7 +38,7 @@ area, so each takes at most 1024 visual tokens and the Qwen3-VL processor does
 not resize them again.
 
     python examples/qwen3_vl_30b_perf/prepare_cauldron_data.py \\
-      --output-dir /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/data/cauldron_seq16384_n240 \\
+      --output-dir /home/pl/data/qwen3_vl_30b_perf/cauldron_seq16384_n240 \\
       --seq-len 16384 --num-samples 240 \\
       --processor-path /home/pl/Qwen3-VL-30B-A3B-Instruct
 
@@ -354,7 +354,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--processor-path", required=True)
     parser.add_argument(
         "--download-dir", type=Path,
-        default=Path("/home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/data/cauldron_parquet"),
+        default=Path("/home/pl/data/the_cauldron"),
     )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(

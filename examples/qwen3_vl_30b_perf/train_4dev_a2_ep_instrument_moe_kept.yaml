@@ -38,17 +38,17 @@
 # Run from the repository root. Build the dataset once (240 samples, 60 steps at
 # 4 ranks, so the DataLoader does not restart during the run):
 #   python examples/qwen3_vl_30b_perf/prepare_cauldron_data.py \
-#     --output-dir /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/data/cauldron_seq16384_n240 \
+#     --output-dir /home/pl/data/qwen3_vl_30b_perf/cauldron_seq16384_n240 \
 #     --seq-len 16384 --num-samples 240 \
 #     --processor-path /home/pl/Qwen3-VL-30B-A3B-Instruct
 #   torchrun --nproc_per_node=4 --master_port=29500 \
 #     scripts/train_vl.py examples/qwen3_vl_30b_perf/train_4dev_a2_ep_instrument_moe_kept.yaml
 #   python examples/qwen3_vl_30b_perf/analyze_ep_instrument.py \
-#     /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/ep_instrument_cauldron --skip 2
+#     /home/pl/runs/qwen3_vl_30b_perf/ep_instrument_cauldron --skip 2
 #
 # The synthetic dataset of prepare_perf_data.py still works as a comparison:
-#   --dataset.data_path=/home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/data/seq16384_img4_n240/vlm_conversations.json
-#   --ep_instrument.output_dir=/home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/ep_instrument_moe_kept
+#   --dataset.data_path=/home/pl/data/qwen3_vl_30b_perf/seq16384_img4_n240/vlm_conversations.json
+#   --ep_instrument.output_dir=/home/pl/runs/qwen3_vl_30b_perf/ep_instrument_moe_kept
 #
 # Devices: torchrun assigns LOCAL_RANK 0..3, which bind to dies 0..3.
 
@@ -156,7 +156,7 @@ compile:
 dataset:
   _target_: hyper_parallel.data.vlm.build_vlm_dataset
   # Built by prepare_cauldron_data.py for this sequence length (see the header).
-  data_path: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/data/cauldron_seq16384_n240/vlm_conversations.json
+  data_path: /home/pl/data/qwen3_vl_30b_perf/cauldron_seq16384_n240/vlm_conversations.json
   data_config:
     source_type: online
   model_assets:
@@ -200,7 +200,7 @@ lr_scheduler:
 
 checkpoint:
   save_ckpt: false
-  checkpoint_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/checkpoints
+  checkpoint_dir: /home/pl/runs/qwen3_vl_30b_perf/checkpoints
 
 debug:
   check_nan_inf: false
@@ -211,7 +211,7 @@ profiling:
   rank: 0
   start_step: 6
   end_step: 8
-  trace_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/train_4dev_a2_profile/profiling
+  trace_dir: /home/pl/runs/qwen3_vl_30b_perf/train_4dev_a2_profile/profiling
   record_shapes: false
   profile_memory: false
   with_stack: false
@@ -222,7 +222,7 @@ profiling:
 # end_step 0 records to the end of the run.
 ep_instrument:
   enabled: true
-  output_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/ep_instrument_cauldron
+  output_dir: /home/pl/runs/qwen3_vl_30b_perf/ep_instrument_cauldron
   start_step: 3
   end_step: 0
   # Read a peak per phase boundary, which resets the allocator's peak counters;

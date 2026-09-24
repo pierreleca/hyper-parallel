@@ -19,21 +19,21 @@
 #   peaks and where the allocator's reserve grows, tagged with the swaps, to
 #   set against the baseline's same report:
 #     python examples/qwen3_vl_30b_perf/analyze_ep_instrument.py \
-#       /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/ep_host_swap_cauldron/instrument --skip 2 \
-#       --swap-dir /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/ep_host_swap_cauldron/ep_host_swap
+#       /home/pl/runs/qwen3_vl_30b_perf/ep_host_swap_cauldron/instrument --skip 2 \
+#       --swap-dir /home/pl/runs/qwen3_vl_30b_perf/ep_host_swap_cauldron/ep_host_swap
 # - the routing, which must match the baseline step by step, since the swap
 #   changes no value:
 #     python examples/qwen3_vl_30b_perf/analyze_ep_instrument.py \
-#       /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/ep_host_swap_cauldron/instrument \
-#       --compare /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/ep_instrument_cauldron
+#       /home/pl/runs/qwen3_vl_30b_perf/ep_host_swap_cauldron/instrument \
+#       --compare /home/pl/runs/qwen3_vl_30b_perf/ep_instrument_cauldron
 #
 # Run from the repository root:
 #   export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 #   torchrun --nproc_per_node=4 --master_port=29500 \
 #     scripts/train_vl.py examples/qwen3_vl_30b_perf/train_4dev_a2_ep_host_swap.yaml
 # Stress variant: --ep_host_swap.capacity_factor=1.0
-#   --ep_host_swap.output_dir=/home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/ep_host_swap_cauldron_c10/ep_host_swap
-#   --ep_instrument.output_dir=/home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/ep_host_swap_cauldron_c10/instrument
+#   --ep_host_swap.output_dir=/home/pl/runs/qwen3_vl_30b_perf/ep_host_swap_cauldron_c10/ep_host_swap
+#   --ep_instrument.output_dir=/home/pl/runs/qwen3_vl_30b_perf/ep_host_swap_cauldron_c10/instrument
 #
 # Devices: torchrun assigns LOCAL_RANK 0..3, which bind to dies 0..3.
 
@@ -141,7 +141,7 @@ compile:
 dataset:
   _target_: hyper_parallel.data.vlm.build_vlm_dataset
   # Built by prepare_cauldron_data.py for this sequence length (see the header).
-  data_path: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/data/cauldron_seq16384_n240/vlm_conversations.json
+  data_path: /home/pl/data/qwen3_vl_30b_perf/cauldron_seq16384_n240/vlm_conversations.json
   data_config:
     source_type: online
   model_assets:
@@ -185,7 +185,7 @@ lr_scheduler:
 
 checkpoint:
   save_ckpt: false
-  checkpoint_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/checkpoints
+  checkpoint_dir: /home/pl/runs/qwen3_vl_30b_perf/checkpoints
 
 debug:
   check_nan_inf: false
@@ -196,7 +196,7 @@ profiling:
   rank: 0
   start_step: 6
   end_step: 8
-  trace_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/train_4dev_a2_profile/profiling
+  trace_dir: /home/pl/runs/qwen3_vl_30b_perf/train_4dev_a2_profile/profiling
   record_shapes: false
   profile_memory: false
   with_stack: false
@@ -207,7 +207,7 @@ profiling:
 # end_step 0 records to the end of the run.
 ep_instrument:
   enabled: true
-  output_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/ep_host_swap_cauldron/instrument
+  output_dir: /home/pl/runs/qwen3_vl_30b_perf/ep_host_swap_cauldron/instrument
   start_step: 3
   end_step: 0
   # Read a peak per phase boundary, which resets the allocator's peak counters;
@@ -229,4 +229,4 @@ ep_host_swap:
   granularity: tensors
   # Index tensors (8 bytes per pair) stay on device.
   min_row_bytes: 1024
-  output_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/ep_host_swap_cauldron/ep_host_swap
+  output_dir: /home/pl/runs/qwen3_vl_30b_perf/ep_host_swap_cauldron/ep_host_swap
