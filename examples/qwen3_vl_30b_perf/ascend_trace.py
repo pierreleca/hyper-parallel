@@ -45,8 +45,8 @@ STEP_PATTERN = re.compile(r"ProfilerStep#(\d+)")
 # Stream synchronization tasks on the device: a stream that waits for an event
 # recorded by another stream (the communication stream, usually) shows an
 # EVENT WAIT that lasts until the other stream gets there. They are not compute.
-SYNC_PATTERN = re.compile(r"^(EVENT WAIT|EVENT RECORD|NOTIFY WAIT|NOTIFY RECORD|Notify_Wait|Notify_Record)",
-                          re.IGNORECASE)
+# CANN versions differ in the separator: "EVENT WAIT" in some, "EVENT_WAIT" in others.
+SYNC_PATTERN = re.compile(r"^(EVENT|NOTIFY)[ _](WAIT|RECORD)", re.IGNORECASE)
 COMM_PROCESS = "Communication"
 COMM_PREFIX = "hcom"
 # hcom_alltoallv__909_502_1 -> alltoallv: the numbers after the type change with every instance.

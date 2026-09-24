@@ -100,6 +100,8 @@ def test_layout_steps_and_gaps(trace_path):
     tasks = lib.window(trace.thread_events((2, 10)), 1000.0, 2000.0)
     kernels, sync = lib.split_sync(tasks)
     assert [event.name for event in sync] == ["EVENT WAIT"], "stream waits are not compute"
+    assert all(lib.is_sync(lib.Event(0.0, 1.0, name)) for name in ("EVENT_WAIT", "EVENT_RECORD", "Notify_Wait"))
+    assert not lib.is_sync(lib.Event(0.0, 1.0, "aclnnEventWaitLike"))
     assert lib.busy_time(kernels) == pytest.approx(360.0)
     assert [row["kernels"] for row in trace.streams()] == [8, 2]
     communications = lib.window(trace.communications(), 1000.0, 2000.0)
