@@ -213,9 +213,11 @@ def _rank_view(trace: Trace, step: Optional[int]) -> dict:
     start, end = steps[number]
     selected = window(tasks, start, end)
     parts = step_breakdown(selected, start, end)
-    categories = {row["name"]: row["total_us"] for row in summarize(split_sync(selected)[0], key=category)}
+    compute = split_sync(selected)[0]
+    categories = {row["name"]: row["total_us"] for row in summarize(compute, key=category)}
     comms = window(trace.communications(), start, end)
     return {"step": number, "start": start, "end": end, "parts": parts, "categories": categories,
+            "operators": summarize(compute),
             "comms": comms, "exposure": {row["name"]: row for row in comm_exposure(
                 comms, parts["compute_union"], parts["sync_union"])}}
 
@@ -235,6 +237,50 @@ def report_rank_table(views: dict[int, dict], out: list[str]) -> None:
             f" {a2av['total_us'] / MS:12.1f} {a2av['exposed_us'] / MS:13.1f}"
             f" {exposure['all collectives']['exposed_us'] / MS:17.1f}"
         )
+
+
+def report_rank_categories(views: dict[int, dict], top: int, out: list[str]) -> None:
+    """Compute per category on every rank, the categories that differ most first."""
+    ranks = list(views)
+    names = sorted({name for view in views.values() for name in view["categories"]})
+    rows = []
+    for name in names:
+        values = [views[rank]["categories"].get(name, 0.0) for rank in ranks]
+        rows.append((max(values) - min(values), name, values))
+    out.append("COMPUTE BY CATEGORY (ms), widest spread across ranks first:")
+    out.append("    spread  " + "  ".join(f"  rank {rank}" for rank in ranks) + "  category")
+    for spread, name, values in sorted(rows, reverse=True)[:top]:
+        out.append(f"  {spread / MS:8.1f}  " + "  ".join(f"{value / MS:8.1f}" for value in values) + f"  {name}")
+
+
+def report_rank_operators(views: dict[int, dict], top: int, out: list[str]) -> None:
+    """Compute per operator on every rank, the operators that differ most first."""
+    ranks = list(views)
+    totals = {rank: {row["name"]: row["total_us"] for row in views[rank]["operators"]} for rank in ranks}
+    names = {name for table in totals.values() for name in table}
+    rows = []
+    for name in names:
+        values = [totals[rank].get(name, 0.0) for rank in ranks]
+        rows.append((max(values) - min(values), name, values))
+    out.append("COMPUTE BY OPERATOR (ms), widest spread across ranks first:")
+    out.append("    spread  " + "  ".join(f"  rank {rank}" for rank in ranks) + "  operator")
+    for spread, name, values in sorted(rows, reverse=True)[:top]:
+        out.append(f"  {spread / MS:8.1f}  " + "  ".join(f"{value / MS:8.1f}" for value in values) + f"  {name}")
+
+
+def report_rank_exposure(views: dict[int, dict], out: list[str]) -> None:
+    """Exposed collective time per type on every rank (in flight in brackets)."""
+    ranks = list(views)
+    names = sorted({name for view in views.values() for name in view["exposure"]},
+                   key=lambda name: (name == "all collectives", name))
+    out.append("EXPOSED COLLECTIVES (ms): exposed / in flight, per rank")
+    out.append("  " + "".join(f"{f'rank {rank}':>20s}" for rank in ranks) + "  type")
+    for name in names:
+        cells = []
+        for rank in ranks:
+            row = views[rank]["exposure"].get(name)
+            cells.append(f"{row['exposed_us'] / MS:9.1f} / {row['total_us'] / MS:8.1f}" if row else f"{'-':>20s}")
+        out.append("  " + "".join(f"{cell:>20s}" for cell in cells) + f"  {name}")
 
 
 def report_matched(views: dict[int, dict], kind: str, list_rows: bool, out: list[str]) -> dict:
@@ -304,6 +350,12 @@ def report_ranks(args: argparse.Namespace) -> int:
         out.append(f"  warning: ranks show different steps: { {r: v['step'] for r, v in views.items()} }")
     out.append("")
     report_rank_table(views, out)
+    out.append("")
+    report_rank_categories(views, 12, out)
+    out.append("")
+    report_rank_operators(views, args.top, out)
+    out.append("")
+    report_rank_exposure(views, out)
     summary = {"ranks": {rank: {"step": view["step"], **_scalars(view["parts"])} for rank, view in views.items()}}
     for kind in args.match:
         out.append("")
