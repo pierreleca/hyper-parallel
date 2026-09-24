@@ -23,8 +23,10 @@ Reports, for one profiled step or all of them:
 - the idle time between tasks, counted by gap length;
 - the stream waits, by the type of collective each one waited for, and the
   longest of them;
-- the collectives (hcom events of the "Communication" process), by type: their
-  time in flight and how much of it compute hides;
+- the collectives (hcom events of the "Communication" process), by type, and
+  the activation swap copies (MEMCPY_ASYNC on the swap streams): their time in
+  flight and how much of it compute hides. Stream waits are attributed to the
+  collective or swap copy that ends with them.
 - optionally, the kernels around every match of a name, with the gaps between
   them (``--around aclnnGroupedMatmul``), to read what one phase launches.
 
@@ -41,11 +43,12 @@ import argparse
 import csv
 import json
 import os
-from typing import Optional
+from typing import Any, Optional
 
 # Run as a script, Python puts this directory first on the import path.
 from ascend_trace import (
-    Trace, around, attribute_waits, base_name, busy_time, category, comm_exposure, comm_type, is_sync, split_sync,
+    SWAP_LABEL, SWAP_PATTERN, Trace, around, attribute_waits, base_name, busy_time, category, comm_exposure,
+    comm_type, is_sync, split_sync,
     find_rank_traces, step_breakdown, summarize, window,
 )
 
@@ -61,15 +64,28 @@ def report_inventory(trace: Trace, out: list[str]) -> None:
         out.append(f"    {count:8d} {total / MS:12.1f}  {label}")
 
 
-def report_streams(trace: Trace, key: tuple, out: list[str]) -> None:
-    """The device streams: tasks, aclnn kernels, sync tasks, busy time and main operators."""
-    out.append("  device streams (events, aclnn kernels, sync tasks, busy ms without sync; top operators by time):")
+def report_streams(trace: Trace, key: tuple, swap_keys: list, out: list[str]) -> None:
+    """The device streams: tasks, kernels, sync tasks, copies, busy time and main operators."""
+    out.append("  device streams (* compute, S swap; events, aclnn kernels, sync tasks, MEMCPY_ASYNC and their share"
+               " without / with sync tasks, busy ms without sync; top operators by time):")
     for row in trace.streams():
-        marker = "*" if row["key"] == key else " "
+        marker = "*" if row["key"] == key else "S" if row["key"] in swap_keys else " "
         compute, _sync = split_sync(trace.thread_events(row["key"]))
         top = ", ".join(f"{item['name'][:28]} {item['total_us'] / MS:.0f}" for item in summarize(compute)[:3])
-        out.append(f"   {marker}{row['events']:8d} {row['kernels']:8d} {row['sync']:8d} {row['busy_us'] / MS:10.1f}"
+        out.append(f"   {marker}{row['events']:8d} {row['kernels']:8d} {row['sync']:8d} {row['copies']:8d}"
+                   f" {row['copy_share']:5.0%} {row['copy_share_all']:5.0%} {row['busy_us'] / MS:10.1f}"
                    f"  {row['label']}: {top}")
+
+
+def swap_setup(trace: Trace, key: tuple, args: argparse.Namespace) -> tuple[list, list]:
+    """The swap streams (by the MEMCPY_ASYNC share, or --swap-stream) and their copies."""
+    keys = trace.swap_threads(compute=key, min_share=args.swap_min_share, name=args.swap_stream)
+    return keys, trace.swaps(keys)
+
+
+def waitable_label(event: Any) -> str:
+    """What a stream wait waited for: a collective type, or the activation swap."""
+    return SWAP_LABEL if SWAP_PATTERN.match(event.name) else comm_type(event.name)
 
 
 def report_step(label: str, tasks: list, span: tuple[float, float], out: list[str]) -> dict:
@@ -129,16 +145,16 @@ def report_kernels(tasks: list, top: int, by_task: bool, out: list[str]) -> list
     return rows
 
 
-def report_waits(trace: Trace, tasks: list, start: float, count: int, out: list[str]) -> None:
-    """Stream waits by the collective type they waited for, and the longest ones."""
+def report_waits(trace: Trace, tasks: list, start: float, count: int, swaps: list, out: list[str]) -> None:
+    """Stream waits by what they waited for (a collective type or the swap), and the longest ones."""
     waits = [event for event in sorted(tasks) if is_sync(event) and event.dur > 0]
-    causes = attribute_waits(waits, trace.communications())
+    causes = attribute_waits(waits, trace.communications() + swaps)
     by_type: dict[str, list[float]] = {}
     for wait, cause in zip(waits, causes):
-        by_type.setdefault(comm_type(cause.name) if cause else "(no collective ends there)", []).append(wait.dur)
+        by_type.setdefault(waitable_label(cause) if cause else "(nothing ends there)", []).append(wait.dur)
     total = busy_time(waits)
-    out.append(f"  stream waits: {len(waits)}, {total / MS:.1f} ms; by the collective ending with the wait"
-               " (waits, ms, share):")
+    out.append(f"  stream waits: {len(waits)}, {total / MS:.1f} ms; by the collective or swap copy ending with the"
+               " wait (waits, ms, share):")
     for name, durations in sorted(by_type.items(), key=lambda item: -sum(item[1])):
         share = sum(durations) / (total or 1.0)
         out.append(f"    {len(durations):6d} {sum(durations) / MS:10.2f} {share:6.1%}  {name}")
@@ -147,22 +163,32 @@ def report_waits(trace: Trace, tasks: list, start: float, count: int, out: list[
     ordered = sorted(tasks)
     position = {id(event): index for index, event in enumerate(ordered)}
     out.append(f"  longest {min(count, len(waits))} waits"
-               " (us, at ms, collective waited for and its duration us, next task):")
+               " (us, at ms, collective or swap copy waited for and its duration us, next task):")
     for wait, cause in sorted(zip(waits, causes), key=lambda item: -item[0].dur)[:count]:
         following = next((item.name for item in ordered[position[id(wait)] + 1:] if not is_sync(item)), "-")
-        waited = f"{comm_type(cause.name)} {cause.dur:.0f}" if cause else "-"
+        waited = f"{waitable_label(cause)} {cause.dur:.0f}" if cause else "-"
         out.append(f"    {wait.dur:9.1f} @ {(wait.ts - start) / MS:8.2f}  {waited:24s}  then {following[:50]}")
 
 
-def report_collectives(trace: Trace, start: float, end: float, parts: dict, out: list[str]) -> list[dict]:
-    """Device collectives in the window, by type: their time, and how much of it compute hides."""
+def exposure_rows(comms: list, swaps: list, parts: dict) -> list[dict]:
+    """Collectives by type, all of them, and the swap copies: time in flight, hidden, exposed."""
+    rows = comm_exposure(comms, parts["compute_union"], parts["sync_union"]) if comms else []
+    if swaps:
+        rows += comm_exposure(swaps, parts["compute_union"], parts["sync_union"], key=lambda name: SWAP_LABEL,
+                              total_label=None)
+    return rows
+
+
+def report_collectives(trace: Trace, start: float, end: float, parts: dict, swaps: list,
+                       out: list[str]) -> list[dict]:
+    """Collectives by type and swap copies in the window: their time, and how much of it compute hides."""
     comms = window(trace.communications(), start, end)
-    if not comms:
-        out.append("  collectives: no hcom event in the Communication process")
+    rows = exposure_rows(comms, window(swaps, start, end), parts)
+    if not rows:
+        out.append("  collectives: no hcom event in the Communication process, and no swap stream")
         return []
-    rows = comm_exposure(comms, parts["compute_union"], parts["sync_union"])
-    out.append("  collectives by type: time in flight (union of their intervals), hidden under compute on the")
-    out.append("  compute stream, exposed (during a stream wait / otherwise); ms:")
+    out.append("  collectives by type, and swap copies: time in flight (union of their intervals), hidden under")
+    out.append("  compute on the compute stream, exposed (during a stream wait / otherwise); ms:")
     out.append("     count   in flight     hidden    exposed    in wait  hidden%")
     for row in rows:
         out.append(
@@ -202,9 +228,10 @@ def write_kernels(tasks: list, start: float, path: str) -> None:
             previous_end = event.end if previous_end is None else max(previous_end, event.end)
 
 
-def _rank_view(trace: Trace, step: Optional[int]) -> dict:
+def _rank_view(trace: Trace, step: Optional[int], args: argparse.Namespace) -> dict:
     """One rank's compute stream over one profiled step."""
     key = trace.compute_thread()
+    _swap_keys, swaps = swap_setup(trace, key, args)
     tasks = trace.thread_events(key)
     steps = {number: (start, end) for number, start, end in trace.steps()}
     if not steps:
@@ -218,24 +245,27 @@ def _rank_view(trace: Trace, step: Optional[int]) -> dict:
     comms = window(trace.communications(), start, end)
     return {"step": number, "start": start, "end": end, "parts": parts, "categories": categories,
             "operators": summarize(compute),
-            "comms": comms, "exposure": {row["name"]: row for row in comm_exposure(
-                comms, parts["compute_union"], parts["sync_union"])}}
+            "comms": comms, "exposure": {row["name"]: row for row in exposure_rows(
+                comms, window(swaps, start, end), parts)}}
 
 
 def report_rank_table(views: dict[int, dict], out: list[str]) -> None:
     """Per rank: how the compute stream spends the step, and the work that scales with routed tokens."""
-    out.append("PER RANK (ms): step = compute + stream wait + idle + edges; routed-token work; collectives")
+    out.append("PER RANK (ms): step = compute + stream wait + idle + edges; routed-token work; collectives; swap")
     out.append("  rank  step    span  compute     wait     idle    edges  grouped mm  sort/index"
-               "  a2av flight  a2av exposed  all-comm exposed")
+               "  a2av flight  a2av exposed  all-comm exposed  swap flight  swap exposed")
     for rank, view in views.items():
         parts, cats, exposure = view["parts"], view["categories"], view["exposure"]
-        a2av = exposure.get("alltoallv", {"total_us": 0.0, "exposed_us": 0.0})
+        empty = {"total_us": 0.0, "exposed_us": 0.0}
+        a2av = exposure.get("alltoallv", empty)
+        swap = exposure.get(SWAP_LABEL, empty)
         out.append(
             f"  {rank:4d} {view['step']:5d} {parts['span'] / MS:7.1f} {parts['compute'] / MS:8.1f}"
             f" {parts['wait'] / MS:8.1f} {parts['idle'] / MS:8.1f} {parts['edges'] / MS:8.1f}"
             f" {cats.get('grouped matmul', 0.0) / MS:11.1f} {cats.get('sort / index', 0.0) / MS:11.1f}"
             f" {a2av['total_us'] / MS:12.1f} {a2av['exposed_us'] / MS:13.1f}"
-            f" {exposure['all collectives']['exposed_us'] / MS:17.1f}"
+            f" {exposure.get('all collectives', empty)['exposed_us'] / MS:17.1f}"
+            f" {swap['total_us'] / MS:12.1f} {swap['exposed_us'] / MS:13.1f}"
         )
 
 
@@ -273,7 +303,7 @@ def report_rank_exposure(views: dict[int, dict], out: list[str]) -> None:
     ranks = list(views)
     names = sorted({name for view in views.values() for name in view["exposure"]},
                    key=lambda name: (name == "all collectives", name))
-    out.append("EXPOSED COLLECTIVES (ms): exposed / in flight, per rank")
+    out.append("EXPOSED COLLECTIVES AND SWAP (ms): exposed / in flight, per rank")
     out.append("  " + "".join(f"{f'rank {rank}':>20s}" for rank in ranks) + "  type")
     for name in names:
         cells = []
@@ -345,7 +375,7 @@ def report_ranks(args: argparse.Namespace) -> int:
     views = {}
     for rank, path in files.items():
         out.append(f"  rank {rank}: {path}")
-        views[rank] = _rank_view(Trace.load(path), args.step)
+        views[rank] = _rank_view(Trace.load(path), args.step, args)
     if len({view["step"] for view in views.values()}) > 1:
         out.append(f"  warning: ranks show different steps: { {r: v['step'] for r, v in views.items()} }")
     out.append("")
@@ -392,6 +422,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", default=None, help="where to write kernels.csv and summary.json")
     parser.add_argument("--rank", type=int, default=0,
                         help="the rank to detail when the path holds the traces of several ranks")
+    parser.add_argument("--swap-stream", default=None,
+                        help="device stream(s) carrying the swap copies, by label substring (e.g. 'Stream 49'),"
+                             " instead of the MEMCPY_ASYNC share rule")
+    parser.add_argument("--swap-min-share", type=float, default=0.5,
+                        help="a stream is a swap stream when MEMCPY_ASYNC tasks exceed this share of its"
+                             " non-sync tasks (and number at least 4)")
     parser.add_argument("--ranks", action="store_true",
                         help="compare the traces of every rank under the path (profiling.rank: -1)")
     parser.add_argument("--match", nargs="+", default=["alltoallv", "alltoall"],
@@ -411,8 +447,11 @@ def main() -> int:
     report_inventory(trace, out)
     key = trace.compute_thread()
     tasks = trace.thread_events(key)
-    report_streams(trace, key, out)
+    swap_keys, swaps = swap_setup(trace, key, args)
+    report_streams(trace, key, swap_keys, out)
     out.append(f"compute stream: {trace.thread_label(key)}, {len(tasks)} tasks")
+    out.append("swap streams: " + (", ".join(trace.thread_label(item) for item in swap_keys) or "none")
+               + f", {len(swaps)} MEMCPY_ASYNC")
     out.append("")
 
     steps = trace.steps()
@@ -437,8 +476,8 @@ def main() -> int:
     out.append(f"DETAIL: {label}")
     summary["kernels"] = report_kernels(selected, args.top, args.by_task, out)
     report_idle(parts, out)
-    report_waits(trace, selected, start, args.waits, out)
-    summary["collectives"] = report_collectives(trace, start, end, parts, out)
+    report_waits(trace, selected, start, args.waits, swaps, out)
+    summary["collectives"] = report_collectives(trace, start, end, parts, swaps, out)
     if args.around:
         report_around(selected, args, start, out)
     print("\n".join(out))

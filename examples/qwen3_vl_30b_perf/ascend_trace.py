@@ -49,6 +49,14 @@ STEP_PATTERN = re.compile(r"ProfilerStep#(\d+)")
 SYNC_PATTERN = re.compile(r"^(EVENT|NOTIFY)[ _](WAIT|RECORD)", re.IGNORECASE)
 COMM_PROCESS = "Communication"
 COMM_PREFIX = "hcom"
+# Activation swap copies are MEMCPY_ASYNC tasks on a stream of the device
+# process; one swap may be split into several. Other streams run a few copies
+# for other reasons, so a stream counts as a swap stream only when copies make
+# up more than SWAP_MIN_SHARE of its tasks, synchronization tasks left out.
+SWAP_PATTERN = re.compile(r"^MEMCPY_ASYNC", re.IGNORECASE)
+SWAP_MIN_SHARE = 0.5
+SWAP_MIN_COUNT = 4
+SWAP_LABEL = "swap"
 # hcom_alltoallv__909_502_1 -> alltoallv: the numbers after the type change with every instance.
 COMM_TYPE_PATTERN = re.compile(r"^hcom_?([A-Za-z]+)")
 
@@ -226,10 +234,35 @@ class Trace:
             if key[0] not in pids:
                 continue
             compute, sync = split_sync(events)
+            copies = sum(1 for event in compute if SWAP_PATTERN.match(event.name))
             rows.append({"key": key, "label": self.thread_label(key), "events": len(events),
                          "kernels": sum(1 for event in events if event.name.startswith(prefix)),
-                         "sync": len(sync), "busy_us": busy_time(compute)})
+                         "sync": len(sync), "busy_us": busy_time(compute), "copies": copies,
+                         "copy_share": copies / len(compute) if compute else 0.0,
+                         "copy_share_all": copies / len(events) if events else 0.0})
         return sorted(rows, key=lambda row: -row["kernels"])
+
+    def swap_threads(self, compute: Optional[tuple[Any, Any]] = None, min_share: float = SWAP_MIN_SHARE,
+                     min_count: int = SWAP_MIN_COUNT, name: Optional[str] = None) -> list[tuple[Any, Any]]:
+        """Return the device streams that carry the activation swap copies.
+
+        Args:
+            compute: The compute stream, never a swap stream.
+            min_share: MEMCPY_ASYNC tasks must be more than this share of the
+                stream's tasks, synchronization tasks left out.
+            min_count: And at least this many.
+            name: When given, the streams whose label contains it, instead of the rule.
+        """
+        rows = [row for row in self.streams() if row["key"] != compute]
+        if name is not None:
+            return [row["key"] for row in rows if name in row["label"]]
+        return [row["key"] for row in rows if row["copies"] >= min_count and row["copy_share"] > min_share]
+
+    def swaps(self, threads: list[tuple[Any, Any]]) -> list[Event]:
+        """Return the MEMCPY_ASYNC tasks of the swap streams."""
+        keys = set(threads)
+        return [event for event in self.events
+                if (event.pid, event.tid) in keys and SWAP_PATTERN.match(event.name)]
 
     def communications(self, process: str = COMM_PROCESS, prefix: str = COMM_PREFIX) -> list[Event]:
         """Return the device collectives: ``prefix`` events of the communication process."""
@@ -337,20 +370,23 @@ def step_breakdown(tasks: list[Event], start: float, end: float) -> dict[str, An
 
 def comm_exposure(comms: list[Event], compute_union: list[tuple[float, float]],
                   sync_union: list[tuple[float, float]],
-                  key: Optional[Callable[[str], str]] = None) -> list[dict[str, Any]]:
+                  key: Optional[Callable[[str], str]] = None,
+                  total_label: Optional[str] = "all collectives") -> list[dict[str, Any]]:
     """Return, per collective type and for all of them, how much of their time compute hides.
 
     total: union of the collectives' intervals; hidden: the part during which
     the compute stream computes; exposed: the rest, split into the part the
     stream spends in an EVENT WAIT and the part it sits idle or before/after
-    its tasks. Times in us.
+    its tasks. Times in us. ``total_label`` names the row over all of them,
+    left out when None.
     """
     key = key or comm_type
     groups: dict[str, list[Event]] = defaultdict(list)
     for event in comms:
         groups[key(event.name)].append(event)
     rows = []
-    for name, events in sorted(groups.items()) + [("all collectives", comms)]:
+    totals = [(total_label, comms)] if total_label else []
+    for name, events in sorted(groups.items()) + totals:
         union = merge(events)
         total = length(union)
         hidden = intersection(union, compute_union)
@@ -477,7 +513,7 @@ def around(events: list[Event], pattern: str, before: int, after: int, limit: in
 
 
 __all__ = [
-    "CATEGORIES", "COMM_PREFIX", "COMM_PROCESS", "COMPUTE_PROCESS", "Event", "IDLE_BUCKETS", "KERNEL_PREFIX",
+    "CATEGORIES", "SWAP_LABEL", "SWAP_MIN_COUNT", "SWAP_MIN_SHARE", "SWAP_PATTERN", "COMM_PREFIX", "COMM_PROCESS", "COMPUTE_PROCESS", "Event", "IDLE_BUCKETS", "KERNEL_PREFIX",
     "STEP_PATTERN", "SYNC_PATTERN", "Trace", "around", "attribute_waits", "base_name", "busy_time", "category",
     "comm_exposure", "comm_name", "comm_type", "find_rank_traces", "find_trace_files", "gaps", "intersection",
     "is_sync", "length", "merge", "overlapping", "split_sync", "step_breakdown", "summarize", "trace_rank",

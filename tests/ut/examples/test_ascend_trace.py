@@ -46,7 +46,7 @@ def _x(name, ts, dur, pid, tid):
     return {"ph": "X", "name": name, "ts": f"{ts:.3f}", "dur": dur, "pid": pid, "tid": tid}
 
 
-def _events(a2a_start: float = 300.0) -> list[dict]:
+def _events(a2a_start: float = 300.0, swap: bool = False) -> list[dict]:
     """Two profiled steps; each sits idle 300 us before its grouped matmul.
 
     Per step (1000 us): compute 360 us, stream wait 100 us, idle 310 us
@@ -73,6 +73,20 @@ def _events(a2a_start: float = 300.0) -> list[dict]:
             _x(f"hcom_allGather__12_{step}_1", base + 600, 85, 3, 20),
             _x("Notify_Wait", base + 690, 80, 3, 20),
         ]
+        if swap:
+            events += [
+                # The swap stream: one swap split into two copies, fenced by sync tasks.
+                _x("EVENT_WAIT", base + 795, 5, 2, 12),
+                _x("MEMCPY_ASYNC", base + 800, 50, 2, 12),
+                _x("MEMCPY_ASYNC", base + 850, 50, 2, 12),
+                _x("EVENT_RECORD", base + 900, 0, 2, 12),
+                # The compute stream waits for the swap to finish.
+                _x("EVENT_WAIT", base + 790, 110, 2, 10),
+                # A copy on another stream, which is no swap stream: half its tasks.
+                _x("MEMCPY_ASYNC", base + 710, 5, 2, 11),
+            ]
+    if swap:
+        events.append(_meta("thread_name", 2, "Stream 7", 12))
     return events
 
 
@@ -172,3 +186,29 @@ def test_ranks_split_the_alltoallv_into_skew_and_transfer(tmp_path, capsys, monk
     assert round(matched["skew_ms"] * 1e3) == 50 and round(matched["transfer_ms"] * 1e3) == 50
     assert {rank: round(value * 1e3) for rank, value in matched["waited_ms"].items()} == {"0": 50, "1": 0}
     assert matched["last"] == {"0": 0, "1": 1}
+
+
+def test_swap_stream_and_waits_on_it(tmp_path, capsys, monkeypatch):
+    """The stream made of copies is the swap stream; the compute stream's wait on it is the swap's."""
+    _write(tmp_path / "run_ascend_pt", _events(swap=True))
+    lib = _load("ascend_trace")
+    trace = lib.Trace.load(str(tmp_path))
+    compute = trace.compute_thread()
+    assert trace.swap_threads(compute=compute) == [(2, 12)], "Stream 5's lone copy is half its tasks: not a swap"
+    assert trace.swap_threads(compute=compute, name="Stream 5") == [(2, 11)]
+    swaps = trace.swaps([(2, 12)])
+    assert len(swaps) == 4
+
+    tasks = lib.window(trace.thread_events(compute), 1000.0, 2000.0)
+    waits = [event for event in tasks if lib.is_sync(event) and event.dur > 0]
+    causes = lib.attribute_waits(waits, trace.communications() + swaps)
+    assert [cause.name[:12] for cause in causes] == ["hcom_allGath", "MEMCPY_ASYNC"]
+    assert causes[1].end == 1900.0, "the last copy of the swap releases the wait"
+
+    report = _load("analyze_npu_trace")
+    monkeypatch.setattr(sys, "argv", ["analyze_npu_trace.py", str(tmp_path), "--waits", "2"])
+    assert report.main() == 0
+    printed = capsys.readouterr().out
+    assert "swap streams: Ascend Hardware / Stream 7, 4 MEMCPY_ASYNC" in printed
+    assert "1       0.11  52.4%  swap" in printed, "the swap's share of the stream waits"
+    assert "2        0.10       0.00       0.10       0.10      0%  swap" in printed
