@@ -63,15 +63,19 @@ class EPHostSwapCallback(Callback):
         if record is None or not record["swapped_layers"]:
             return
         logger.info(
-            "EP host swap rank%s step %s: %d of %d MoE layers over budget, %.2f GiB to host at %s GB/s, "
-            "back at %s GB/s, compute waited %.1f ms",
+            "EP host swap rank%s step %s: %d of %d MoE layers over budget, %.2f GiB to host in %.1f ms"
+            " at %s GB/s (never waited for), back in %.1f ms at %s GB/s: %.1f ms hidden under compute,"
+            " %.1f ms exposed",
             self.trainer.global_rank,
             state.global_step + 1,
             record["swapped_layers"],
             record["moe_layers"],
             record["d2h_gib"],
+            record["d2h_ms"],
             _rate(record["d2h_gbps"]),
+            record["h2d_ms"],
             _rate(record["h2d_gbps"]),
+            record["h2d_hidden_ms"],
             record["stall_ms"],
         )
 

@@ -36,8 +36,11 @@ this layer's backward computes. The topmost swapped layer is copied back on
 demand; the compute stream waits for it, and that wait is measured.
 
 Each rank writes one JSON Lines file with, per step and per swapped layer, the
-bytes moved, the device time of both copies and the time the compute stream
-waited, so the host-link bandwidth can be read off.
+bytes moved, the device time of both copies and how much of it the compute
+stream did not wait for, so the host-link bandwidth and the overlap can be read
+off. The copy to host is never waited for: the compute stream goes on, and only
+the release of the device memory follows the copy. The copy back is exposed
+for the time the compute stream waits on it, and hidden for the rest.
 
 Activation recompute runs the block again inside the autograd engine; nothing
 is swapped then, since the recomputed tensors are consumed at once.
@@ -218,6 +221,7 @@ class EPHostSwap:
         h2d_bytes = sum(layer["swapped_bytes"] for layer in layers if layer["loaded"])
         d2h_ms = sum(layer["d2h_ms"] or 0.0 for layer in layers)
         h2d_ms = sum(layer["h2d_ms"] or 0.0 for layer in layers)
+        stall_ms = sum(layer["stall_ms"] or 0.0 for layer in layers)
         record = {
             "step": self._step,
             "rank": rank,
@@ -227,7 +231,11 @@ class EPHostSwap:
             "h2d_gib": h2d_bytes / GIB,
             "d2h_gbps": d2h_bytes / d2h_ms / 1e6 if d2h_ms else None,
             "h2d_gbps": h2d_bytes / h2d_ms / 1e6 if h2d_ms else None,
-            "stall_ms": sum(layer["stall_ms"] or 0.0 for layer in layers),
+            "d2h_ms": d2h_ms,
+            "h2d_ms": h2d_ms,
+            # Copy-back time the compute stream waited for, and the rest, which ran under compute.
+            "stall_ms": stall_ms,
+            "h2d_hidden_ms": max(h2d_ms - stall_ms, 0.0),
             "pinned_gib": self._pool.allocated_bytes / GIB if self._pool else 0.0,
             "layers": layers,
         }
@@ -419,6 +427,14 @@ class EPHostSwap:
             return None
         return events[start].elapsed_time(events[end])
 
+    def _hidden(self, events: dict) -> Optional[float]:
+        """Copy-back time that ran under compute: the copy's duration less the compute stream's wait."""
+        h2d = self._elapsed(events, "h2d_start", "h2d_end")
+        stall = self._elapsed(events, "stall_start", "stall_end")
+        if h2d is None or stall is None:
+            return None
+        return max(h2d - stall, 0.0)
+
     def _layer_record(self, layer: _Layer) -> dict:
         """The JSON-friendly summary of one swapped layer."""
         return {
@@ -431,6 +447,7 @@ class EPHostSwap:
             "d2h_ms": self._elapsed(layer.events, "d2h_start", "d2h_end"),
             "h2d_ms": self._elapsed(layer.events, "h2d_start", "h2d_end"),
             "stall_ms": self._elapsed(layer.events, "stall_start", "stall_end"),
+            "h2d_hidden_ms": self._hidden(layer.events),
             "loaded": layer.loading,
             "prefetched": layer.prefetched,
         }
