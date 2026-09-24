@@ -88,12 +88,46 @@ class Event:
         return self.ts + self.dur
 
 
+RANK_DIR_PATTERN = re.compile(r"(?:^|[/\\])rank(\d+)_[^/\\]*_ascend_pt(?:[/\\]|$)")
+PROFILER_INFO_PATTERN = re.compile(r"profiler_info_(\d+)\.json$")
+IDLE_BUCKETS = ((10.0, "< 10 us"), (100.0, "10-100 us"), (1e3, "0.1-1 ms"), (1e4, "1-10 ms"),
+                (float("inf"), ">= 10 ms"))
+
+
 def find_trace_files(path: str) -> list[str]:
     """Return the trace_view.json files under ``path``, or ``path`` itself."""
     if os.path.isfile(path):
         return [path]
     files = glob.glob(os.path.join(path, "**", "trace_view.json"), recursive=True)
     return sorted(files, key=os.path.getmtime)
+
+
+def trace_rank(trace_file: str) -> Optional[int]:
+    """Return the rank a trace belongs to, from its run directory, or None.
+
+    The trainer names run directories rank<N>_<time>_ascend_pt; torch_npu also
+    writes profiler_info_<N>.json next to ASCEND_PROFILER_OUTPUT when the
+    process group is up.
+    """
+    match = RANK_DIR_PATTERN.search(trace_file)
+    if match:
+        return int(match.group(1))
+    run_dir = os.path.dirname(os.path.dirname(os.path.abspath(trace_file)))
+    for name in sorted(os.listdir(run_dir)) if os.path.isdir(run_dir) else []:
+        match = PROFILER_INFO_PATTERN.match(name)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def find_rank_traces(path: str) -> dict[int, str]:
+    """Return {rank: newest trace_view.json of that rank} under ``path``."""
+    found: dict[int, str] = {}
+    for trace_file in find_trace_files(path):  # oldest first: newer runs overwrite
+        rank = trace_rank(trace_file)
+        if rank is not None:
+            found[rank] = trace_file
+    return dict(sorted(found.items()))
 
 
 def _number(value: Any) -> Optional[float]:
@@ -240,6 +274,92 @@ def busy_time(events: list[Event]) -> float:
     return total
 
 
+def merge(events: Iterable[Event]) -> list[tuple[float, float]]:
+    """Return the union of the events' intervals, as sorted disjoint (start, end) pairs."""
+    merged: list[list[float]] = []
+    for event in sorted(events):
+        if merged and event.ts <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], event.end)
+        else:
+            merged.append([event.ts, event.end])
+    return [(interval[0], interval[1]) for interval in merged]
+
+
+def length(intervals: list[tuple[float, float]]) -> float:
+    """Return the total length of disjoint intervals."""
+    return sum(end - start for start, end in intervals)
+
+
+def intersection(first: list[tuple[float, float]], second: list[tuple[float, float]]) -> float:
+    """Return the length of the intersection of two sorted disjoint interval lists."""
+    total, i, j = 0.0, 0, 0
+    while i < len(first) and j < len(second):
+        start = max(first[i][0], second[j][0])
+        end = min(first[i][1], second[j][1])
+        if end > start:
+            total += end - start
+        if first[i][1] < second[j][1]:
+            i += 1
+        else:
+            j += 1
+    return total
+
+
+def step_breakdown(tasks: list[Event], start: float, end: float) -> dict[str, Any]:
+    """Split a window of one stream into compute, stream waits, idle and edges, in us.
+
+    ``tasks`` are the stream's tasks that start in [start, end). Compute is
+    the union of the non-synchronization tasks; wait is the part of the
+    EVENT WAIT tasks that no compute task covers; idle is the time between
+    the first task's start and the last task's end that no task covers; the
+    edges are the rest of the window, before the first task and after the
+    last one. The four add up to the window length, less any tail of the last
+    task past ``end``. ``idle_buckets`` counts the idle gaps by length.
+    """
+    compute, sync = split_sync(tasks)
+    compute_union, all_union = merge(compute), merge(tasks)
+    sync_union = merge(sync)
+    wait = length(sync_union) - intersection(sync_union, compute_union)
+    idle_gaps = [following[0] - previous[1] for previous, following in zip(all_union, all_union[1:])]
+    first = all_union[0][0] if all_union else start
+    last = all_union[-1][1] if all_union else start
+    buckets = []
+    lower = 0.0
+    for upper, label in IDLE_BUCKETS:
+        chosen = [gap for gap in idle_gaps if lower <= gap < upper]
+        buckets.append({"bucket": label, "count": len(chosen), "total_us": sum(chosen)})
+        lower = upper
+    return {"span": end - start, "compute": length(compute_union), "wait": wait, "idle": sum(idle_gaps),
+            "edges": (first - start) + max(end - last, 0.0), "overrun": max(last - end, 0.0),
+            "tasks": len(compute), "idle_buckets": buckets, "compute_union": compute_union,
+            "sync_union": sync_union}
+
+
+def comm_exposure(comms: list[Event], compute_union: list[tuple[float, float]],
+                  sync_union: list[tuple[float, float]],
+                  key: Optional[Callable[[str], str]] = None) -> list[dict[str, Any]]:
+    """Return, per collective type and for all of them, how much of their time compute hides.
+
+    total: union of the collectives' intervals; hidden: the part during which
+    the compute stream computes; exposed: the rest, split into the part the
+    stream spends in an EVENT WAIT and the part it sits idle or before/after
+    its tasks. Times in us.
+    """
+    key = key or comm_type
+    groups: dict[str, list[Event]] = defaultdict(list)
+    for event in comms:
+        groups[key(event.name)].append(event)
+    rows = []
+    for name, events in sorted(groups.items()) + [("all collectives", comms)]:
+        union = merge(events)
+        total = length(union)
+        hidden = intersection(union, compute_union)
+        in_wait = min(intersection(union, sync_union), total - hidden)
+        rows.append({"name": name, "count": len(events), "total_us": total, "hidden_us": hidden,
+                     "exposed_us": total - hidden, "in_wait_us": in_wait})
+    return rows
+
+
 def gaps(events: list[Event]) -> list[tuple[float, Event, Event]]:
     """Return (idle us, kernel before, kernel after) between consecutive events."""
     result, last = [], None
@@ -357,8 +477,9 @@ def around(events: list[Event], pattern: str, before: int, after: int, limit: in
 
 
 __all__ = [
-    "CATEGORIES", "COMM_PREFIX", "COMM_PROCESS", "COMPUTE_PROCESS", "Event", "KERNEL_PREFIX",
+    "CATEGORIES", "COMM_PREFIX", "COMM_PROCESS", "COMPUTE_PROCESS", "Event", "IDLE_BUCKETS", "KERNEL_PREFIX",
     "STEP_PATTERN", "SYNC_PATTERN", "Trace", "around", "attribute_waits", "base_name", "busy_time", "category",
-    "comm_name", "comm_type", "find_trace_files", "gaps", "is_sync", "overlapping", "split_sync", "summarize",
+    "comm_exposure", "comm_name", "comm_type", "find_rank_traces", "find_trace_files", "gaps", "intersection",
+    "is_sync", "length", "merge", "overlapping", "split_sync", "step_breakdown", "summarize", "trace_rank",
     "window",
 ]

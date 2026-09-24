@@ -20,13 +20,19 @@ Reports, for one profiled step or all of them:
 - how that stream spends the step: computing, waiting on another stream
   (EVENT WAIT tasks), or idle with nothing queued;
 - the kernels and kernel categories that take the time;
+- the idle time between tasks, counted by gap length;
 - the stream waits, by the type of collective each one waited for, and the
   longest of them;
-- the collectives (hcom events of the "Communication" process), by type;
+- the collectives (hcom events of the "Communication" process), by type: their
+  time in flight and how much of it compute hides;
 - optionally, the kernels around every match of a name, with the gaps between
   them (``--around aclnnGroupedMatmul``), to read what one phase launches.
 
     python examples/qwen3_vl_30b_perf/analyze_npu_trace.py <trace dir or trace_view.json>
+
+With the traces of every rank (profiling.rank: -1), ``--ranks`` compares them:
+per-rank step breakdown and routed-token work, and the k-th alltoallv matched
+across ranks, split into the wait for the last rank to arrive and the transfer.
 """
 
 from __future__ import annotations
@@ -35,11 +41,12 @@ import argparse
 import csv
 import json
 import os
+from typing import Optional
 
 # Run as a script, Python puts this directory first on the import path.
 from ascend_trace import (
-    Trace, around, attribute_waits, base_name, busy_time, category, comm_type, gaps, is_sync, split_sync,
-    summarize, window,
+    Trace, around, attribute_waits, base_name, busy_time, category, comm_exposure, comm_type, is_sync, split_sync,
+    find_rank_traces, step_breakdown, summarize, window,
 )
 
 MS = 1e3
@@ -66,20 +73,28 @@ def report_streams(trace: Trace, key: tuple, out: list[str]) -> None:
 
 
 def report_step(label: str, tasks: list, span: tuple[float, float], out: list[str]) -> dict:
-    """How the compute stream spends one window: compute, waits on other streams, idle."""
-    compute, sync = split_sync(tasks)
-    length = span[1] - span[0]
-    busy = busy_time(compute)
-    waiting = busy_time(sync)
-    idle = [gap for gap, _before, _after in gaps(tasks)]
+    """How the compute stream spends one window: compute, waits on other streams, idle, edges."""
+    parts = step_breakdown(tasks, span[0], span[1])
+    total = parts["span"] or 1.0
+
+    def share(name: str) -> str:
+        """One part in ms and as a share of the step."""
+        return f"{parts[name] / MS:7.1f} ({parts[name] / total:4.0%})"
+
     out.append(
-        f"  {label}: {length / MS:8.1f} ms = compute {busy / MS:7.1f} ({busy / length:4.0%})"
-        f" + wait on other streams {waiting / MS:6.1f} ({waiting / length:4.0%})"
-        f" + idle {sum(idle) / MS:6.1f} ({sum(idle) / length:4.0%});"
-        f" {len(compute)} tasks"
+        f"  {label}: {parts['span'] / MS:8.1f} ms = compute {share('compute')} + stream wait {share('wait')}"
+        f" + idle {share('idle')} + before first / after last task {share('edges')}; {parts['tasks']} tasks"
+        + (f"; last task runs {parts['overrun'] / MS:.1f} ms past the step" if parts["overrun"] > 0 else "")
     )
-    return {"label": label, "span_ms": length / MS, "compute_ms": busy / MS, "wait_ms": waiting / MS,
-            "idle_ms": sum(idle) / MS, "tasks": len(compute)}
+    return parts
+
+
+def report_idle(parts: dict, out: list[str]) -> None:
+    """The idle gaps between the stream's tasks, counted by length."""
+    out.append(f"  idle between tasks: {parts['idle'] / MS:.1f} ms, by gap length (gaps, total ms, share of idle):")
+    for row in parts["idle_buckets"]:
+        out.append(f"    {row['count']:8d} {row['total_us'] / MS:10.2f} {row['total_us'] / (parts['idle'] or 1.0):6.1%}"
+                   f"  {row['bucket']}")
 
 
 def report_kernels(tasks: list, top: int, by_task: bool, out: list[str]) -> list[dict]:
@@ -126,16 +141,23 @@ def report_waits(trace: Trace, tasks: list, start: float, count: int, out: list[
         out.append(f"    {wait.dur:9.1f} @ {(wait.ts - start) / MS:8.2f}  {waited:24s}  then {following[:50]}")
 
 
-def report_collectives(trace: Trace, start: float, end: float, out: list[str]) -> None:
-    """Device collectives in the window, by type."""
+def report_collectives(trace: Trace, start: float, end: float, parts: dict, out: list[str]) -> list[dict]:
+    """Device collectives in the window, by type: their time, and how much of it compute hides."""
     comms = window(trace.communications(), start, end)
     if not comms:
         out.append("  collectives: no hcom event in the Communication process")
-        return
-    out.append("  collectives by type (count, total ms, mean us, max us):")
-    for row in summarize(comms, key=comm_type):
-        out.append(f"    {row['count']:6d} {row['total_us'] / MS:10.2f} {row['mean_us']:10.1f} {row['max_us']:10.1f}"
-                   f"  {row['name']}")
+        return []
+    rows = comm_exposure(comms, parts["compute_union"], parts["sync_union"])
+    out.append("  collectives by type: time in flight (union of their intervals), hidden under compute on the")
+    out.append("  compute stream, exposed (during a stream wait / otherwise); ms:")
+    out.append("     count   in flight     hidden    exposed    in wait  hidden%")
+    for row in rows:
+        out.append(
+            f"    {row['count']:6d} {row['total_us'] / MS:11.2f} {row['hidden_us'] / MS:10.2f}"
+            f" {row['exposed_us'] / MS:10.2f} {row['in_wait_us'] / MS:10.2f}"
+            f" {row['hidden_us'] / (row['total_us'] or 1.0):7.0%}  {row['name']}"
+        )
+    return rows
 
 
 def report_around(kernels: list, args: argparse.Namespace, start: float, out: list[str]) -> None:
@@ -167,6 +189,127 @@ def write_kernels(tasks: list, start: float, path: str) -> None:
             previous_end = event.end if previous_end is None else max(previous_end, event.end)
 
 
+def _rank_view(trace: Trace, step: Optional[int]) -> dict:
+    """One rank's compute stream over one profiled step."""
+    key = trace.compute_thread()
+    tasks = trace.thread_events(key)
+    steps = {number: (start, end) for number, start, end in trace.steps()}
+    if not steps:
+        raise ValueError(f"{trace.path}: no ProfilerStep range")
+    number = step if step in steps else max(steps)
+    start, end = steps[number]
+    selected = window(tasks, start, end)
+    parts = step_breakdown(selected, start, end)
+    categories = {row["name"]: row["total_us"] for row in summarize(split_sync(selected)[0], key=category)}
+    comms = window(trace.communications(), start, end)
+    return {"step": number, "start": start, "end": end, "parts": parts, "categories": categories,
+            "comms": comms, "exposure": {row["name"]: row for row in comm_exposure(
+                comms, parts["compute_union"], parts["sync_union"])}}
+
+
+def report_rank_table(views: dict[int, dict], out: list[str]) -> None:
+    """Per rank: how the compute stream spends the step, and the work that scales with routed tokens."""
+    out.append("PER RANK (ms): step = compute + stream wait + idle + edges; routed-token work; collectives")
+    out.append("  rank  step    span  compute     wait     idle    edges  grouped mm  sort/index"
+               "  a2av flight  a2av exposed  all-comm exposed")
+    for rank, view in views.items():
+        parts, cats, exposure = view["parts"], view["categories"], view["exposure"]
+        a2av = exposure.get("alltoallv", {"total_us": 0.0, "exposed_us": 0.0})
+        out.append(
+            f"  {rank:4d} {view['step']:5d} {parts['span'] / MS:7.1f} {parts['compute'] / MS:8.1f}"
+            f" {parts['wait'] / MS:8.1f} {parts['idle'] / MS:8.1f} {parts['edges'] / MS:8.1f}"
+            f" {cats.get('grouped matmul', 0.0) / MS:11.1f} {cats.get('sort / index', 0.0) / MS:11.1f}"
+            f" {a2av['total_us'] / MS:12.1f} {a2av['exposed_us'] / MS:13.1f}"
+            f" {exposure['all collectives']['exposed_us'] / MS:17.1f}"
+        )
+
+
+def report_matched(views: dict[int, dict], kind: str, list_rows: bool, out: list[str]) -> dict:
+    """Match the k-th collective of one type across ranks: arrival skew and transfer.
+
+    A collective ends on every rank once the last rank has joined and the data
+    has moved, so on each rank its duration is the wait for the last rank
+    (last start - own start) plus the transfer (end - last start). The ranks
+    run on one host and share its clock.
+    """
+    lists = {rank: sorted(event for event in view["comms"] if comm_type(event.name) == kind)
+             for rank, view in views.items()}
+    counts = {rank: len(events) for rank, events in lists.items()}
+    count = min(counts.values()) if counts else 0
+    out.append(f"MATCHED {kind}: {count} per rank" + ("" if len(set(counts.values())) <= 1 else
+                                                      f" (counts differ: {counts}; matched by order up to {count})"))
+    if count == 0:
+        return {}
+    origin = min(view["start"] for view in views.values())
+    ranks = list(lists)
+    waited = {rank: 0.0 for rank in ranks}
+    own = {rank: 0.0 for rank in ranks}
+    last_count = {rank: 0 for rank in ranks}
+    total_skew = total_transfer = 0.0
+    rows = []
+    for index in range(count):
+        events = {rank: lists[rank][index] for rank in ranks}
+        last_start = max(event.ts for event in events.values())
+        last_rank = max(ranks, key=lambda rank, events=events: events[rank].ts)
+        transfer = max(max(event.end for event in events.values()) - last_start, 0.0)
+        skew = last_start - min(event.ts for event in events.values())
+        total_skew += skew
+        total_transfer += transfer
+        last_count[last_rank] += 1
+        for rank, event in events.items():
+            waited[rank] += last_start - event.ts
+            own[rank] += event.dur
+        rows.append((index, (min(event.ts for event in events.values()) - origin) / MS, skew, transfer, last_rank,
+                     [events[rank].dur for rank in ranks]))
+    if list_rows:
+        out.append("     k      at ms   skew us  transfer us  last  " + "  ".join(f"r{rank} dur us" for rank in ranks))
+        for index, at, skew, transfer, last_rank, durations in rows:
+            out.append(f"  {index:4d} {at:10.2f} {skew:9.0f} {transfer:12.0f}  {last_rank:4d}  "
+                       + "  ".join(f"{duration:9.0f}" for duration in durations))
+    out.append(f"  sum over the {count}: widest skew {total_skew / MS:.1f} ms, transfer after the last arrival"
+               f" {total_transfer / MS:.1f} ms")
+    out.append("  per rank (ms): time in the collective = waiting for the last rank + transfer; times last")
+    for rank in ranks:
+        out.append(f"    rank {rank}: {own[rank] / MS:8.1f} = {waited[rank] / MS:8.1f} waiting"
+                   f" + {(own[rank] - waited[rank]) / MS:8.1f}; last {last_count[rank]} times")
+    return {"count": count, "skew_ms": total_skew / MS, "transfer_ms": total_transfer / MS,
+            "waited_ms": {rank: value / MS for rank, value in waited.items()},
+            "own_ms": {rank: value / MS for rank, value in own.items()}, "last": last_count}
+
+
+def report_ranks(args: argparse.Namespace) -> int:
+    """Compare the traces of every rank under one trace_dir."""
+    files = find_rank_traces(args.path)
+    if len(files) < 2:
+        raise SystemExit(f"--ranks needs traces of several ranks under {args.path}; found {files}")
+    out: list[str] = [f"traces: {len(files)} ranks"]
+    views = {}
+    for rank, path in files.items():
+        out.append(f"  rank {rank}: {path}")
+        views[rank] = _rank_view(Trace.load(path), args.step)
+    if len({view["step"] for view in views.values()}) > 1:
+        out.append(f"  warning: ranks show different steps: { {r: v['step'] for r, v in views.items()} }")
+    out.append("")
+    report_rank_table(views, out)
+    summary = {"ranks": {rank: {"step": view["step"], **_scalars(view["parts"])} for rank, view in views.items()}}
+    for kind in args.match:
+        out.append("")
+        summary[kind] = report_matched(views, kind, args.list_matched, out)
+    print("\n".join(out))
+    out_dir = args.out_dir or os.path.join(args.path if os.path.isdir(args.path) else os.path.dirname(args.path),
+                                           "analysis_ranks")
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "ranks.json"), "w", encoding="utf-8") as stream:
+        json.dump(summary, stream, indent=2)
+    print(f"\nwrote {out_dir}/ranks.json")
+    return 0
+
+
+def _scalars(parts: dict) -> dict:
+    """The JSON-friendly part of a step breakdown, in ms."""
+    return {name: parts[name] / MS for name in ("span", "compute", "wait", "idle", "edges", "overrun")}
+
+
 def parse_args() -> argparse.Namespace:
     """Command-line options."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -182,13 +325,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=3, help="matches shown")
     parser.add_argument("--skip", type=int, default=0, help="matches skipped before the first one shown")
     parser.add_argument("--out-dir", default=None, help="where to write kernels.csv and summary.json")
+    parser.add_argument("--rank", type=int, default=0,
+                        help="the rank to detail when the path holds the traces of several ranks")
+    parser.add_argument("--ranks", action="store_true",
+                        help="compare the traces of every rank under the path (profiling.rank: -1)")
+    parser.add_argument("--match", nargs="+", default=["alltoallv", "alltoall"],
+                        help="collective types matched across ranks in --ranks mode")
+    parser.add_argument("--list-matched", action="store_true", help="list every matched collective")
     return parser.parse_args()
 
 
 def main() -> int:
     """Load the trace and print the report."""
     args = parse_args()
-    trace = Trace.load(args.path)
+    if args.ranks:
+        return report_ranks(args)
+    ranked = find_rank_traces(args.path)
+    trace = Trace.load(ranked.get(args.rank, args.path) if ranked else args.path)
     out: list[str] = []
     report_inventory(trace, out)
     key = trace.compute_thread()
@@ -200,21 +353,25 @@ def main() -> int:
     steps = trace.steps()
     summary = {"compute_stream": trace.thread_label(key), "steps": []}
     out.append("STEPS (ProfilerStep numbers)")
+    breakdowns = {}
     if steps:
         for step, start, end in steps:
-            summary["steps"].append(report_step(f"step {step}", window(tasks, start, end), (start, end), out))
+            breakdowns[step] = report_step(f"step {step}", window(tasks, start, end), (start, end), out)
         chosen = next((item for item in steps if item[0] == args.step), steps[-1])
         label, start, end = f"step {chosen[0]}", chosen[1], chosen[2]
+        parts = breakdowns[chosen[0]]
     else:
         start, end = tasks[0].ts, tasks[-1].end
         label = "whole trace (no ProfilerStep range found)"
-        summary["steps"].append(report_step(label, tasks, (start, end), out))
+        parts = breakdowns[0] = report_step(label, tasks, (start, end), out)
+    summary["steps"] = [{"step": step, **_scalars(value)} for step, value in breakdowns.items()]
     selected = window(tasks, start, end)
     out.append("")
     out.append(f"DETAIL: {label}")
     summary["kernels"] = report_kernels(selected, args.top, args.by_task, out)
+    report_idle(parts, out)
     report_waits(trace, selected, start, args.waits, out)
-    report_collectives(trace, start, end, out)
+    summary["collectives"] = report_collectives(trace, start, end, parts, out)
     if args.around:
         report_around(selected, args, start, out)
     print("\n".join(out))

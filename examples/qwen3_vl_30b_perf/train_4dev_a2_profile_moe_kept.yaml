@@ -2,15 +2,15 @@
 # 4 Ascend A2 devices, FSDP + EP, same model, data and parallelism as
 # train_4dev_a2_ep_instrument_moe_kept.yaml.
 #
-# What it is for: the EP instrument puts about 250-270 ms per step into the
-# forward router and per-rank counts, more than the expert GEMMs. The profile
-# shows what the compute stream runs there and where it sits idle: a host sync
-# (the .tolist() of the counts) appears as a gap on the stream before the
-# grouped matmul.
+# What it is for: how each rank's compute stream spends a step (compute, waits
+# on collectives, idle), how much collective time compute hides, and, compared
+# across ranks, how much of each EP all-to-all is waiting for the busiest rank
+# and how much is moving data.
 #
 # Differences from the instrumented run:
-# - profiling on rank 0, steps 6 and 7 (end_step is exclusive), with shapes;
-#   the run stops after step 8;
+# - profiling on every rank (rank -1), steps 6 and 7 (end_step is exclusive),
+#   with shapes; the run stops after step 8. Each rank writes its own
+#   rank<N>_<time>_ascend_pt directory, so the ranks' timelines can be compared;
 # - the EP instrument off: its step barriers and per-phase synchronizations
 #   would show up in the trace;
 # - full determinism off, so the kernels are the production ones.
@@ -20,13 +20,15 @@
 #   export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 #   torchrun --nproc_per_node=4 --master_port=29500 \
 #     scripts/train_vl.py examples/qwen3_vl_30b_perf/train_4dev_a2_profile_moe_kept.yaml
-#   python examples/qwen3_vl_30b_perf/analyze_npu_trace.py \
-#     /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/profile_moe_cauldron \
-#     --around aclnnGroupedMatmul
+#   T=/home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/profile_moe_cauldron_ranks
+#   python examples/qwen3_vl_30b_perf/analyze_npu_trace.py $T --rank 0
+#   python examples/qwen3_vl_30b_perf/analyze_npu_trace.py $T --ranks --list-matched
 #
-# torch_npu writes <host>_<pid>_<time>_ascend_pt/ASCEND_PROFILER_OUTPUT/
-# trace_view.json under trace_dir; the analysis reads the newest one. Another
-# rank: --profiling.rank=N and a new trace_dir.
+# torch_npu writes ASCEND_PROFILER_OUTPUT/trace_view.json in each rank's run
+# directory under trace_dir. --rank N details one rank; --ranks compares them:
+# per-rank step breakdown and routed-token work, and each alltoallv matched
+# across ranks, split into the wait for the last rank and the transfer. One
+# rank only: --profiling.rank=N.
 #
 # Devices: torchrun assigns LOCAL_RANK 0..3, which bind to dies 0..3.
 
@@ -186,10 +188,11 @@ debug:
 
 profiling:
   enabled: true
-  rank: 0
+  # Every rank: the imbalance lives in the differences between them.
+  rank: -1
   start_step: 6
   end_step: 8
-  trace_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/profile_moe_cauldron
+  trace_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/profile_moe_cauldron_ranks
   record_shapes: true
   profile_memory: false
   with_stack: false
