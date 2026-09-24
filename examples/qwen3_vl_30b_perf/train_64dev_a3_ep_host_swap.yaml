@@ -7,7 +7,8 @@
 # passes: the forward all-gathers of the dense weights (64 ranks) and of each
 # layer's experts (4 ranks, one per node), and their reduce-scatters in
 # backward. The swap copies then share the step with more collectives, which is
-# the point of the comparison.
+# the point of the comparison. Global rank = node rank x 16 + local rank, so
+# the EP groups are the nodes.
 #
 # What it measures, as the 4-die A2 runs did (train_4dev_a2_ep_host_swap.yaml):
 # - the EP imbalance per layer and per rank, and the MoE memory it causes
@@ -27,40 +28,16 @@
 # layers fit a 64 GB die next to the vision tower and the loss. If it runs out
 # of memory: --model.num_hidden_layers=8; with headroom, raise it.
 #
-# Paths follow the A2 layout; on another cluster override
-# --model.pretrained_model_name_or_path and the output directories.
+# Paths: data and outputs are relative to the repository, where cluster-kit
+# runs every job and from where `cluster gather` pulls; the checkpoint path is
+# absolute (model.pretrained_model_name_or_path) and must exist on every node.
 #
-# Run from the repository root, on every node. Data: 1280 samples (64 ranks x
-# 20 steps), built once on a shared file system (or on every node):
-#   python examples/qwen3_vl_30b_perf/prepare_cauldron_data.py \
-#     --output-dir $O/data/cauldron_seq16384_n1280 --seq-len 16384 --num-samples 1280 \
-#     --processor-path /home/pl/Qwen3-VL-30B-A3B-Instruct
-# (if the four subsets run out of conversations, build what they hold and lower
-# --training.train_iters to the samples / 64.)
-#   export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-#   export TASK_QUEUE_ENABLE=2 CPU_AFFINITY_CONF=1 HCCL_CONNECT_TIMEOUT=1800
-#   O=/home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf
-#   N=<this node's rank, 0..3>  M=<node 0's address>
-#   # baseline, swap off
-#   torchrun --nnodes=4 --node_rank=$N --master_addr=$M --master_port=29500 --nproc_per_node=16 \
-#     scripts/train_vl.py examples/qwen3_vl_30b_perf/train_64dev_a3_ep_host_swap.yaml \
-#     --ep_host_swap.enabled=false --ep_instrument.output_dir=$O/a3_64dev_noswap/instrument
-#   # swap on (the YAML as is)
-#   torchrun --nnodes=4 --node_rank=$N --master_addr=$M --master_port=29500 --nproc_per_node=16 \
-#     scripts/train_vl.py examples/qwen3_vl_30b_perf/train_64dev_a3_ep_host_swap.yaml
-#   # reports: as in train_16dev_a3_ep_host_swap.yaml, with a3_64dev_* directories
-#   # (each node writes its ranks' files: gather them in one directory first
-#   # when the output directory is not shared)
-#   # profile of the swap run, every rank, steps 6-9:
-#   torchrun --nnodes=4 --node_rank=$N --master_addr=$M --master_port=29500 --nproc_per_node=16 \
-#     scripts/train_vl.py examples/qwen3_vl_30b_perf/train_64dev_a3_ep_host_swap.yaml \
-#     --training.train_iters=10 --ep_instrument.enabled=false \
-#     --profiling.enabled=true --profiling.rank=-1 --profiling.start_step=6 --profiling.end_step=10 \
-#     --ep_host_swap.output_dir=$O/a3_64dev_profile/ep_host_swap
-#   python examples/qwen3_vl_30b_perf/analyze_npu_trace.py $O/a3_64dev_profile --ranks
-#
-# Devices: torchrun assigns LOCAL_RANK 0..15 on each node, which bind to its 16
-# dies; global rank = node rank x 16 + local rank, so EP groups are the nodes.
+# Launch with cluster-kit (NPROC_PER_NODE=16 in cluster.env). REMOTE_ENV_SETUP
+# must export, next to the toolkit and the Python environment:
+#   PYTORCH_NPU_ALLOC_CONF=expandable_segments:True TASK_QUEUE_ENABLE=2
+#   CPU_AFFINITY_CONF=1 HCCL_CONNECT_TIMEOUT=1800
+# (full determinism sets HCCL_DETERMINISTIC itself). The commands, from the
+# control node, are in examples/qwen3_vl_30b_perf/A3_RUNS.md.
 
 model:
   _target_: examples.qwen3_vl_30b_perf.cropped_qwen3_vl.build_cropped_qwen3_vl
@@ -166,7 +143,7 @@ compile:
 dataset:
   _target_: hyper_parallel.data.vlm.build_vlm_dataset
   # Built by prepare_cauldron_data.py for this sequence length (see the header).
-  data_path: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/data/cauldron_seq16384_n1280/vlm_conversations.json
+  data_path: outputs/qwen3_vl_30b_perf/data/cauldron_seq16384_n1280/vlm_conversations.json
   data_config:
     source_type: online
   model_assets:
@@ -210,7 +187,7 @@ lr_scheduler:
 
 checkpoint:
   save_ckpt: false
-  checkpoint_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/checkpoints
+  checkpoint_dir: outputs/qwen3_vl_30b_perf/checkpoints
 
 debug:
   check_nan_inf: false
@@ -221,7 +198,7 @@ profiling:
   rank: 0
   start_step: 6
   end_step: 8
-  trace_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/a3_64dev_profile
+  trace_dir: outputs/qwen3_vl_30b_perf/a3_64dev_profile
   record_shapes: false
   profile_memory: false
   with_stack: false
@@ -232,7 +209,7 @@ profiling:
 # end_step 0 records to the end of the run.
 ep_instrument:
   enabled: true
-  output_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/a3_64dev_swap/instrument
+  output_dir: outputs/qwen3_vl_30b_perf/a3_64dev_swap/instrument
   start_step: 3
   end_step: 0
   # Read a peak per phase boundary, which resets the allocator's peak counters;
@@ -254,4 +231,4 @@ ep_host_swap:
   granularity: tensors
   # Index tensors (8 bytes per pair) stay on device.
   min_row_bytes: 1024
-  output_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/a3_64dev_swap/ep_host_swap
+  output_dir: outputs/qwen3_vl_30b_perf/a3_64dev_swap/ep_host_swap

@@ -21,41 +21,16 @@
 # layers fit a 64 GB die next to the vision tower and the loss. If it runs out
 # of memory: --model.num_hidden_layers=8; with headroom, raise it.
 #
-# Paths follow the A2 layout; on another cluster override
-# --model.pretrained_model_name_or_path and the output directories.
+# Paths: data and outputs are relative to the repository, where cluster-kit
+# runs every job and from where `cluster gather` pulls; the checkpoint path is
+# absolute (model.pretrained_model_name_or_path) and must exist on every node.
 #
-# Run from the repository root. Data: 320 real image-text samples of 16384
-# tokens (16 ranks x 20 steps, so the DataLoader does not restart):
-#   python examples/qwen3_vl_30b_perf/prepare_cauldron_data.py \
-#     --output-dir $O/data/cauldron_seq16384_n320 --seq-len 16384 --num-samples 320 \
-#     --processor-path /home/pl/Qwen3-VL-30B-A3B-Instruct
-#   export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-#   export TASK_QUEUE_ENABLE=2 CPU_AFFINITY_CONF=1 HCCL_CONNECT_TIMEOUT=1800
-#   O=/home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf
-#   # baseline, swap off
-#   torchrun --nproc_per_node=16 --master_port=29500 \
-#     scripts/train_vl.py examples/qwen3_vl_30b_perf/train_16dev_a3_ep_host_swap.yaml \
-#     --ep_host_swap.enabled=false --ep_instrument.output_dir=$O/a3_16dev_noswap/instrument
-#   # swap on (the YAML as is)
-#   torchrun --nproc_per_node=16 --master_port=29500 \
-#     scripts/train_vl.py examples/qwen3_vl_30b_perf/train_16dev_a3_ep_host_swap.yaml
-#   # both runs route identically, then the reports (RESERVED GROWTH tags the swaps)
-#   python examples/qwen3_vl_30b_perf/analyze_ep_instrument.py $O/a3_16dev_swap/instrument \
-#     --compare $O/a3_16dev_noswap/instrument
-#   python examples/qwen3_vl_30b_perf/analyze_ep_instrument.py $O/a3_16dev_noswap/instrument
-#   python examples/qwen3_vl_30b_perf/analyze_ep_instrument.py $O/a3_16dev_swap/instrument \
-#     --swap-dir $O/a3_16dev_swap/ep_host_swap
-#   # profile of the swap run, every rank, steps 6-9 (instrument off: its
-#   # barriers and synchronizations would show in the trace)
-#   torchrun --nproc_per_node=16 --master_port=29500 \
-#     scripts/train_vl.py examples/qwen3_vl_30b_perf/train_16dev_a3_ep_host_swap.yaml \
-#     --training.train_iters=10 --ep_instrument.enabled=false \
-#     --profiling.enabled=true --profiling.rank=-1 --profiling.start_step=6 --profiling.end_step=10 \
-#     --ep_host_swap.output_dir=$O/a3_16dev_profile/ep_host_swap
-#   python examples/qwen3_vl_30b_perf/analyze_npu_trace.py $O/a3_16dev_profile --ranks
-#   python examples/qwen3_vl_30b_perf/analyze_npu_trace.py $O/a3_16dev_profile --rank 0 --waits 5 --top 10
-#
-# Devices: torchrun assigns LOCAL_RANK 0..15, which bind to the node's 16 dies.
+# Launch with cluster-kit (NPROC_PER_NODE=16 in cluster.env). REMOTE_ENV_SETUP
+# must export, next to the toolkit and the Python environment:
+#   PYTORCH_NPU_ALLOC_CONF=expandable_segments:True TASK_QUEUE_ENABLE=2
+#   CPU_AFFINITY_CONF=1 HCCL_CONNECT_TIMEOUT=1800
+# (full determinism sets HCCL_DETERMINISTIC itself). The commands, from the
+# control node, are in examples/qwen3_vl_30b_perf/A3_RUNS.md.
 
 model:
   _target_: examples.qwen3_vl_30b_perf.cropped_qwen3_vl.build_cropped_qwen3_vl
@@ -161,7 +136,7 @@ compile:
 dataset:
   _target_: hyper_parallel.data.vlm.build_vlm_dataset
   # Built by prepare_cauldron_data.py for this sequence length (see the header).
-  data_path: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/data/cauldron_seq16384_n320/vlm_conversations.json
+  data_path: outputs/qwen3_vl_30b_perf/data/cauldron_seq16384_n320/vlm_conversations.json
   data_config:
     source_type: online
   model_assets:
@@ -205,7 +180,7 @@ lr_scheduler:
 
 checkpoint:
   save_ckpt: false
-  checkpoint_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/checkpoints
+  checkpoint_dir: outputs/qwen3_vl_30b_perf/checkpoints
 
 debug:
   check_nan_inf: false
@@ -216,7 +191,7 @@ profiling:
   rank: 0
   start_step: 6
   end_step: 8
-  trace_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/a3_16dev_profile
+  trace_dir: outputs/qwen3_vl_30b_perf/a3_16dev_profile
   record_shapes: false
   profile_memory: false
   with_stack: false
@@ -227,7 +202,7 @@ profiling:
 # end_step 0 records to the end of the run.
 ep_instrument:
   enabled: true
-  output_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/a3_16dev_swap/instrument
+  output_dir: outputs/qwen3_vl_30b_perf/a3_16dev_swap/instrument
   start_step: 3
   end_step: 0
   # Read a peak per phase boundary, which resets the allocator's peak counters;
@@ -249,4 +224,4 @@ ep_host_swap:
   granularity: tensors
   # Index tensors (8 bytes per pair) stay on device.
   min_row_bytes: 1024
-  output_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/a3_16dev_swap/ep_host_swap
+  output_dir: outputs/qwen3_vl_30b_perf/a3_16dev_swap/ep_host_swap
