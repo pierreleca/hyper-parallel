@@ -89,6 +89,19 @@ def report_step(label: str, tasks: list, span: tuple[float, float], out: list[st
     return parts
 
 
+def report_mean(breakdowns: list[dict], out: list[str]) -> None:
+    """The mean of the per-step breakdowns, and how far the steps spread."""
+    names = ("span", "compute", "wait", "idle", "edges")
+    mean = {name: sum(parts[name] for parts in breakdowns) / len(breakdowns) for name in names}
+    spans = [parts["span"] for parts in breakdowns]
+    out.append(
+        f"  mean of {len(breakdowns)}: {mean['span'] / MS:6.1f} ms = compute {mean['compute'] / MS:7.1f}"
+        f" + stream wait {mean['wait'] / MS:7.1f} + idle {mean['idle'] / MS:7.1f}"
+        f" + before first / after last task {mean['edges'] / MS:7.1f}"
+        f"; steps range {min(spans) / MS:.1f}-{max(spans) / MS:.1f} ms"
+    )
+
+
 def report_idle(parts: dict, out: list[str]) -> None:
     """The idle gaps between the stream's tasks, counted by length."""
     out.append(f"  idle between tasks: {parts['idle'] / MS:.1f} ms, by gap length (gaps, total ms, share of idle):")
@@ -357,6 +370,8 @@ def main() -> int:
     if steps:
         for step, start, end in steps:
             breakdowns[step] = report_step(f"step {step}", window(tasks, start, end), (start, end), out)
+        if len(steps) > 1:
+            report_mean(list(breakdowns.values()), out)
         chosen = next((item for item in steps if item[0] == args.step), steps[-1])
         label, start, end = f"step {chosen[0]}", chosen[1], chosen[2]
         parts = breakdowns[chosen[0]]

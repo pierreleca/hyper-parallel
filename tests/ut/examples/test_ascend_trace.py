@@ -146,6 +146,7 @@ def test_report_runs_end_to_end(trace_path, capsys, monkeypatch):
     printed = capsys.readouterr().out
     for heading in ("compute stream: Ascend Hardware / Stream 2", "step 6:", "DETAIL: step 7",
                     "compute     0.4 ( 36%) + stream wait     0.1 ( 10%) + idle     0.3 ( 31%)",
+                    "mean of 2:    1.0 ms = compute     0.4",
                     "1       0.10 100.0%  allGather", "allGather 85", "idle between tasks: 0.3 ms",
                     "1        0.09       0.07       0.01       0.01     82%  allGather", "around 'GroupedMatmul'"):
         assert heading in printed, heading

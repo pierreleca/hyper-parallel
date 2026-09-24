@@ -8,8 +8,9 @@
 # and how much is moving data.
 #
 # Differences from the instrumented run:
-# - profiling on every rank (rank -1), steps 6 and 7 (end_step is exclusive),
-#   with shapes; the run stops after step 8. Each rank writes its own
+# - profiling on every rank (rank -1), steps 6 to 9 (end_step is exclusive),
+#   with shapes; the run stops after step 10. Two steps differed by 30% in the
+#   first profile, so four give a steadier mean. Each rank writes its own
 #   rank<N>_<time>_ascend_pt directory, so the ranks' timelines can be compared;
 # - the EP instrument off: its step barriers and per-phase synchronizations
 #   would show up in the trace;
@@ -52,7 +53,7 @@ model:
   validate_placement: false
 
 training:
-  train_iters: 8
+  train_iters: 10
   global_batch_size: 4
   micro_batch_size: 1
   backend: hccl
@@ -191,7 +192,7 @@ profiling:
   # Every rank: the imbalance lives in the differences between them.
   rank: -1
   start_step: 6
-  end_step: 8
+  end_step: 10
   trace_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/profile_moe_cauldron_ranks
   record_shapes: true
   profile_memory: false
