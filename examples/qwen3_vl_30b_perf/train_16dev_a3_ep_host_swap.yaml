@@ -1,0 +1,252 @@
+# Qwen3-VL-30B-A3B-Instruct on 16 Ascend A3 dies (one node): EP imbalance and
+# the per-layer MoE host swap. FSDP 16 over every weight, EP 16 (8 of the 128
+# experts per rank, all-to-all inside the node), experts not FSDP-sharded
+# (edp_shard 1).
+#
+# What it measures, as the 4-die A2 runs did (train_4dev_a2_ep_host_swap.yaml):
+# - the EP imbalance per layer and per rank, and the MoE memory it causes
+#   (EP instrument on, MoE blocks kept: activation_checkpoint full_except_moe);
+# - the per-layer host swap (ep_host_swap, whole tensors, budget 1.2 x the
+#   mean): which layers go over, the bytes moved, the copy bandwidth each way,
+#   how much of the copy back compute hides, and where the allocator's reserve
+#   grows;
+# - against a baseline run with the swap off. Full determinism makes step i
+#   identical in both runs (same samples, same routing), so the difference is
+#   the swap's own cost; keep train_iters equal, since the cosine LR schedule
+#   depends on it.
+#
+# Depth: 10 of the 48 text layers (the builder crops the checkpoint). With the
+# MoE blocks kept, each text layer holds about 2.7 GiB of activations at 16384
+# tokens per rank, plus its share of weights, gradients and moments; about 10
+# layers fit a 64 GB die next to the vision tower and the loss. If it runs out
+# of memory: --model.num_hidden_layers=8; with headroom, raise it.
+#
+# Paths follow the A2 layout; on another cluster override
+# --model.pretrained_model_name_or_path and the output directories.
+#
+# Run from the repository root. Data: 320 real image-text samples of 16384
+# tokens (16 ranks x 20 steps, so the DataLoader does not restart):
+#   python examples/qwen3_vl_30b_perf/prepare_cauldron_data.py \
+#     --output-dir $O/data/cauldron_seq16384_n320 --seq-len 16384 --num-samples 320 \
+#     --processor-path /home/pl/Qwen3-VL-30B-A3B-Instruct
+#   export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+#   export TASK_QUEUE_ENABLE=2 CPU_AFFINITY_CONF=1 HCCL_CONNECT_TIMEOUT=1800
+#   O=/home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf
+#   # baseline, swap off
+#   torchrun --nproc_per_node=16 --master_port=29500 \
+#     scripts/train_vl.py examples/qwen3_vl_30b_perf/train_16dev_a3_ep_host_swap.yaml \
+#     --ep_host_swap.enabled=false --ep_instrument.output_dir=$O/a3_16dev_noswap/instrument
+#   # swap on (the YAML as is)
+#   torchrun --nproc_per_node=16 --master_port=29500 \
+#     scripts/train_vl.py examples/qwen3_vl_30b_perf/train_16dev_a3_ep_host_swap.yaml
+#   # both runs route identically, then the reports (RESERVED GROWTH tags the swaps)
+#   python examples/qwen3_vl_30b_perf/analyze_ep_instrument.py $O/a3_16dev_swap/instrument \
+#     --compare $O/a3_16dev_noswap/instrument
+#   python examples/qwen3_vl_30b_perf/analyze_ep_instrument.py $O/a3_16dev_noswap/instrument
+#   python examples/qwen3_vl_30b_perf/analyze_ep_instrument.py $O/a3_16dev_swap/instrument \
+#     --swap-dir $O/a3_16dev_swap/ep_host_swap
+#   # profile of the swap run, every rank, steps 6-9 (instrument off: its
+#   # barriers and synchronizations would show in the trace)
+#   torchrun --nproc_per_node=16 --master_port=29500 \
+#     scripts/train_vl.py examples/qwen3_vl_30b_perf/train_16dev_a3_ep_host_swap.yaml \
+#     --training.train_iters=10 --ep_instrument.enabled=false \
+#     --profiling.enabled=true --profiling.rank=-1 --profiling.start_step=6 --profiling.end_step=10 \
+#     --ep_host_swap.output_dir=$O/a3_16dev_profile/ep_host_swap
+#   python examples/qwen3_vl_30b_perf/analyze_npu_trace.py $O/a3_16dev_profile --ranks
+#   python examples/qwen3_vl_30b_perf/analyze_npu_trace.py $O/a3_16dev_profile --rank 0 --waits 5 --top 10
+#
+# Devices: torchrun assigns LOCAL_RANK 0..15, which bind to the node's 16 dies.
+
+model:
+  _target_: examples.qwen3_vl_30b_perf.cropped_qwen3_vl.build_cropped_qwen3_vl
+  # One key: the checkpoint, the HF configuration that the builder crops, and
+  # the processor source that the VLM Trainer reads.
+  pretrained_model_name_or_path: /home/pl/Qwen3-VL-30B-A3B-Instruct
+  num_hidden_layers: 10
+  local_files_only: true
+  torch_dtype: bfloat16
+  # On Ascend, transformers routes flash_attention_2 to torch_npu's
+  # npu_fusion_attention: varlen over per-image cu_seqlens in the vision tower;
+  # the fused text attention below runs the causal sparse mode.
+  attn_implementation: flash_attention_2
+  # Under EP the sharding planner covers the text decoder but, in the vision
+  # tower, only the LayerNorms, and its coverage check fails. This keeps the
+  # undeclared vision parameters as plain FSDP parameters (the correct layout
+  # at TP = CP = 1) and turns the check into a warning.
+  allow_uncovered_params: true
+  validate_placement: false
+
+training:
+  train_iters: 20
+  global_batch_size: 16
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  # Step i gives the same result in every run (see the header).
+  enable_full_determinism: true
+  logging_steps: 1
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 16
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 16
+  edp_shard_size: 1
+  replicate_params: []
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+# Module replacements run before sharding and checkpoint loading.
+# module_type + exact_type keep the vision tower untouched. Replacement targets
+# must not nest, so the per-head q/k norms inside self_attn stay Transformers
+# RMSNorm modules.
+plan_overrides:
+  # torch_npu.npu_rms_norm for the decoder-layer and final text norms.
+  - match:
+      - "*.language_model.layers.*.input_layernorm"
+      - "*.language_model.layers.*.post_attention_layernorm"
+      - "*.language_model.norm"
+    module_type: transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextRMSNorm
+    exact_type: true
+    replace_module:
+      _target_: hyper_parallel.components.modules.RMSNorm
+  # modules.GQAAttention (fused QKV projection, fused RoPE) driven by the
+  # Qwen3 attention interface: mask-free batches run npu_fusion_attention's
+  # causal sparse mode, which skips fully masked blocks.
+  - match: "*.language_model.layers.*.self_attn"
+    module_type: transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextAttention
+    exact_type: true
+    replace_module:
+      _target_: hyper_parallel.models.qwen3_moe.adapter.replacements.replace_qwen3_moe_flash_attention
+  # Grouped-GEMM routed experts (npu_moe_token_permute + npu_grouped_matmul).
+  - match: "*.language_model.layers.*.mlp.experts"
+    module_type: transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextExperts
+    exact_type: true
+    replace_module:
+      _target_: hyper_parallel.components.modules.GroupedExperts
+  # EP all-to-all dispatch/combine around the grouped experts. Scoped to the
+  # text layers: the vision blocks also own "mlp" modules.
+  - match: "*.language_model.layers.*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn
+      use_grouped_gemm: true
+
+mixed_precision:
+  enabled: false
+
+# Recompute the vision blocks and the text attention and norms; keep the MoE
+# activations of every text layer.
+activation_checkpoint:
+  mode: full_except_moe
+
+activation_swap: none
+
+compile:
+  enabled: false
+
+dataset:
+  _target_: hyper_parallel.data.vlm.build_vlm_dataset
+  # Built by prepare_cauldron_data.py for this sequence length (see the header).
+  data_path: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/data/cauldron_seq16384_n320/vlm_conversations.json
+  data_config:
+    source_type: online
+  model_assets:
+    chat_template: null
+    tokenizer: null
+  data_transform:
+    _target_: hyper_parallel.data.vlm.build_vlm_data_transform
+    max_seq_len: 16384
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.vlm.build_vlm_collator
+  # get_batch omitted: VLMTrainer defaults to build_vlm_get_batch.
+  dataloader_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  # Image preprocessing and tokenization of long samples run in worker
+  # processes so they stay off the training critical path.
+  num_workers: 4
+  pin_memory: false
+  prefetch_factor: 2
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/checkpoints
+
+debug:
+  check_nan_inf: false
+  check_dataset: null
+
+profiling:
+  enabled: false
+  rank: 0
+  start_step: 6
+  end_step: 8
+  trace_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/a3_16dev_profile
+  record_shapes: false
+  profile_memory: false
+  with_stack: false
+  with_modules: false
+
+# Expert-parallel imbalance recording. start_step skips the warm-up steps, whose
+# allocator growth and first-touch HCCL links say nothing about the steady state;
+# end_step 0 records to the end of the run.
+ep_instrument:
+  enabled: true
+  output_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/a3_16dev_swap/instrument
+  start_step: 3
+  end_step: 0
+  # Read a peak per phase boundary, which resets the allocator's peak counters;
+  # the trainer's own peak metric folds the recorder's running peak back in.
+  segment_peaks: true
+  # Meet the ranks at a barrier before each step, so their recorded timelines
+  # start together.
+  align_steps: true
+  record_counts: true
+
+# Per-layer budget for the MoE activations; the excess goes to pinned host memory.
+ep_host_swap:
+  enabled: true
+  capacity_factor: 1.2
+  # tensors: move whole saved tensors. rows: move about the excess only, at the
+  # cost of a device copy of the kept rows of one tensor each way; its buffers
+  # fragmented the allocator on A2 (reserve +0.5-1.2 GiB), so tensors is the
+  # default.
+  granularity: tensors
+  # Index tensors (8 bytes per pair) stay on device.
+  min_row_bytes: 1024
+  output_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/a3_16dev_swap/ep_host_swap
