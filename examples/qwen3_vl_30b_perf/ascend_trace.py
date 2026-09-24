@@ -513,7 +513,8 @@ def around(events: list[Event], pattern: str, before: int, after: int, limit: in
 
 
 __all__ = [
-    "CATEGORIES", "SWAP_LABEL", "SWAP_MIN_COUNT", "SWAP_MIN_SHARE", "SWAP_PATTERN", "COMM_PREFIX", "COMM_PROCESS", "COMPUTE_PROCESS", "Event", "IDLE_BUCKETS", "KERNEL_PREFIX",
+    "CATEGORIES", "SWAP_LABEL", "SWAP_MIN_COUNT", "SWAP_MIN_SHARE", "SWAP_PATTERN",
+    "COMM_PREFIX", "COMM_PROCESS", "COMPUTE_PROCESS", "Event", "IDLE_BUCKETS", "KERNEL_PREFIX",
     "STEP_PATTERN", "SYNC_PATTERN", "Trace", "around", "attribute_waits", "base_name", "busy_time", "category",
     "comm_exposure", "comm_name", "comm_type", "find_rank_traces", "find_trace_files", "gaps", "intersection",
     "is_sync", "length", "merge", "overlapping", "split_sync", "step_breakdown", "summarize", "trace_rank",
