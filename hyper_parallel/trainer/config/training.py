@@ -94,6 +94,30 @@ class EPInstrumentConfig:
 
 
 @dataclass
+class EPHostSwapConfig:
+    """Per-layer budget for the MoE activations, the excess swapped to host.
+
+    Read by ``EPHostSwapCallback``; the swap itself lives in
+    ``hyper_parallel.distributed.expert_parallel.host_swap``. Each MoE layer
+    keeps at most ``capacity_factor`` times the routed pairs a rank sends; the
+    saved tensors beyond that go to pinned host memory in forward and come back
+    in backward.
+    """
+
+    enabled: bool = False
+    capacity_factor: float = 1.2
+    # Saved tensors with fewer bytes per routed pair (indices) stay on device.
+    min_row_bytes: int = 1024
+    # One JSON Lines file per rank: bytes moved, copy times and waits per step.
+    output_dir: str = "./outputs/ep_host_swap"
+
+    def __post_init__(self) -> None:
+        """Reject a budget that cannot hold anything."""
+        if self.capacity_factor <= 0:
+            raise ValueError("ep_host_swap.capacity_factor must be positive")
+
+
+@dataclass
 class ProfilingConfig:
     """Lightweight per-step profiler settings."""
 

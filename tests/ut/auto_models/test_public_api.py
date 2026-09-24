@@ -224,6 +224,7 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 "DataLoaderConfig",
                 "DatasetConfig",
                 "DebugConfig",
+                "EPHostSwapConfig",
                 "EPInstrumentConfig",
                 "FSDP2Config",
                 "MixedPrecisionConfig",
