@@ -381,6 +381,40 @@ def test_analysis_reports_reserved_memory_and_its_growth(tmp_path, capsys):
     capsys.readouterr()
 
 
+def test_reserved_growth_is_located_and_tagged_with_the_swaps(tmp_path):
+    """A reserve that rises inside one segment of one step is reported there, with that step's swap."""
+    analyzer = _load_analyzer()
+    records = tmp_path / "records"
+    records.mkdir()
+    _synthetic_records(records, [150, 100, 80, 70], [2 ** 31] * 4)
+    base = 10 * 2 ** 30
+    for path in records.glob("rank*.jsonl"):
+        lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        for record in lines[1:]:
+            grown = False
+            for mark in record["marks"]:
+                if record["step"] == 2 and path.name == "rank000.jsonl" and mark[:4] == [1, "fwd", 0, "experts"]:
+                    grown = True
+                    mark += [base, base + 2 ** 29]  # the segment's peak passes the reserve by 512 MiB
+                else:
+                    mark += [base + (2 ** 29 if grown else 0), None]
+        path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+    swap_dir = tmp_path / "swap"
+    swap_dir.mkdir()
+    (swap_dir / "host_swap_rank0.jsonl").write_text("\n".join([
+        json.dumps({"header": True, "rank": 0}),
+        json.dumps({"step": 2, "rank": 0, "layers": [{"index": 1}]}),
+    ]) + "\n", encoding="utf-8")
+
+    _headers, steps = analyzer.load_records(str(records), skip=0)
+    out = []
+    growth = analyzer.report_reserved_growth(steps, out, analyzer.load_swaps(str(swap_dir)))
+    assert growth["0"]["growth_gib"] == pytest.approx(0.5)
+    assert growth["0"]["events"] == [{"step": 2, "segment": "L1:fwd:dispatched -> L1:fwd:experts", "mib": 512.0}]
+    assert growth["1"]["growth_gib"] == 0.0 and not growth["1"]["events"]
+    assert "[swapped L1]" in "\n".join(out)
+
+
 def test_compare_finds_the_first_diverging_step(tmp_path):
     """Two identical runs compare equal; a changed step is located."""
     analyzer = _load_analyzer()

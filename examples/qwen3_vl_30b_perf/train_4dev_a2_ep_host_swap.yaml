@@ -15,10 +15,12 @@
 # - the log line "EP host swap rankN step S": layers over budget, GiB moved,
 #   the D2H and H2D bandwidths and how long the compute stream waited;
 # - ep_host_swap/host_swap_rank<N>.jsonl: the same per layer;
-# - the EP instrument (on, as in the baseline): the per-layer memory and step
-#   peaks, to set against the baseline's same report:
+# - the EP instrument (on, as in the baseline): the per-layer memory, the step
+#   peaks and where the allocator's reserve grows, tagged with the swaps, to
+#   set against the baseline's same report:
 #     python examples/qwen3_vl_30b_perf/analyze_ep_instrument.py \
-#       /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/ep_host_swap_cauldron/instrument --skip 2
+#       /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/ep_host_swap_cauldron/instrument --skip 2 \
+#       --swap-dir /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/ep_host_swap_cauldron/ep_host_swap
 # - the routing, which must match the baseline step by step, since the swap
 #   changes no value:
 #     python examples/qwen3_vl_30b_perf/analyze_ep_instrument.py \
@@ -220,9 +222,11 @@ ep_instrument:
 ep_host_swap:
   enabled: true
   capacity_factor: 1.2
-  # rows: move about the excess only, at the cost of a device copy of the kept
-  # rows of one tensor each way; tensors: move whole saved tensors.
-  granularity: rows
+  # tensors: move whole saved tensors. rows: move about the excess only, at the
+  # cost of a device copy of the kept rows of one tensor each way; its buffers
+  # fragmented the allocator on A2 (reserve +0.5-1.2 GiB), so tensors is the
+  # default.
+  granularity: tensors
   # Index tensors (8 bytes per pair) stay on device.
   min_row_bytes: 1024
   output_dir: /home/pl/hyper-parallel/outputs/qwen3_vl_30b_perf/ep_host_swap_cauldron/ep_host_swap

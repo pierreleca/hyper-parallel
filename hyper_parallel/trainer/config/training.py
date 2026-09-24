@@ -106,10 +106,12 @@ class EPHostSwapConfig:
 
     enabled: bool = False
     capacity_factor: float = 1.2
-    # What goes to host: "rows" moves about the excess only (the kept rows of the
-    # split tensor cost a device copy each way); "tensors" moves whole saved
-    # tensors, with no device copy but up to a whole tensor more host traffic.
-    granularity: str = "rows"
+    # What goes to host: "tensors" moves whole saved tensors, with no device copy
+    # but up to a whole tensor more host traffic; "rows" moves about the excess
+    # only, but its kept-rows buffers (a new size every step, allocated near the
+    # peak) fragment the allocator: on 4 A2 dies the reserve grew 0.5-1.2 GiB,
+    # more than the swap saved.
+    granularity: str = "tensors"
     # Saved tensors with fewer bytes per routed pair (indices) stay on device.
     min_row_bytes: int = 1024
     # One JSON Lines file per rank: bytes moved, copy times and waits per step.

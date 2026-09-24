@@ -462,6 +462,73 @@ def _report_reserved(collected: dict, out: list[str]) -> dict[str, Any]:
     return summary
 
 
+def load_swaps(swap_dir: str) -> dict[tuple[int, int], list[int]]:
+    """Read the host-swap records: {(step, rank): [swapped layer indices]}."""
+    swaps: dict[tuple[int, int], list[int]] = {}
+    for path in sorted(glob.glob(os.path.join(swap_dir, "host_swap_rank*.jsonl"))):
+        with open(path, encoding="utf-8") as stream:
+            for line in stream:
+                record = json.loads(line)
+                if record.get("header") or not record.get("layers"):
+                    continue
+                swaps[(record["step"], record["rank"])] = [layer["index"] for layer in record["layers"]]
+    return swaps
+
+
+def report_reserved_growth(
+        steps: dict[int, list[dict]],
+        out: list[str],
+        swaps: dict[tuple[int, int], list[int]] | None = None,
+        threshold_mib: float = 32.0,
+        listed: int = 12,
+) -> dict[str, Any]:
+    """Report where the allocator's reserve grows: which step, which segment, by how much.
+
+    The reserve is a high-water mark: the cache keeps what it maps. With
+    ``segment_peaks`` the recorder resets the peak counters at every mark, so
+    each mark holds the reserved peak of the segment that ends there; the
+    growth is how far that peak passes every earlier one. Every step counts,
+    warm-up included, since the reserve settles there. With ``swaps``, the
+    steps where the rank swapped are tagged with the swapped layers.
+    """
+    summary: dict[str, Any] = {}
+    out.append(f"RESERVED GROWTH (where the allocator's reserve rises; all steps, events over {threshold_mib:.0f} MiB)")
+    for rank in sorted(steps):
+        high = None
+        events = []
+        first = None
+        for record in steps[rank]:
+            previous = "step:start"
+            for layer, pass_name, _occurrence, name, _time_ms, _alloc, _peak, reserved, reserved_peak in marks(record):
+                label = f"{'step' if layer < 0 else f'L{layer}'}:{pass_name}:{name}"
+                value = max(reserved or 0, reserved_peak or 0)
+                if value:
+                    if high is None:
+                        high = first = value
+                    elif value > high:
+                        events.append((record["step"], f"{previous} -> {label}", value - high, value))
+                        high = value
+                previous = label
+        if high is None:
+            continue
+        total = high - first
+        big = [event for event in events if event[2] >= threshold_mib * 2 ** 20]
+        summary[str(rank)] = {
+            "first_gib": first / GIB, "final_gib": high / GIB, "growth_gib": total / GIB,
+            "events": [{"step": step, "segment": segment, "mib": growth / 2 ** 20}
+                       for step, segment, growth, _value in events],
+        }
+        out.append(f"  r{rank}: {first / GIB:.2f} -> {high / GIB:.2f} GiB (+{total / GIB:.2f}), {len(events)} rises,"
+                   f" {len(big)} over {threshold_mib:.0f} MiB:")
+        for step, segment, growth, value in sorted(big, key=lambda item: -item[2])[:listed]:
+            tag = ""
+            if swaps is not None:
+                swapped = swaps.get((step, rank))
+                tag = f"  [swapped L{', L'.join(map(str, swapped))}]" if swapped else "  [no swap]"
+            out.append(f"    step {step:3d}  +{growth / 2 ** 20:7.1f} MiB -> {value / GIB:6.2f} GiB  {segment}{tag}")
+    return summary
+
+
 def report_offload(
         collected: dict,
         headers: dict,
@@ -862,6 +929,10 @@ def main() -> int:
         help="compare the routing of this run with another, step by step, and stop",
     )
     parser.add_argument(
+        "--swap-dir", default=None,
+        help="ep_host_swap output directory: tag the reserved-memory rises with the steps' swaps",
+    )
+    parser.add_argument(
         "--intermediate", type=int, default=None,
         help="expert intermediate size, overriding the recorded one (768 for Qwen3-VL-30B)",
     )
@@ -898,6 +969,10 @@ def main() -> int:
     summary["time"] = report_time(table, collected["ranks"], out)
     out.append("")
     summary["memory"] = report_memory(collected, out)
+    out.append("")
+    _headers, all_steps = load_records(args.record_dir, 0)
+    swaps = load_swaps(args.swap_dir) if args.swap_dir else None
+    summary["reserved_growth"] = report_reserved_growth(all_steps, out, swaps)
     out.append("")
     summary["offload"] = report_offload(collected, headers, table, out, args.intermediate)
     out.append("")

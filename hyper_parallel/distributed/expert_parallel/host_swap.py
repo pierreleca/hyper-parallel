@@ -255,7 +255,7 @@ class EPHostSwap:
     def __init__(self) -> None:
         """Start disabled; ``configure`` turns it on."""
         self.enabled = False
-        self.granularity = "rows"
+        self.granularity = "tensors"
         self.capacity_factor = 1.2
         self.min_row_bytes = 1024
         self.output_dir = ""
@@ -271,7 +271,7 @@ class EPHostSwap:
     # -- configuration and steps ---------------------------------------------
 
     def configure(self, *, enabled: bool, capacity_factor: float, min_row_bytes: int, output_dir: str,
-                  granularity: str = "rows") -> None:
+                  granularity: str = "tensors") -> None:
         """Set the budget, what moves (``rows`` or ``tensors``) and where the per-rank records go."""
         if capacity_factor <= 0:
             raise ValueError("ep_host_swap.capacity_factor must be positive")
