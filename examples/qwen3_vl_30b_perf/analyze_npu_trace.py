@@ -101,7 +101,7 @@ def report_kernels(tasks: list, top: int, by_task: bool, out: list[str]) -> list
     return rows
 
 
-def report_waits(trace: Trace, tasks: list, start: float, end: float, count: int, out: list[str]) -> None:
+def report_waits(trace: Trace, tasks: list, start: float, count: int, out: list[str]) -> None:
     """Stream waits by the collective type they waited for, and the longest ones."""
     waits = [event for event in sorted(tasks) if is_sync(event) and event.dur > 0]
     causes = attribute_waits(waits, trace.communications())
@@ -112,12 +112,14 @@ def report_waits(trace: Trace, tasks: list, start: float, end: float, count: int
     out.append(f"  stream waits: {len(waits)}, {total / MS:.1f} ms; by the collective ending with the wait"
                " (waits, ms, share):")
     for name, durations in sorted(by_type.items(), key=lambda item: -sum(item[1])):
-        out.append(f"    {len(durations):6d} {sum(durations) / MS:10.2f} {sum(durations) / (total or 1.0):6.1%}  {name}")
+        share = sum(durations) / (total or 1.0)
+        out.append(f"    {len(durations):6d} {sum(durations) / MS:10.2f} {share:6.1%}  {name}")
     if count <= 0:
         return
     ordered = sorted(tasks)
     position = {id(event): index for index, event in enumerate(ordered)}
-    out.append(f"  longest {min(count, len(waits))} waits (us, at ms, collective waited for and its duration us, next task):")
+    out.append(f"  longest {min(count, len(waits))} waits"
+               " (us, at ms, collective waited for and its duration us, next task):")
     for wait, cause in sorted(zip(waits, causes), key=lambda item: -item[0].dur)[:count]:
         following = next((item.name for item in ordered[position[id(wait)] + 1:] if not is_sync(item)), "-")
         waited = f"{comm_type(cause.name)} {cause.dur:.0f}" if cause else "-"
@@ -211,7 +213,7 @@ def main() -> int:
     out.append("")
     out.append(f"DETAIL: {label}")
     summary["kernels"] = report_kernels(selected, args.top, args.by_task, out)
-    report_waits(trace, selected, start, end, args.waits, out)
+    report_waits(trace, selected, start, args.waits, out)
     report_collectives(trace, start, end, out)
     if args.around:
         report_around(selected, args, start, out)
