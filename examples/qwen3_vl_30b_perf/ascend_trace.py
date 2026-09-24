@@ -368,6 +368,28 @@ def step_breakdown(tasks: list[Event], start: float, end: float) -> dict[str, An
             "sync_union": sync_union}
 
 
+def wait_split(tasks: list[Event], sources: list[Event]) -> dict[str, float]:
+    """Split a stream's wait time by what released each wait: collectives, the swap, or nothing found.
+
+    Args:
+        tasks: The stream's tasks in the window.
+        sources: The collectives and swap copies a wait may be released by.
+
+    Returns:
+        Microseconds of waiting under "collectives", "swap" and "unattributed".
+    """
+    waits = [event for event in tasks if is_sync(event) and event.dur > 0]
+    split = {"collectives": 0.0, SWAP_LABEL: 0.0, "unattributed": 0.0}
+    for wait, cause in zip(waits, attribute_waits(waits, sources)):
+        if cause is None:
+            split["unattributed"] += wait.dur
+        elif SWAP_PATTERN.match(cause.name):
+            split[SWAP_LABEL] += wait.dur
+        else:
+            split["collectives"] += wait.dur
+    return split
+
+
 def comm_exposure(comms: list[Event], compute_union: list[tuple[float, float]],
                   sync_union: list[tuple[float, float]],
                   key: Optional[Callable[[str], str]] = None,
@@ -516,7 +538,7 @@ __all__ = [
     "CATEGORIES", "SWAP_LABEL", "SWAP_MIN_COUNT", "SWAP_MIN_SHARE", "SWAP_PATTERN",
     "COMM_PREFIX", "COMM_PROCESS", "COMPUTE_PROCESS", "Event", "IDLE_BUCKETS", "KERNEL_PREFIX",
     "STEP_PATTERN", "SYNC_PATTERN", "Trace", "around", "attribute_waits", "base_name", "busy_time", "category",
-    "comm_exposure", "comm_name", "comm_type", "find_rank_traces", "find_trace_files", "gaps", "intersection",
+    "comm_exposure", "wait_split", "comm_name", "comm_type", "find_rank_traces", "find_trace_files", "gaps", "intersection",
     "is_sync", "length", "merge", "overlapping", "split_sync", "step_breakdown", "summarize", "trace_rank",
     "window",
 ]

@@ -48,7 +48,7 @@ from typing import Any, Optional
 # Run as a script, Python puts this directory first on the import path.
 from ascend_trace import (
     SWAP_LABEL, SWAP_PATTERN, Trace, around, attribute_waits, base_name, busy_time, category, comm_exposure,
-    comm_type, is_sync, split_sync,
+    comm_type, is_sync, split_sync, wait_split,
     find_rank_traces, step_breakdown, summarize, window,
 )
 
@@ -88,9 +88,15 @@ def waitable_label(event: Any) -> str:
     return SWAP_LABEL if SWAP_PATTERN.match(event.name) else comm_type(event.name)
 
 
-def report_step(label: str, tasks: list, span: tuple[float, float], out: list[str]) -> dict:
-    """How the compute stream spends one window: compute, waits on other streams, idle, edges."""
+def report_step(label: str, tasks: list, span: tuple[float, float], out: list[str],
+                sources: Optional[list] = None) -> dict:
+    """How the compute stream spends one window: compute, waits on other streams, idle, edges.
+
+    With ``sources`` (collectives and swap copies), the stream wait is split by
+    what released each wait.
+    """
     parts = step_breakdown(tasks, span[0], span[1])
+    parts.update({f"wait_{name}": value for name, value in wait_split(tasks, sources or []).items()})
     total = parts["span"] or 1.0
 
     def share(name: str) -> str:
@@ -102,13 +108,15 @@ def report_step(label: str, tasks: list, span: tuple[float, float], out: list[st
         f" + idle {share('idle')} + before first / after last task {share('edges')}; {parts['tasks']} tasks"
         + (f"; last task runs {parts['overrun'] / MS:.1f} ms past the step" if parts["overrun"] > 0 else "")
     )
+    out.append(f"      stream wait on collectives {parts['wait_collectives'] / MS:.1f} ms, on the swap"
+               f" {parts['wait_' + SWAP_LABEL] / MS:.1f} ms, unattributed {parts['wait_unattributed'] / MS:.1f} ms")
     return parts
 
 
 def report_mean(breakdowns: list[dict], out: list[str]) -> None:
     """The mean of the per-step breakdowns, and how far the steps spread."""
-    names = ("span", "compute", "wait", "idle", "edges")
-    mean = {name: sum(parts[name] for parts in breakdowns) / len(breakdowns) for name in names}
+    names = ("span", "compute", "wait", "idle", "edges", "wait_collectives", "wait_" + SWAP_LABEL)
+    mean = {name: sum(parts.get(name, 0.0) for parts in breakdowns) / len(breakdowns) for name in names}
     spans = [parts["span"] for parts in breakdowns]
     out.append(
         f"  mean of {len(breakdowns)}: {mean['span'] / MS:6.1f} ms = compute {mean['compute'] / MS:7.1f}"
@@ -116,6 +124,8 @@ def report_mean(breakdowns: list[dict], out: list[str]) -> None:
         f" + before first / after last task {mean['edges'] / MS:7.1f}"
         f"; steps range {min(spans) / MS:.1f}-{max(spans) / MS:.1f} ms"
     )
+    out.append(f"      stream wait on collectives {mean['wait_collectives'] / MS:.1f} ms,"
+               f" on the swap {mean['wait_' + SWAP_LABEL] / MS:.1f} ms")
 
 
 def report_idle(parts: dict, out: list[str]) -> None:
@@ -240,6 +250,8 @@ def _rank_view(trace: Trace, step: Optional[int], args: argparse.Namespace) -> d
     start, end = steps[number]
     selected = window(tasks, start, end)
     parts = step_breakdown(selected, start, end)
+    parts.update({f"wait_{name}": value
+                  for name, value in wait_split(selected, trace.communications() + swaps).items()})
     compute = split_sync(selected)[0]
     categories = {row["name"]: row["total_us"] for row in summarize(compute, key=category)}
     comms = window(trace.communications(), start, end)
@@ -253,7 +265,7 @@ def report_rank_table(views: dict[int, dict], out: list[str]) -> None:
     """Per rank: how the compute stream spends the step, and the work that scales with routed tokens."""
     out.append("PER RANK (ms): step = compute + stream wait + idle + edges; routed-token work; collectives; swap")
     out.append("  rank  step    span  compute     wait     idle    edges  grouped mm  sort/index"
-               "  a2av flight  a2av exposed  all-comm exposed  swap flight  swap exposed")
+               "  a2av flight  a2av exposed  all-comm exposed  swap flight  swap exposed  swap wait")
     for rank, view in views.items():
         parts, cats, exposure = view["parts"], view["categories"], view["exposure"]
         empty = {"total_us": 0.0, "exposed_us": 0.0}
@@ -266,6 +278,7 @@ def report_rank_table(views: dict[int, dict], out: list[str]) -> None:
             f" {a2av['total_us'] / MS:12.1f} {a2av['exposed_us'] / MS:13.1f}"
             f" {exposure.get('all collectives', empty)['exposed_us'] / MS:17.1f}"
             f" {swap['total_us'] / MS:12.1f} {swap['exposed_us'] / MS:13.1f}"
+            f" {parts['wait_' + SWAP_LABEL] / MS:10.1f}"
         )
 
 
@@ -402,7 +415,9 @@ def report_ranks(args: argparse.Namespace) -> int:
 
 def _scalars(parts: dict) -> dict:
     """The JSON-friendly part of a step breakdown, in ms."""
-    return {name: parts[name] / MS for name in ("span", "compute", "wait", "idle", "edges", "overrun")}
+    names = ("span", "compute", "wait", "idle", "edges", "overrun", "wait_collectives", "wait_" + SWAP_LABEL,
+             "wait_unattributed")
+    return {name: parts.get(name, 0.0) / MS for name in names}
 
 
 def parse_args() -> argparse.Namespace:
@@ -460,7 +475,8 @@ def main() -> int:
     breakdowns = {}
     if steps:
         for step, start, end in steps:
-            breakdowns[step] = report_step(f"step {step}", window(tasks, start, end), (start, end), out)
+            breakdowns[step] = report_step(f"step {step}", window(tasks, start, end), (start, end), out,
+                                           sources=trace.communications() + swaps)
         if len(steps) > 1:
             report_mean(list(breakdowns.values()), out)
         chosen = next((item for item in steps if item[0] == args.step), steps[-1])
@@ -469,7 +485,8 @@ def main() -> int:
     else:
         start, end = tasks[0].ts, tasks[-1].end
         label = "whole trace (no ProfilerStep range found)"
-        parts = breakdowns[0] = report_step(label, tasks, (start, end), out)
+        parts = breakdowns[0] = report_step(label, tasks, (start, end), out,
+                                            sources=trace.communications() + swaps)
     summary["steps"] = [{"step": step, **_scalars(value)} for step, value in breakdowns.items()]
     selected = window(tasks, start, end)
     out.append("")

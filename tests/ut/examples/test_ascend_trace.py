@@ -212,3 +212,7 @@ def test_swap_stream_and_waits_on_it(tmp_path, capsys, monkeypatch):
     assert "swap streams: Ascend Hardware / Stream 7, 4 MEMCPY_ASYNC" in printed
     assert "1       0.11  52.4%  swap" in printed, "the swap's share of the stream waits"
     assert "2        0.10       0.00       0.10       0.10      0%  swap" in printed
+    assert "stream wait on collectives 0.1 ms, on the swap 0.1 ms, unattributed 0.0 ms" in printed
+    parts = lib.wait_split(tasks, trace.communications() + swaps)
+    assert {name: round(value) for name, value in parts.items()} == {
+        "collectives": 100, "swap": 110, "unattributed": 0}
