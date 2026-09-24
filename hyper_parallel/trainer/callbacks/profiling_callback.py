@@ -22,7 +22,7 @@ from .base import Callback, TrainerState
 
 
 class ProfilingCallback(Callback):
-    """Record a bounded CPU and accelerator trace on one distributed rank."""
+    """Record a bounded CPU and accelerator trace on one distributed rank, or on all of them."""
 
     def __init__(self, trainer: Any) -> None:
         """Initialize the callback from ``TrainerConfig.profiling``.
@@ -35,7 +35,8 @@ class ProfilingCallback(Callback):
         """
         super().__init__(trainer)
         config = trainer.config.profiling
-        self.enabled = config.enabled and trainer.global_rank == config.rank
+        # rank -1 profiles every rank, to compare their timelines (EP imbalance, collective skew).
+        self.enabled = config.enabled and config.rank in (-1, trainer.global_rank)
         self.config = config
         self.profiler = None
         if not config.enabled:
@@ -44,13 +45,13 @@ class ProfilingCallback(Callback):
             raise ValueError("profiling.start_step must be at least 1")
         if config.end_step <= config.start_step:
             raise ValueError("profiling.end_step must be greater than profiling.start_step")
-        if config.rank < 0 or config.rank >= trainer.world_size:
+        if config.rank < -1 or config.rank >= trainer.world_size:
             raise ValueError(
-                f"profiling.rank must be in [0, {trainer.world_size}), but got {config.rank}"
+                f"profiling.rank must be -1 (every rank) or in [0, {trainer.world_size}), but got {config.rank}"
             )
 
     def on_train_begin(self, state: TrainerState, **kwargs: Any) -> None:
-        """Create and start the profiler on the configured rank."""
+        """Create and start the profiler on the configured rank or ranks."""
         del state, kwargs
         if not self.enabled:
             return

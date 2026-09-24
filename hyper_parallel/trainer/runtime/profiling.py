@@ -112,13 +112,15 @@ class _ProfilerBackend(NamedTuple):
     experimental_config: Any
 
 
-def _create_profiler_backend(trace_dir: str) -> _ProfilerBackend:
+def _create_profiler_backend(trace_dir: str, global_rank: int) -> _ProfilerBackend:
     """Create backend-specific profiler objects."""
     if IS_NPU_AVAILABLE:
         profiler_module = torch_npu.profiler
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.NPU]
+        # Name each run directory after its rank (rank<N>_<time>_ascend_pt), so the traces of
+        # several ranks in one trace_dir can be told apart and compared.
         trace_handler = torch_npu.profiler.tensorboard_trace_handler(
-            CACHE_DIR if trace_dir.startswith("hdfs://") else trace_dir
+            CACHE_DIR if trace_dir.startswith("hdfs://") else trace_dir, worker_name=f"rank{global_rank}"
         )
         experimental_config = torch_npu.profiler._ExperimentalConfig(  # pylint: disable=protected-access
             aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
@@ -217,7 +219,7 @@ def create_profiler(
             copy(trace_file, trace_dir)
             logger.info(f"Profiling result uploaded to {trace_dir}.")  # pylint: disable=logging-fstring-interpolation
 
-    profiler_backend = _create_profiler_backend(trace_dir)
+    profiler_backend = _create_profiler_backend(trace_dir, global_rank)
     schedule = _create_profiler_schedule(profiler_backend.module, start_step, end_step)
     base_profiler = profiler_backend.module.profile(
         activities=profiler_backend.activities,

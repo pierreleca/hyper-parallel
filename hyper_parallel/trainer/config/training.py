@@ -105,4 +105,5 @@ class ProfilingConfig:
     profile_memory: bool = False
     with_stack: bool = False
     with_modules: bool = False
+    # The rank to profile, or -1 for every rank (one rank<N>_<time>_ascend_pt directory each).
     rank: int = 0
