@@ -24,12 +24,13 @@ name starts with ``aclnn``.
 
 The helpers here stay generic: load the trace, name its processes and threads,
 pick the compute stream, cut it into profiler steps, and measure kernels, the
-idle gaps between them and the collectives. ``analyze_npu_trace.py`` builds its
+idle time between them, the stream waits and the collectives they wait for. ``analyze_npu_trace.py`` builds its
 report from them.
 """
 
 from __future__ import annotations
 
+import bisect
 import glob
 import json
 import os
@@ -46,9 +47,10 @@ STEP_PATTERN = re.compile(r"ProfilerStep#(\d+)")
 # EVENT WAIT that lasts until the other stream gets there. They are not compute.
 SYNC_PATTERN = re.compile(r"^(EVENT WAIT|EVENT RECORD|NOTIFY WAIT|NOTIFY RECORD|Notify_Wait|Notify_Record)",
                           re.IGNORECASE)
-HOST_PROCESS = "Python"
-COMM_PATTERN = re.compile(r"alltoall|all_to_all|allreduce|all_reduce|allgather|all_gather|reduce_?scatter|"
-                          r"broadcast|hcom|hccl|send|recv", re.IGNORECASE)
+COMM_PROCESS = "Communication"
+COMM_PREFIX = "hcom"
+# hcom_alltoallv__909_502_1 -> alltoallv: the numbers after the type change with every instance.
+COMM_TYPE_PATTERN = re.compile(r"^hcom_?([A-Za-z]+)")
 
 # First match wins; the names are the aclnn/ATen operator names seen in traces.
 CATEGORIES = (
@@ -195,12 +197,10 @@ class Trace:
                          "sync": len(sync), "busy_us": busy_time(compute)})
         return sorted(rows, key=lambda row: -row["kernels"])
 
-    def host_threads(self, process: str = HOST_PROCESS) -> list[tuple[Any, Any]]:
-        """Return the (pid, tid) of the host threads, busiest first."""
+    def communications(self, process: str = COMM_PROCESS, prefix: str = COMM_PREFIX) -> list[Event]:
+        """Return the device collectives: ``prefix`` events of the communication process."""
         pids = set(self.find_processes(process))
-        groups = self.by_thread()
-        keys = [key for key in groups if key[0] in pids]
-        return sorted(keys, key=lambda key: -len(groups[key]))
+        return [event for event in self.events if event.pid in pids and event.name.startswith(prefix)]
 
     def thread_events(self, key: tuple[Any, Any]) -> list[Event]:
         """Return the events of one thread, in time order."""
@@ -216,10 +216,6 @@ class Trace:
                 start, end = found.get(step, (event.ts, event.end))
                 found[step] = (min(start, event.ts), max(end, event.end))
         return [(step, start, end) for step, (start, end) in sorted(found.items())]
-
-    def collectives(self) -> list[Event]:
-        """Return every complete event whose name looks like a collective."""
-        return [event for event in self.events if COMM_PATTERN.search(event.name)]
 
 
 # -- measurements over event lists --------------------------------------------
@@ -278,6 +274,33 @@ def comm_name(name: str) -> str:
     return re.sub(r"[_#:]*\d[\w.]*", "", name).strip("_ ") or name
 
 
+def comm_type(name: str) -> str:
+    """Return the type of an hcom collective: alltoallv, allGather, reduceScatter..."""
+    match = COMM_TYPE_PATTERN.match(name)
+    return match.group(1) if match else comm_name(name)
+
+
+def attribute_waits(waits: list[Event], comms: list[Event], tolerance: float = 50.0) -> list[Optional[Event]]:
+    """Return, for each stream wait, the collective it most likely waited for.
+
+    A stream wait ends when the stream it waits on records the event, which
+    the communication stream does right after its collective: the candidate
+    is the collective whose end is closest to the wait's end, among those
+    ending inside the wait or at most ``tolerance`` us after it. None when no
+    collective ends there (the wait is on another compute stream, or on an
+    event recorded before the wait started).
+    """
+    ends = sorted(comms, key=lambda event: event.end)
+    keys = [event.end for event in ends]
+    result = []
+    for wait in waits:
+        low = bisect.bisect_left(keys, wait.ts)
+        high = bisect.bisect_right(keys, wait.end + tolerance)
+        candidates = ends[low:high]
+        result.append(min(candidates, key=lambda event: abs(event.end - wait.end)) if candidates else None)
+    return result
+
+
 def base_name(name: str) -> str:
     """Return an operator name without the aclnn launcher's repeated suffixes."""
     return name.split("_", 1)[0] if name.startswith(KERNEL_PREFIX) else name
@@ -334,7 +357,8 @@ def around(events: list[Event], pattern: str, before: int, after: int, limit: in
 
 
 __all__ = [
-    "CATEGORIES", "COMM_PATTERN", "COMPUTE_PROCESS", "Event", "HOST_PROCESS", "KERNEL_PREFIX", "STEP_PATTERN",
-    "SYNC_PATTERN", "Trace", "around", "base_name", "busy_time", "category", "comm_name", "find_trace_files",
-    "gaps", "is_sync", "overlapping", "split_sync", "summarize", "window",
+    "CATEGORIES", "COMM_PREFIX", "COMM_PROCESS", "COMPUTE_PROCESS", "Event", "KERNEL_PREFIX",
+    "STEP_PATTERN", "SYNC_PATTERN", "Trace", "around", "attribute_waits", "base_name", "busy_time", "category",
+    "comm_name", "comm_type", "find_trace_files", "gaps", "is_sync", "overlapping", "split_sync", "summarize",
+    "window",
 ]

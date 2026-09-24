@@ -18,13 +18,11 @@ Reports, for one profiled step or all of them:
 
 - which threads the trace holds, and which device stream computes;
 - how that stream spends the step: computing, waiting on another stream
-  (EVENT WAIT tasks, usually for a collective), or idle with nothing queued;
+  (EVENT WAIT tasks), or idle with nothing queued;
 - the kernels and kernel categories that take the time;
-- the longest idle gaps, with the kernels on either side and what the host
-  threads were running meanwhile: a stream that waits for the host (a
-  ``.tolist()``, an ``.item()``, a slow Python stretch) shows up here;
-- the longest waits on other streams;
-- the collectives, by thread;
+- the stream waits, by the type of collective each one waited for, and the
+  longest of them;
+- the collectives (hcom events of the "Communication" process), by type;
 - optionally, the kernels around every match of a name, with the gaps between
   them (``--around aclnnGroupedMatmul``), to read what one phase launches.
 
@@ -40,8 +38,8 @@ import os
 
 # Run as a script, Python puts this directory first on the import path.
 from ascend_trace import (
-    Trace, around, base_name, busy_time, category, comm_name, gaps, is_sync, overlapping, split_sync, summarize,
-    window,
+    Trace, around, attribute_waits, base_name, busy_time, category, comm_type, gaps, is_sync, split_sync,
+    summarize, window,
 )
 
 MS = 1e3
@@ -57,12 +55,14 @@ def report_inventory(trace: Trace, out: list[str]) -> None:
 
 
 def report_streams(trace: Trace, key: tuple, out: list[str]) -> None:
-    """The device streams: how many kernels and synchronization tasks each runs."""
-    out.append("  device streams (events, aclnn kernels, sync tasks, busy ms without sync):")
+    """The device streams: tasks, aclnn kernels, sync tasks, busy time and main operators."""
+    out.append("  device streams (events, aclnn kernels, sync tasks, busy ms without sync; top operators by time):")
     for row in trace.streams():
         marker = "*" if row["key"] == key else " "
+        compute, _sync = split_sync(trace.thread_events(row["key"]))
+        top = ", ".join(f"{item['name'][:28]} {item['total_us'] / MS:.0f}" for item in summarize(compute)[:3])
         out.append(f"   {marker}{row['events']:8d} {row['kernels']:8d} {row['sync']:8d} {row['busy_us'] / MS:10.1f}"
-                   f"  {row['label']}")
+                   f"  {row['label']}: {top}")
 
 
 def report_step(label: str, tasks: list, span: tuple[float, float], out: list[str]) -> dict:
@@ -76,7 +76,7 @@ def report_step(label: str, tasks: list, span: tuple[float, float], out: list[st
         f"  {label}: {length / MS:8.1f} ms = compute {busy / MS:7.1f} ({busy / length:4.0%})"
         f" + wait on other streams {waiting / MS:6.1f} ({waiting / length:4.0%})"
         f" + idle {sum(idle) / MS:6.1f} ({sum(idle) / length:4.0%});"
-        f" {len(compute)} tasks, {sum(1 for gap in idle if gap > 100)} idle gaps over 100 us"
+        f" {len(compute)} tasks"
     )
     return {"label": label, "span_ms": length / MS, "compute_ms": busy / MS, "wait_ms": waiting / MS,
             "idle_ms": sum(idle) / MS, "tasks": len(compute)}
@@ -101,63 +101,39 @@ def report_kernels(tasks: list, top: int, by_task: bool, out: list[str]) -> list
     return rows
 
 
-def _host_activity(trace: Trace, start: float, end: float, depth: int) -> list[str]:
-    """What the host threads ran during [start, end): the innermost events covering most of it."""
-    lines = []
-    length = end - start
-    for key in trace.host_threads():
-        covering = [event for event in overlapping(trace.thread_events(key), start, end)
-                    if min(event.end, end) - max(event.ts, start) >= 0.5 * length]
-        if not covering:
-            continue
-        # Nested ranges: the shortest ones covering the gap are the innermost.
-        innermost = sorted(covering, key=lambda event: event.dur)[:depth]
-        names = " < ".join(f"{event.name[:50]} ({event.dur / MS:.1f} ms)" for event in innermost)
-        lines.append(f"        host {trace.thread_label(key)}: {names}")
-    return lines
-
-
-def report_gaps(trace: Trace, tasks: list, start: float, args: argparse.Namespace, out: list[str]) -> None:
-    """The longest idle gaps, the tasks on either side and the host meanwhile."""
-    ranked = sorted(gaps(tasks), key=lambda item: -item[0])[:args.gaps]
-    out.append(f"  longest {len(ranked)} idle gaps, nothing queued on the stream"
-               " (us, at ms into the window, task before -> task after):")
-    for gap, before, after in ranked:
-        out.append(f"    {gap:9.1f} @ {(before.end - start) / MS:8.2f}  {before.name[:55]}  ->  {after.name[:55]}")
-        if gap >= args.host_min_gap:
-            out.extend(_host_activity(trace, before.end, after.ts, args.host_depth))
-
-
 def report_waits(trace: Trace, tasks: list, start: float, end: float, count: int, out: list[str]) -> None:
-    """The longest waits on another stream, with the collectives running meanwhile."""
+    """Stream waits by the collective type they waited for, and the longest ones."""
+    waits = [event for event in sorted(tasks) if is_sync(event) and event.dur > 0]
+    causes = attribute_waits(waits, trace.communications())
+    by_type: dict[str, list[float]] = {}
+    for wait, cause in zip(waits, causes):
+        by_type.setdefault(comm_type(cause.name) if cause else "(no collective ends there)", []).append(wait.dur)
+    total = busy_time(waits)
+    out.append(f"  stream waits: {len(waits)}, {total / MS:.1f} ms; by the collective ending with the wait"
+               " (waits, ms, share):")
+    for name, durations in sorted(by_type.items(), key=lambda item: -sum(item[1])):
+        out.append(f"    {len(durations):6d} {sum(durations) / MS:10.2f} {sum(durations) / (total or 1.0):6.1%}  {name}")
+    if count <= 0:
+        return
     ordered = sorted(tasks)
-    waits = sorted((index for index, event in enumerate(ordered) if is_sync(event) and event.dur > 0),
-                   key=lambda index: -ordered[index].dur)[:count]
-    total = busy_time([event for event in ordered if is_sync(event)])
-    out.append(f"  longest {len(waits)} waits on other streams ({total / MS:.1f} ms in all;"
-               " us, at ms, next task, device collectives overlapping):")
-    device_comm = [event for event in window(trace.collectives(), start, end)
-                   if trace.processes.get(event.pid, "") not in ("Python", "CANN")]
-    for index in waits:
-        event = ordered[index]
-        following = next((item.name for item in ordered[index + 1:] if not is_sync(item)), "-")
-        comm = sorted({comm_name(item.name) for item in overlapping(device_comm, event.ts, event.end)})
-        out.append(f"    {event.dur:9.1f} @ {(event.ts - start) / MS:8.2f}  then {following[:50]}"
-                   f"  | {', '.join(comm)[:70] or '-'}")
+    position = {id(event): index for index, event in enumerate(ordered)}
+    out.append(f"  longest {min(count, len(waits))} waits (us, at ms, collective waited for and its duration us, next task):")
+    for wait, cause in sorted(zip(waits, causes), key=lambda item: -item[0].dur)[:count]:
+        following = next((item.name for item in ordered[position[id(wait)] + 1:] if not is_sync(item)), "-")
+        waited = f"{comm_type(cause.name)} {cause.dur:.0f}" if cause else "-"
+        out.append(f"    {wait.dur:9.1f} @ {(wait.ts - start) / MS:8.2f}  {waited:24s}  then {following[:50]}")
 
 
 def report_collectives(trace: Trace, start: float, end: float, out: list[str]) -> None:
-    """Collectives in the window, by thread and name."""
-    rows: dict[tuple[str, str], list[float]] = {}
-    for event in window(trace.collectives(), start, end):
-        key = (trace.thread_label((event.pid, event.tid)), comm_name(event.name))
-        rows.setdefault(key, []).append(event.dur)
-    if not rows:
-        out.append("  collectives: none matched")
+    """Device collectives in the window, by type."""
+    comms = window(trace.communications(), start, end)
+    if not comms:
+        out.append("  collectives: no hcom event in the Communication process")
         return
-    out.append("  collectives (count, total ms, thread, name):")
-    for (label, name), durations in sorted(rows.items(), key=lambda item: -sum(item[1]))[:20]:
-        out.append(f"    {len(durations):6d} {sum(durations) / MS:10.2f}  {label}  {name[:60]}")
+    out.append("  collectives by type (count, total ms, mean us, max us):")
+    for row in summarize(comms, key=comm_type):
+        out.append(f"    {row['count']:6d} {row['total_us'] / MS:10.2f} {row['mean_us']:10.1f} {row['max_us']:10.1f}"
+                   f"  {row['name']}")
 
 
 def report_around(kernels: list, args: argparse.Namespace, start: float, out: list[str]) -> None:
@@ -197,11 +173,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top", type=int, default=25, help="kernels to list")
     parser.add_argument("--by-task", action="store_true",
                         help="list device tasks by full name instead of grouping them by aclnn operator")
-    parser.add_argument("--gaps", type=int, default=15, help="idle gaps to list")
-    parser.add_argument("--host-min-gap", type=float, default=1000.0,
-                        help="show the host threads' activity for idle gaps of at least this many us")
-    parser.add_argument("--host-depth", type=int, default=3, help="host ranges shown per thread, innermost first")
-    parser.add_argument("--waits", type=int, default=10, help="waits on other streams to list")
+    parser.add_argument("--waits", type=int, default=10, help="longest stream waits to list")
     parser.add_argument("--around", default=None, help="regex of task names to show in context")
     parser.add_argument("--before", type=int, default=25, help="tasks shown before each match")
     parser.add_argument("--after", type=int, default=5, help="tasks shown after each match")
@@ -239,7 +211,6 @@ def main() -> int:
     out.append("")
     out.append(f"DETAIL: {label}")
     summary["kernels"] = report_kernels(selected, args.top, args.by_task, out)
-    report_gaps(trace, selected, start, args, out)
     report_waits(trace, selected, start, end, args.waits, out)
     report_collectives(trace, start, end, out)
     if args.around:
