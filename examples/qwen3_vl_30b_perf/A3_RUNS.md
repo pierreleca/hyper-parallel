@@ -77,17 +77,20 @@ If the files sit one directory deeper (`scp -r` or `mv` into an existing
 Python environment:
 
 ```bash
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True TASK_QUEUE_ENABLE=2 CPU_AFFINITY_CONF=1 HCCL_CONNECT_TIMEOUT=1800
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True TASK_QUEUE_ENABLE=1 CPU_AFFINITY_CONF=1 HCCL_CONNECT_TIMEOUT=1800
 ```
 
 - `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True` is required: without it, the
   first A3 run failed with 10 GiB cached that the allocator could not hand out
   as one 9.28 GiB block (the fp32 logits gradient).
-- `TASK_QUEUE_ENABLE=2` and `CPU_AFFINITY_CONF=1` only speed up the host side:
-  torch_npu launches operators from a second thread (level 1, the default) and,
-  at level 2, moves more of the launch work there; the affinity pins each
-  process's threads to cores near its NPU. The A2 runs used the defaults, so
-  host-bound phases (router and counts) do not compare one to one.
+- `TASK_QUEUE_ENABLE=1` (the torch_npu default) launches operators from a second
+  thread. Level 2 moves more of the launch work there but gives operator
+  workspaces their own allocator, outside PyTorch's pool: the 16-die baseline
+  then failed to find 5.28 GiB for one workspace with the pool holding the rest
+  of the die. Keep level 1 for these memory-bound runs.
+- `CPU_AFFINITY_CONF=1` pins each process's threads to cores near its NPU; it
+  only speeds up the host side. The A2 runs did not set it, so host-bound phases
+  (router and counts) do not compare one to one.
 - `HCCL_CONNECT_TIMEOUT=1800` gives slow multi-node starts time to connect.
 
 Full determinism sets `HCCL_DETERMINISTIC` itself.
