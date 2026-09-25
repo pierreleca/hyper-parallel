@@ -89,7 +89,8 @@ cluster select -a 1                      # or pick the node by hand
 cluster sync
 cluster exec -p 'python examples/qwen3_vl_30b_perf/prepare_cauldron_data.py \
   --output-dir /home/pl/data/qwen3_vl_30b_perf/cauldron_seq16384_n320 \
-  --seq-len 16384 --num-samples 320 --processor-path /home/e00642590/Qwen3-VL-30B-A3B-Instruct --offline'
+  --seq-len 16384 --num-samples 320 --processor-path /home/e00642590/Qwen3-VL-30B-A3B-Instruct \
+  --download-dir /home/pl/data/the_cauldron --offline'
 
 C=examples/qwen3_vl_30b_perf/train_16dev_a3_ep_host_swap.yaml
 R=/home/pl/runs/qwen3_vl_30b_perf
@@ -129,7 +130,8 @@ cluster select -a 4
 cluster sync
 cluster exec -p 'python examples/qwen3_vl_30b_perf/prepare_cauldron_data.py \
   --output-dir /home/pl/data/qwen3_vl_30b_perf/cauldron_seq16384_n1280 \
-  --seq-len 16384 --num-samples 1280 --processor-path /home/e00642590/Qwen3-VL-30B-A3B-Instruct --offline'
+  --seq-len 16384 --num-samples 1280 --processor-path /home/e00642590/Qwen3-VL-30B-A3B-Instruct \
+  --download-dir /home/pl/data/the_cauldron --offline'
 ```
 
 If the four cauldron subsets run out of conversations, build what they hold on
