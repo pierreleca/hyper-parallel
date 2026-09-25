@@ -97,14 +97,26 @@ class Conversation:
     turns: list[tuple[str, str]]
 
 
-def download(download_dir: Path, insecure: bool = False) -> list[tuple[str, Path]]:
+def download(download_dir: Path, insecure: bool = False, offline: bool = False) -> list[tuple[str, Path]]:
     """Fetch the Parquet files that are not already in ``download_dir``.
 
     ``insecure`` skips TLS certificate verification, for a proxy that
     re-signs traffic with a certificate the environment does not trust.
     Pointing ``SSL_CERT_FILE`` at the proxy's CA certificate keeps
-    verification on instead.
+    verification on instead. ``offline`` never downloads: a missing file
+    stops the run with the names expected and what the directory holds.
     """
+    if offline:
+        missing = [remote.replace("/", "__") for _subset, remote in _SUBSETS
+                   if not (download_dir / remote.replace("/", "__")).is_file()]
+        if missing:
+            held = sorted(path.name for path in download_dir.iterdir()) if download_dir.is_dir() else None
+            raise SystemExit(
+                f"--offline: {len(missing)} of {len(_SUBSETS)} Parquet files missing from {download_dir}:\n  "
+                + "\n  ".join(missing)
+                + (f"\nthe directory holds: {held}" if held is not None else "\nthe directory does not exist")
+                + "\ncopy them there from a machine with internet access (their names as above)"
+            )
     endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
     context = None
     if insecure:
@@ -303,7 +315,7 @@ def prepare(args: argparse.Namespace) -> None:
     from transformers import AutoTokenizer  # pylint: disable=C0415
 
     tokenizer = AutoTokenizer.from_pretrained(args.processor_path, local_files_only=True)
-    conversations = read_conversations(download(args.download_dir, insecure=args.insecure))
+    conversations = read_conversations(download(args.download_dir, insecure=args.insecure, offline=args.offline))
     random.Random(args.seed).shuffle(conversations)
     stream = iter(conversations)
 
@@ -357,6 +369,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=Path("/home/pl/data/the_cauldron"),
     )
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument(
+        "--offline", action="store_true",
+        help="never download: stop with the missing file names instead (for machines without internet)",
+    )
     parser.add_argument(
         "--insecure", action="store_true",
         help="skip TLS certificate verification (a proxy with its own certificate)",

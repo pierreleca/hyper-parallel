@@ -21,9 +21,9 @@
 # layers fit a 64 GB die next to the vision tower and the loss. If it runs out
 # of memory: --model.num_hidden_layers=8; with headroom, raise it.
 #
-# Paths, the same on A2 and on every A3 node, all outside the repository (the
-# code travels as a zip; data and runs stay put): the checkpoint in
-# /home/pl/Qwen3-VL-30B-A3B-Instruct, the raw cauldron Parquet files in
+# Paths, all outside the repository (the code travels as a zip; data and runs
+# stay put): the checkpoint in /home/e00642590/Qwen3-VL-30B-A3B-Instruct on every A3
+# node (/home/pl/Qwen3-VL-30B-A3B-Instruct on A2), the raw cauldron Parquet files in
 # /home/pl/data/the_cauldron, the prepared datasets in
 # /home/pl/data/qwen3_vl_30b_perf/<name>, the run outputs in
 # /home/pl/runs/qwen3_vl_30b_perf/<run>. See A3_RUNS.md.
@@ -39,7 +39,7 @@ model:
   _target_: examples.qwen3_vl_30b_perf.cropped_qwen3_vl.build_cropped_qwen3_vl
   # One key: the checkpoint, the HF configuration that the builder crops, and
   # the processor source that the VLM Trainer reads.
-  pretrained_model_name_or_path: /home/pl/Qwen3-VL-30B-A3B-Instruct
+  pretrained_model_name_or_path: /home/e00642590/Qwen3-VL-30B-A3B-Instruct
   num_hidden_layers: 10
   local_files_only: true
   torch_dtype: bfloat16

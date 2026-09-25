@@ -10,20 +10,25 @@ Two runs per configuration, identical except for the swap, then the reports:
 The A3 nodes have no internet and no shared disk, and the code reaches them as a
 zip of the A2 checkout. So nothing but code lives in the repository: data and
 run outputs sit at fixed paths under `/home/pl`, the same on A2 and on every A3
-node.
+node; only the checkpoint differs.
 
 ## Where things live
 
 | What | Path | A2 | A3 |
 | --- | --- | --- | --- |
-| checkpoint | `/home/pl/Qwen3-VL-30B-A3B-Instruct` | there | on every node |
+| checkpoint | A2 `/home/pl/Qwen3-VL-30B-A3B-Instruct`, A3 `/home/e00642590/Qwen3-VL-30B-A3B-Instruct` | there | on every node |
 | raw cauldron Parquet files (0.8 GB, 4 files) | `/home/pl/data/the_cauldron` | downloaded once | copied once, then synced to every node |
 | prepared datasets (JSON + images) | `/home/pl/data/qwen3_vl_30b_perf/<name>` | built there | built on every node from the raw files, offline |
 | run outputs (records, profiles) | `/home/pl/runs/qwen3_vl_30b_perf/<run>` | written there | written on each node, gathered for the reports |
 
 `prepare_cauldron_data.py` reads `--download-dir` (default
-`/home/pl/data/the_cauldron`) and downloads only the files it does not find, so
-it runs offline once the raw files are in place. A prepared dataset refers to
+`/home/pl/data/the_cauldron`) and downloads only the files it does not find;
+with `--offline`, as on A3, it never downloads and a missing file stops it with
+the names it expects, which must sit directly in that directory:
+`vsr__train-00000-of-00001-b56e9224d46b0ed3.parquet`,
+`infographic_vqa__train-00000-of-00001-9187ab6377a43fd2.parquet`,
+`scienceqa__train-00000-of-00001-c411546b9bc4df22.parquet`,
+`finqa__train-00000-of-00001-4eb0e3dd12354fba.parquet`. A prepared dataset refers to
 its images relative to its JSON file, so its directory can move as a whole.
 
 ## Once on A2: move data and runs out of the repository
@@ -60,7 +65,11 @@ whole pool once, so a later node selection finds it everywhere:
 
 ```bash
 cluster -c <path to the full-pool cluster.env> sync
+cluster -c <path to the full-pool cluster.env> exec 'ls /home/pl/data/the_cauldron'   # the four files, on every node
 ```
+
+If the files sit one directory deeper (`scp -r` or `mv` into an existing
+`the_cauldron` nests them), move them up a level before syncing.
 
 ## Environment
 
@@ -80,7 +89,7 @@ cluster select -a 1                      # or pick the node by hand
 cluster sync
 cluster exec -p 'python examples/qwen3_vl_30b_perf/prepare_cauldron_data.py \
   --output-dir /home/pl/data/qwen3_vl_30b_perf/cauldron_seq16384_n320 \
-  --seq-len 16384 --num-samples 320 --processor-path /home/pl/Qwen3-VL-30B-A3B-Instruct'
+  --seq-len 16384 --num-samples 320 --processor-path /home/e00642590/Qwen3-VL-30B-A3B-Instruct --offline'
 
 C=examples/qwen3_vl_30b_perf/train_16dev_a3_ep_host_swap.yaml
 R=/home/pl/runs/qwen3_vl_30b_perf
@@ -120,7 +129,7 @@ cluster select -a 4
 cluster sync
 cluster exec -p 'python examples/qwen3_vl_30b_perf/prepare_cauldron_data.py \
   --output-dir /home/pl/data/qwen3_vl_30b_perf/cauldron_seq16384_n1280 \
-  --seq-len 16384 --num-samples 1280 --processor-path /home/pl/Qwen3-VL-30B-A3B-Instruct'
+  --seq-len 16384 --num-samples 1280 --processor-path /home/e00642590/Qwen3-VL-30B-A3B-Instruct --offline'
 ```
 
 If the four cauldron subsets run out of conversations, build what they hold on
