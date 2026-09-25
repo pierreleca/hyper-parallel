@@ -15,11 +15,14 @@
 #   the swap's own cost; keep train_iters equal, since the cosine LR schedule
 #   depends on it.
 #
-# Depth: 10 of the 48 text layers (the builder crops the checkpoint). With the
+# Depth: 8 of the 48 text layers (the builder crops the checkpoint). With the
 # MoE blocks kept, each text layer holds about 2.7 GiB of activations at 16384
-# tokens per rank, plus its share of weights, gradients and moments; about 10
-# layers fit a 64 GB die next to the vision tower and the loss. If it runs out
-# of memory: --model.num_hidden_layers=8; with headroom, raise it.
+# tokens per rank, plus its share of weights, gradients and moments. 10 layers
+# ran out of memory on 16 dies in the first step: 48.6 GiB allocated when the
+# loss asked for the 9.28 GiB fp32 logits gradient (16384 x 151936 x 4 B), on a
+# die exposing 61.3 GiB. 8 layers leave about 6 GiB more. Expandable segments
+# are needed as well (see A3_RUNS.md): without them the cache held 10 GiB it
+# could not hand out as one block.
 #
 # Paths, all outside the repository (the code travels as a zip; data and runs
 # stay put): the checkpoint in /home/e00642590/Qwen3-VL-30B-A3B-Instruct on every A3
@@ -40,7 +43,7 @@ model:
   # One key: the checkpoint, the HF configuration that the builder crops, and
   # the processor source that the VLM Trainer reads.
   pretrained_model_name_or_path: /home/e00642590/Qwen3-VL-30B-A3B-Instruct
-  num_hidden_layers: 10
+  num_hidden_layers: 8
   local_files_only: true
   torch_dtype: bfloat16
   # On Ascend, transformers routes flash_attention_2 to torch_npu's
