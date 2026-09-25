@@ -589,13 +589,13 @@ class EPHostSwap:
         }
 
     def _write(self, record: dict, rank: int) -> None:
-        """Append one record to this rank's file."""
+        """Append one record to this rank's file, which a run starts afresh, as the EP instrument does."""
         if not self.output_dir:
             return
         if self._file is None:
             os.makedirs(self.output_dir, exist_ok=True)
             path = os.path.join(self.output_dir, f"host_swap_rank{rank}.jsonl")
-            self._file = open(path, "a", encoding="utf-8")  # pylint: disable=consider-using-with
+            self._file = open(path, "w", encoding="utf-8")  # pylint: disable=consider-using-with
             header = {"header": True, "host": socket.gethostname(), "rank": rank,
                       "capacity_factor": self.capacity_factor, "min_row_bytes": self.min_row_bytes}
             self._file.write(json.dumps(header) + "\n")
