@@ -80,6 +80,20 @@ def test_choose_offload_takes_the_smallest_covering_set():
     assert choose_offload(sizes, 9000) == [0, 1, 2]
 
 
+def test_pinned_pool_hands_out_the_best_fit_among_mixed_sizes():
+    """Buffers of several sizes come back to the pool and go out again by best fit."""
+    from hyper_parallel.distributed.expert_parallel.host_swap import _PinnedPool  # pylint: disable=import-outside-toplevel
+
+    pool = _PinnedPool(pin=False)
+    small, large = pool.take(1), pool.take(3 * 64 * 1024 * 1024)
+    assert small.numel() < large.numel()
+    pool.give(large)
+    pool.give(small)
+    assert pool.take(10) is small, "the smallest buffer that fits"
+    assert pool.take(10) is large
+    assert not pool.free
+
+
 def test_plan_rows_moves_about_the_excess_and_splits_the_cheapest_tensor():
     """Rows of the smallest tensor cover a small excess; bigger ones add whole tensors first."""
     tensors = [(100, 4096), (100, 3072), (100, 1536)]

@@ -174,11 +174,10 @@ class _PinnedPool:
 
     def take(self, nbytes: int) -> torch.Tensor:
         """Return a byte buffer of at least ``nbytes``."""
-        fitting = [buffer for buffer in self.free if buffer.numel() >= nbytes]
+        fitting = [index for index, buffer in enumerate(self.free) if buffer.numel() >= nbytes]
         if fitting:
-            buffer = min(fitting, key=lambda item: item.numel())
-            self.free.remove(buffer)
-            return buffer
+            # By position: list.remove would compare tensors with ==, element by element.
+            return self.free.pop(min(fitting, key=lambda index: self.free[index].numel()))
         size = -(-nbytes // _PIN_GRANULE) * _PIN_GRANULE
         self.allocated_bytes += size
         return torch.empty(size, dtype=torch.uint8, pin_memory=self.pin)
