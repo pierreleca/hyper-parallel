@@ -223,9 +223,10 @@ ep_instrument:
   # Read a peak per phase boundary, which resets the allocator's peak counters;
   # the trainer's own peak metric folds the recorder's running peak back in.
   segment_peaks: true
-  # Meet the ranks at a barrier before each step, so their recorded timelines
-  # start together.
-  align_steps: true
+  # No barrier before each step: the reports compare phase durations within each
+  # rank, and the barrier's communicator costs about 400 MB of HCCL buffers
+  # outside PyTorch's allocator, which these runs cannot spare.
+  align_steps: false
   record_counts: true
 
 # Per-layer budget for the MoE activations; the excess goes to pinned host memory.
