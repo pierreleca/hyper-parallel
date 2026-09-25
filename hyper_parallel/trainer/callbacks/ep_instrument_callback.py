@@ -16,6 +16,8 @@
 
 from typing import Any
 
+import torch.distributed as dist
+
 from hyper_parallel.distributed.expert_parallel.instrument import EP_INSTRUMENT
 from hyper_parallel.trainer.runtime.logging import create_logger
 
@@ -57,6 +59,13 @@ class EPInstrumentCallback(Callback):
         if not self.config.enabled:
             return
         EP_INSTRUMENT.register_modules(self.trainer.model)
+        if self.config.align_steps and dist.is_available() and dist.is_initialized():
+            # The step barriers run on the default group, which nothing else may
+            # use before them. HCCL creates a group's communicator, and allocates
+            # its buffers (about 400 MB) outside PyTorch's allocator, at the first
+            # collective: meet once now, while the device still has room, rather
+            # than at start_step, when the cache may hold the whole die.
+            dist.barrier()
         logger.info(
             "EP instrument: writing per-rank records to %s",
             self.config.output_dir,

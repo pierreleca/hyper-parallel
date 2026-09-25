@@ -80,6 +80,16 @@ Python environment:
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True TASK_QUEUE_ENABLE=2 CPU_AFFINITY_CONF=1 HCCL_CONNECT_TIMEOUT=1800
 ```
 
+- `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True` is required: without it, the
+  first A3 run failed with 10 GiB cached that the allocator could not hand out
+  as one 9.28 GiB block (the fp32 logits gradient).
+- `TASK_QUEUE_ENABLE=2` and `CPU_AFFINITY_CONF=1` only speed up the host side:
+  torch_npu launches operators from a second thread (level 1, the default) and,
+  at level 2, moves more of the launch work there; the affinity pins each
+  process's threads to cores near its NPU. The A2 runs used the defaults, so
+  host-bound phases (router and counts) do not compare one to one.
+- `HCCL_CONNECT_TIMEOUT=1800` gives slow multi-node starts time to connect.
+
 Full determinism sets `HCCL_DETERMINISTIC` itself.
 
 ## 16 dies, one node
