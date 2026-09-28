@@ -51,11 +51,13 @@ def test_scenarios_skip_numa_groups_when_the_binding_is_unknown():
     assert not any("NUMA" in name for name in names)
 
 
-def test_bound_numa_takes_the_node_holding_most_cpus():
-    """A process bound across nodes counts where most of its CPUs are."""
+def test_bound_numa_names_a_node_only_when_the_mask_sits_on_it():
+    """A mask mostly on one node names it; an unrestricted mask names none."""
     bench = _load_bench()
     mapping = {cpu: cpu // 24 for cpu in range(96)}
-    assert bench.bound_numa({24, 25, 26, 50}, mapping) == 1
+    assert bench.bound_numa({24, 25, 26, 27, 50}, mapping) == 1, "four of five cores on node 1"
+    assert bench.bound_numa(set(range(96)), mapping) == -1, "free to run anywhere, not bound"
+    assert bench.bound_numa({24, 25, 50, 51}, mapping) == -1, "split evenly over two nodes"
     assert bench.bound_numa({500}, mapping) == -1
 
 
@@ -77,6 +79,8 @@ def test_report_folds_the_dies_alone_into_one_line_per_direction():
                         **bench.summarize([base / 2, base / 2])})
     lines = bench.report({"world": 2, "gib": 1.0, "repeat": 5, "numa_of_rank": [0, 0], "results": results})
     assert "r0:0 r1:0" in lines[1]
+    assert "none" in bench.report({"world": 2, "gib": 1.0, "repeat": 5, "numa_of_rank": [-1, -1],
+                                   "results": results})[1]
     assert lines[2].startswith("alone D2H: min 30.0 median 30.5 max 31.0") and lines[2].endswith("r0:30 r1:31")
     assert lines[3].startswith("alone H2D: min 40.0")
     assert [line.split()[0] for line in lines[5:]] == ["first", "first"] and len(lines) == 7

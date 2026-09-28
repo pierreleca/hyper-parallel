@@ -82,9 +82,17 @@ def cpu_numa_nodes() -> dict[int, int]:
 
 
 def bound_numa(cpus: set[int], mapping: dict[int, int]) -> int:
-    """Return the NUMA node holding most of ``cpus``, or -1 when unknown."""
+    """Return the NUMA node this process is bound to, or -1 when it is not bound to one.
+
+    A process free to run anywhere has every node's cores in its mask, and
+    naming one of them would invent a placement the run does not have: only a
+    mask that sits mostly (four fifths) on one node counts as bound to it.
+    """
     nodes = [mapping[cpu] for cpu in cpus if cpu in mapping]
-    return max(set(nodes), key=nodes.count) if nodes else -1
+    if not nodes:
+        return -1
+    best = max(set(nodes), key=nodes.count)
+    return best if nodes.count(best) >= 0.8 * len(nodes) else -1
 
 
 def build_scenarios(world: int, numa_of_rank: list[int]) -> list[tuple[str, list[int]]]:
@@ -122,9 +130,11 @@ def summarize(rates: list[float]) -> dict[str, float]:
 
 def report(data: dict) -> list[str]:
     """Return a short digest of a results file: the dies alone on one line per direction, then the rest."""
+    bindings = data["numa_of_rank"]
     lines = [f"host link bench: {data['world']} dies, {data['gib']} GiB x {data['repeat']} copies",
              "NUMA node of each rank's binding: "
-             + " ".join(f"r{rank}:{node}" for rank, node in enumerate(data["numa_of_rank"]))]
+             + ("none: every rank may run on any core" if set(bindings) == {-1} else
+                " ".join(f"r{rank}:{node}" for rank, node in enumerate(bindings)))]
     rows = data["results"]
     for direction in ("D2H", "H2D"):
         alone = {row["ranks"][0]: row["min"] for row in rows
@@ -197,7 +207,8 @@ def main() -> int:
     if rank == 0:
         print(f"host link bench: {world} dies, {args.gib} GiB x {args.repeat} copies per measurement")
         print("NUMA node of each rank's CPU binding: "
-              + ", ".join(f"r{member} {node}" for member, node in enumerate(numa_of_rank)))
+              + ("none: every rank may run on any core" if set(numa_of_rank) == {-1} else
+                 ", ".join(f"r{member} {node}" for member, node in enumerate(numa_of_rank))))
         print(f"{'scenario':38} dir   per-die GB/s: min  median    max    sum")
         for row in results:
             print(f"{row['scenario']:38} {row['direction']}  {row['min']:17.1f}{row['median']:8.1f}"
