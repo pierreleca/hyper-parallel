@@ -916,6 +916,96 @@ def report_swap_activity(swap_dir: str, skip: int, out: list[str]) -> dict[str, 
     return {"budget": budget, "ranks": rows}
 
 
+def sweep_row(run_dir: str, skip: int) -> dict[str, Any]:
+    """Summarize one run: its memory peaks, its step time and what its swap moved.
+
+    ``run_dir`` holds ``instrument/`` and, when the swap ran, ``ep_host_swap/``;
+    a directory of ``rank*.jsonl`` is taken as the records themselves.
+    """
+    inner = os.path.join(run_dir, "instrument")
+    record_dir = inner if os.path.isdir(inner) else run_dir
+    headers, steps = load_records(record_dir, skip)
+    collected = collect(headers, steps)
+    allocated: dict[int, list[float]] = {}
+    reserved: dict[int, list[float]] = {}
+    walls: dict[int, float] = {}
+    for (step, rank), entry in collected["per_step_rank"].items():
+        if entry.get("peak_allocated"):
+            allocated.setdefault(rank, []).append(entry["peak_allocated"] / GIB)
+        if entry.get("peak_reserved"):
+            reserved.setdefault(rank, []).append(entry["peak_reserved"] / GIB)
+        if entry.get("wall_s") is not None:
+            walls[step] = max(walls.get(step, 0.0), entry["wall_s"])
+    alloc = [statistics.fmean(values) for values in allocated.values()]
+    resv = [statistics.fmean(values) for values in reserved.values()]
+    row = {
+        "run": os.path.basename(run_dir.rstrip("/")) or run_dir,
+        "steps": len(walls),
+        "alloc_mean": statistics.fmean(alloc) if alloc else 0.0,
+        "alloc_worst": max(alloc) if alloc else 0.0,
+        "reserved_mean": statistics.fmean(resv) if resv else 0.0,
+        "reserved_worst": max(resv) if resv else 0.0,
+        "step_mean": statistics.fmean(walls.values()) if walls else 0.0,
+        "step_median": statistics.median(walls.values()) if walls else 0.0,
+    }
+    row.update(swap_totals(os.path.join(run_dir, "ep_host_swap"), skip))
+    return row
+
+
+def swap_totals(swap_dir: str, skip: int) -> dict[str, Any]:
+    """What a run's swap records add up to: bytes moved, copy rates, exposure, pinned memory."""
+    empty = {"moved_gib": 0.0, "d2h_min": None, "d2h_max": None, "exposed_max": 0.0, "pinned_max": 0.0}
+    per_rank: dict[int, list[dict]] = {}
+    for path in sorted(glob.glob(os.path.join(swap_dir, "host_swap_rank*.jsonl"))):
+        with open(path, encoding="utf-8") as stream:
+            for line in stream:
+                record = json.loads(line)
+                if not record.get("header") and record["step"] > skip:
+                    per_rank.setdefault(record["rank"], []).append(record)
+    if not per_rank:
+        return empty
+    moved, rates, exposed, pinned = [], [], [], []
+    for records in per_rank.values():
+        moved.append(statistics.fmean(record["d2h_gib"] for record in records))
+        seen = [record["d2h_gbps"] for record in records if record["d2h_gbps"]]
+        if seen:
+            rates.append(statistics.fmean(seen))
+        exposed.append(statistics.fmean(record["stall_ms"] for record in records))
+        pinned.append(max(record.get("pinned_gib", 0.0) for record in records))
+    return {"moved_gib": statistics.fmean(moved), "d2h_min": min(rates) if rates else None,
+            "d2h_max": max(rates) if rates else None, "exposed_max": max(exposed),
+            "pinned_max": max(pinned)}
+
+
+def report_sweep(run_dirs: list[str], skip: int, out: list[str]) -> list[dict[str, Any]]:
+    """One row per run, so a factor sweep can be read at a glance."""
+    rows = [sweep_row(run_dir, skip) for run_dir in run_dirs]
+    out.append(f"SWEEP ({len(rows)} runs, per-rank means over the steps kept after {skip})")
+    out.append("  run                              steps   moved  alloc  alloc  reserved  reserved   step s   step s"
+               "   D2H GB/s   exposed  pinned")
+    out.append("                                           GiB/st   mean  worst      mean     worst     mean   median"
+               "    min-max     ms max     GiB")
+    for row in rows:
+        rate = "-" if row["d2h_min"] is None else f"{row['d2h_min']:.0f}-{row['d2h_max']:.0f}"
+        out.append(
+            f"  {row['run']:<32}{row['steps']:5d}{row['moved_gib']:8.2f}{row['alloc_mean']:7.2f}"
+            f"{row['alloc_worst']:7.2f}{row['reserved_mean']:10.2f}{row['reserved_worst']:10.2f}"
+            f"{row['step_mean']:9.3f}{row['step_median']:9.3f}{rate:>11}{row['exposed_max']:11.1f}"
+            f"{row['pinned_max']:8.2f}"
+        )
+    base = rows[0]
+    out.append(f"  against {base['run']}: step time and memory as deltas")
+    for row in rows[1:]:
+        out.append(
+            f"  {row['run']:<32}     {row['moved_gib']:8.2f} moved,"
+            f" reserved mean {row['reserved_mean'] - base['reserved_mean']:+6.2f},"
+            f" worst {row['reserved_worst'] - base['reserved_worst']:+6.2f} GiB,"
+            f" step mean {(row['step_mean'] / base['step_mean'] - 1) * 100:+5.1f}%,"
+            f" median {(row['step_median'] / base['step_median'] - 1) * 100:+5.1f}%"
+        )
+    return rows
+
+
 def _rate(value: float | None) -> str:
     """A bandwidth for a table cell, or '-' when nothing was timed."""
     return "-" if value is None else f"{value:.1f}"
@@ -1000,8 +1090,13 @@ def write_trace(collected: dict, headers: dict, path: str, step: int | None) -> 
 def main() -> int:
     """Read the records, print the report and write the tables."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("record_dir", help="directory holding rank*.jsonl")
+    parser.add_argument("record_dir", nargs="?", help="directory holding rank*.jsonl")
     parser.add_argument("--skip", type=int, default=2, help="warm-up steps to drop")
+    parser.add_argument(
+        "--sweep", nargs="+", default=None, metavar="RUN_DIR",
+        help="compare whole runs, one row each, and stop: every directory holding instrument/ and"
+             " ep_host_swap/; the first is the baseline the deltas are taken against",
+    )
     parser.add_argument("--out-dir", default=None, help="where to write the CSVs")
     parser.add_argument("--trace", action="store_true", help="also write a Chrome trace")
     parser.add_argument("--trace-step", type=int, default=None, help="step to trace")
@@ -1018,6 +1113,14 @@ def main() -> int:
         help="expert intermediate size, overriding the recorded one (768 for Qwen3-VL-30B)",
     )
     args = parser.parse_args()
+
+    if args.sweep:
+        out = []
+        report_sweep(args.sweep, args.skip, out)
+        print("\n".join(out))
+        return 0
+    if not args.record_dir:
+        raise SystemExit("record_dir is required unless --sweep is given")
 
     if args.compare:
         out = []

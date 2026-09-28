@@ -494,3 +494,31 @@ def test_swap_activity_summarizes_the_swap_records(tmp_path):
     assert summary["budget"] == "step" and row["steps"] == 2 and row["steps_swapping"] == 1
     assert row["gib_per_step"] == pytest.approx(0.25) and row["d2h_gbps"] == pytest.approx(30.0)
     assert row["exposed_ms"] == pytest.approx(1.0) and row["evictions_per_step"] == pytest.approx(0.5)
+
+
+def test_sweep_compares_runs_one_row_each(tmp_path, capsys):
+    """Each run contributes a row; the deltas are taken against the first."""
+    analyzer = _load_analyzer()
+    for name, peak, moved in (("noswap", 8 * 1024 ** 3, None), ("f090", 7 * 1024 ** 3, 0.5)):
+        run = tmp_path / name
+        (run / "instrument").mkdir(parents=True)
+        _synthetic_records(run / "instrument", [150, 100, 80, 70], [peak] * 4)
+        if moved is None:
+            continue
+        (run / "ep_host_swap").mkdir()
+        lines = [{"header": True, "budget": "step"}] + [
+            {"step": step, "rank": 0, "swapped_layers": 1, "d2h_gib": moved, "d2h_gbps": 30.0,
+             "h2d_gbps": 40.0, "h2d_hidden_ms": 9.0, "stall_ms": 4.0, "pinned_gib": 2.0, "evictions": [{}]}
+            for step in (1, 2)]
+        (run / "ep_host_swap" / "host_swap_rank0.jsonl").write_text(
+            "\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+
+    out = []
+    rows = analyzer.report_sweep([str(tmp_path / "noswap"), str(tmp_path / "f090")], 1, out)
+    assert [row["run"] for row in rows] == ["noswap", "f090"]
+    assert rows[0]["moved_gib"] == 0.0 and rows[0]["d2h_min"] is None, "no swap records, no swap columns"
+    assert rows[1]["moved_gib"] == pytest.approx(0.5) and rows[1]["d2h_min"] == pytest.approx(30.0)
+    assert rows[1]["exposed_max"] == pytest.approx(4.0) and rows[1]["pinned_max"] == pytest.approx(2.0)
+    assert rows[0]["reserved_worst"] == pytest.approx(8.0) and rows[1]["reserved_worst"] == pytest.approx(7.0)
+    assert "-1.00 GiB" in "\n".join(out), "the reserved delta against the baseline"
+    capsys.readouterr()
