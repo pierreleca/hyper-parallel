@@ -217,3 +217,71 @@ def test_ep_blocks_swap_and_keep_their_gradients(world_one_group, swap):
     record = swap.end_step(rank=0)
     assert record["moe_layers"] == 2 and record["swapped_layers"] == 2
     assert all(layer["swapped_bytes"] > 0 for layer in record["layers"])
+
+
+@pytest.fixture(name="step_swap")
+def fixture_step_swap(tmp_path: pathlib.Path) -> Iterator[EPHostSwap]:
+    """Enable the step budget below the mean load; disable it after the test."""
+    HOST_SWAP.configure(enabled=True, capacity_factor=0.9, min_row_bytes=16, output_dir=str(tmp_path),
+                        budget="step")
+    HOST_SWAP.begin_step(1)
+    yield HOST_SWAP
+    HOST_SWAP.close()
+    HOST_SWAP.configure(enabled=False, capacity_factor=1.2, min_row_bytes=1024, output_dir="")
+    HOST_SWAP.begin_step(0)
+
+
+def test_step_budget_below_the_mean_swaps_balanced_layers_and_keeps_gradients(step_swap):
+    """A factor under 1 swaps even when every layer is at the mean, earliest layers first."""
+    rows = [8, 8, 8]  # every layer exactly at the mean load
+    expected, _ = _run(rows, sent=8, swap_on=False)
+    step_swap.begin_step(1)
+    got, layers = _run(rows, sent=8, swap_on=True)
+    for want, have in zip(expected, got):
+        torch.testing.assert_close(have, want)
+    assert layers and min(layer.index for layer in layers) == 0, "the earliest layer goes first"
+    record = step_swap.end_step(rank=0)
+    assert record["budget"] == "step" and record["evictions"]
+    for decision in record["evictions"]:
+        assert decision["projected_gib"] - decision["evicted_gib"] <= decision["budget_gib"] + 1e-12
+
+
+def test_step_budget_learns_the_pass_length_and_acts_early(step_swap):
+    """Once a pass's length is known, the projection swaps after the very first layer."""
+    _run([8, 8, 8], sent=8, swap_on=True)
+    first = step_swap.end_step(rank=0)["evictions"]
+    step_swap.begin_step(2)
+    _run([8, 8, 8], sent=8, swap_on=True)
+    second = step_swap.end_step(rank=0)["evictions"]
+    assert second[0]["expected_layers"] == 3 and second[0]["after_layer"] == 0
+    assert second[0]["need_gib"] > first[0]["need_gib"], "the remaining layers count from the start"
+
+
+def test_step_budget_above_the_spread_swaps_nothing(step_swap):
+    """A budget over every rank's total leaves the pass on device."""
+    step_swap.configure(enabled=True, capacity_factor=1.5, min_row_bytes=16, output_dir="", budget="step")
+    step_swap.begin_step(1)
+    _grads, layers = _run([12, 6, 9], sent=8, swap_on=True)  # total 27 rows against 1.5 x 24
+    assert not layers
+
+
+def test_step_budget_brings_a_layer_back_only_from_the_layer_above(step_swap, monkeypatch):
+    """Swapped early layers come back one layer ahead of their backward, not at its start."""
+    step_swap.configure(enabled=True, capacity_factor=0.5, min_row_bytes=16, output_dir="", budget="step")
+    step_swap.begin_step(1)
+    trace = []
+    unpack, load = step_swap._unpack, step_swap._load  # pylint: disable=protected-access
+    monkeypatch.setattr(step_swap, "_unpack", lambda packed: (
+        trace.append(("unpack", packed.layer.index)) if hasattr(packed, "layer") else None, unpack(packed))[1])
+    monkeypatch.setattr(step_swap, "_load", lambda layer: (trace.append(("load", layer.index)), load(layer))[0])
+    _grads, layers = _run([8, 8, 8, 8], sent=8, swap_on=True)
+    for layer in layers:
+        first_unpack_above = trace.index(("unpack", layer.index + 1))
+        assert trace.index(("load", layer.index)) > first_unpack_above, f"layer {layer.index} loaded early"
+
+
+def test_step_budget_rejects_rows_granularity():
+    """The step budget moves whole tensors only."""
+    with pytest.raises(ValueError, match="tensors"):
+        EPHostSwap().configure(enabled=False, capacity_factor=0.9, min_row_bytes=16, output_dir="",
+                               granularity="rows", budget="step")

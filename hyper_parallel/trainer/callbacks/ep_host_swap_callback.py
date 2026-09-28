@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Drive the per-layer MoE activation budget and its host swap from the training loop."""
+"""Drive the MoE activation budget and its host swap from the training loop."""
 
 from typing import Any
 
@@ -37,6 +37,7 @@ class EPHostSwapCallback(Callback):
             min_row_bytes=self.config.min_row_bytes,
             output_dir=self.config.output_dir,
             granularity=self.config.granularity,
+            budget=self.config.budget,
         )
 
     def on_train_begin(self, state: TrainerState, **kwargs: Any) -> None:
@@ -44,7 +45,8 @@ class EPHostSwapCallback(Callback):
         del state, kwargs
         if self.config.enabled:
             logger.info(
-                "EP host swap: MoE layer budget %.2f x sent pairs, %s granularity, records in %s",
+                "EP host swap: MoE %s budget %.2f x sent pairs, %s granularity, records in %s",
+                self.config.budget,
                 self.config.capacity_factor,
                 self.config.granularity,
                 self.config.output_dir,

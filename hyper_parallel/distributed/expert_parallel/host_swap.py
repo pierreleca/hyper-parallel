@@ -49,6 +49,23 @@ off. The copy to host is never waited for: the compute stream goes on, and only
 the release of the device memory follows the copy. The copy back is exposed
 for the time the compute stream waits on it, and hidden for the rest.
 
+With ``budget: step`` a rank gets one budget for all its MoE layers of a
+forward pass instead: ``capacity_factor`` times its mean load (the pairs it
+sends) summed over the layers, in bytes of the saved tensors. After each block
+the rank projects its end-of-forward total, what it holds plus the remaining
+layers at the mean, and when the projection is over the budget it swaps whole
+saved tensors of its earliest layers, whose backward comes last, until it is
+not. Acting on the projection rather than on the budget itself moves the
+copies, and the memory they take to set up, away from the step's peak at the
+end of forward. The factor may be below 1: the budget is then a memory setting
+that every rank enforces every step, not only a guard against bad routing.
+The number of layers of a pass is learned from the previous passes; the first
+pass budgets only the layers seen so far. Only ``tensors`` granularity is
+supported, and the passes must not interleave (no pipeline schedule). In
+backward, a layer swapped under this budget comes back while the layer just
+above it runs backward, not one swapped layer ahead, so the copy back of the
+earliest layers does not land at the peak either.
+
 Activation recompute runs the block again inside the autograd engine; nothing
 is swapped then, since the recomputed tensors are consumed at once.
 """
@@ -236,12 +253,16 @@ class _Layer:
     index: int
     rows: int
     capacity: int
+    sent: int = 0
+    need_bytes: int = 0
     saved: list[_Saved] = field(default_factory=list)
     keys: dict = field(default_factory=dict)
     swapped: list[_Saved] = field(default_factory=list)
     swapped_bytes: int = 0
     device_copy_bytes: int = 0
     events: dict = field(default_factory=dict)
+    # (start, end) events of every copy to host; the step budget can swap a layer in several rounds.
+    d2h_rounds: list = field(default_factory=list)
     loading: bool = False
     waited: bool = False
     prefetch_done: bool = False
@@ -249,12 +270,13 @@ class _Layer:
 
 
 class EPHostSwap:
-    """Per-layer budget for the MoE activations, with the excess swapped to host."""
+    """Budget for the MoE activations, per layer or per step, with the excess swapped to host."""
 
     def __init__(self) -> None:
         """Start disabled; ``configure`` turns it on."""
         self.enabled = False
         self.granularity = "tensors"
+        self.budget = "layer"
         self.capacity_factor = 1.2
         self.min_row_bytes = 1024
         self.output_dir = ""
@@ -264,20 +286,34 @@ class EPHostSwap:
         self._layers: list[_Layer] = []
         self._swapped: list[_Layer] = []
         self._current: Optional[_Layer] = None
+        # Step budget: where the current forward pass starts in ``_layers``, whether a
+        # backward ran since (the next layer then starts a pass), the longest pass seen,
+        # the last bytes per pair and the step's eviction decisions.
+        self._pass_start = 0
+        self._backward_seen = False
+        self._expected_layers = 0
+        self._pair_bytes = 0
+        self._evictions: list[dict] = []
         self._step = 0
         self._file = None
 
     # -- configuration and steps ---------------------------------------------
 
     def configure(self, *, enabled: bool, capacity_factor: float, min_row_bytes: int, output_dir: str,
-                  granularity: str = "tensors") -> None:
-        """Set the budget, what moves (``rows`` or ``tensors``) and where the per-rank records go."""
+                  granularity: str = "tensors", budget: str = "layer") -> None:
+        """Set the budget (per ``layer`` or per ``step``), what moves and where the per-rank records go."""
         if capacity_factor <= 0:
             raise ValueError("ep_host_swap.capacity_factor must be positive")
         if granularity not in ("rows", "tensors"):
             raise ValueError(f"ep_host_swap.granularity must be 'rows' or 'tensors', not {granularity!r}")
+        if budget not in ("layer", "step"):
+            raise ValueError(f"ep_host_swap.budget must be 'layer' or 'step', not {budget!r}")
+        if budget == "step" and granularity != "tensors":
+            raise ValueError("ep_host_swap.budget 'step' supports 'tensors' granularity only")
         self.enabled = enabled
         self.granularity = granularity
+        self.budget = budget
+        self._expected_layers = 0
         self.capacity_factor = capacity_factor
         self.min_row_bytes = min_row_bytes
         self.output_dir = output_dir
@@ -293,6 +329,9 @@ class EPHostSwap:
         self._layers = []
         self._swapped = []
         self._current = None
+        self._pass_start = 0
+        self._backward_seen = False
+        self._evictions = []
 
     def end_step(self, rank: int) -> Optional[dict]:
         """Resolve the step's copy timings, append its record and return it."""
@@ -312,6 +351,7 @@ class EPHostSwap:
             "step": self._step,
             "rank": rank,
             "granularity": self.granularity,
+            "budget": self.budget,
             "moe_layers": len(self._layers),
             "swapped_layers": len(layers),
             "d2h_gib": d2h_bytes / GIB,
@@ -331,9 +371,11 @@ class EPHostSwap:
             "h2d_hidden_ms": max(load_ms - stall_ms, 0.0),
             "pinned_gib": self._pool.allocated_bytes / GIB if self._pool else 0.0,
             "layers": layers,
+            # Step budget: one entry per decision that swapped something.
+            "evictions": self._evictions,
         }
         self._write(record, rank)
-        self._layers, self._swapped = [], []
+        self._layers, self._swapped, self._evictions = [], [], []
         return record
 
     def close(self) -> None:
@@ -346,7 +388,7 @@ class EPHostSwap:
 
     @contextmanager
     def layer(self, received_rows: int, sent_rows: int) -> Iterator[None]:
-        """Track what one MoE block saves; swap its excess when the block returns.
+        """Track what one MoE block saves; enforce the budget when the block returns.
 
         Args:
             received_rows: Routed pairs this rank received for its experts.
@@ -355,8 +397,11 @@ class EPHostSwap:
         if not self.enabled or not torch.is_grad_enabled() or _in_backward():
             yield
             return
-        capacity = int(self.capacity_factor * sent_rows)
-        current = _Layer(index=len(self._layers), rows=received_rows, capacity=capacity)
+        if self._backward_seen:
+            self._pass_start, self._backward_seen = len(self._layers), False
+        # The step budget has no per-layer excess: the whole layer is within its capacity.
+        capacity = int(self.capacity_factor * sent_rows) if self.budget == "layer" else received_rows
+        current = _Layer(index=len(self._layers), rows=received_rows, capacity=capacity, sent=sent_rows)
         self._layers.append(current)
         self._current = current
         try:
@@ -364,7 +409,10 @@ class EPHostSwap:
                 yield
         finally:
             self._current = None
-        self._swap_excess(current)
+        if self.budget == "layer":
+            self._swap_excess(current)
+        else:
+            self._enforce_step_budget(current)
 
     def _candidate(self, tensor: torch.Tensor, layer: _Layer) -> bool:
         """Whether a saved tensor scales with the received pairs and can move."""
@@ -394,32 +442,84 @@ class EPHostSwap:
         return saved
 
     def _swap_excess(self, layer: _Layer) -> None:
-        """Copy the layer's excess to host: whole tensors, or rows of them."""
+        """Per-layer budget: copy the layer's excess to host, whole tensors or rows of them."""
         layer.keys = {}
         excess_rows = layer.rows - layer.capacity
         if excess_rows <= 0 or not layer.saved:
             return
         row_bytes = sum(saved.row_bytes for saved in layer.saved)
         need = excess_rows * row_bytes
+        layer.need_bytes = need
         if self.granularity == "tensors":
             plan = [(index, layer.saved[index].rows)
                     for index in choose_offload([saved.nbytes for saved in layer.saved], need)]
         else:
             plan = plan_rows([(saved.rows, saved.row_bytes) for saved in layer.saved], need)
+        self._evict(layer, plan)
+
+    def _enforce_step_budget(self, layer: _Layer) -> None:
+        """Step budget: swap the earliest layers' tensors while the projected total is over the budget.
+
+        The budget is ``capacity_factor`` times the pass's mean bytes per layer
+        (sent pairs times the bytes a received pair saves) times its expected
+        number of layers; the projection is what the pass holds on device plus
+        the remaining layers at the mean.
+        """
+        layer.keys = {}
+        if layer.saved:
+            self._pair_bytes = sum(saved.row_bytes for saved in layer.saved)
+        current = self._layers[self._pass_start:]
+        self._expected_layers = max(self._expected_layers, len(current))
+        remaining = self._expected_layers - len(current)
+        mean = self._pair_bytes * sum(item.sent for item in current) / len(current)
+        budget = self.capacity_factor * mean * self._expected_layers
+        held = sum(saved.nbytes for item in current for saved in item.saved if saved.device is not None)
+        projected = held + remaining * mean
+        need = projected - budget
+        if need <= 0:
+            return
+        evicted = 0
+        for item in current:
+            candidates = [index for index, saved in enumerate(item.saved)
+                          if saved.device is not None and saved.rows_out == 0]
+            if not candidates:
+                continue
+            picked = choose_offload([item.saved[index].nbytes for index in candidates], int(need - evicted) + 1)
+            plan = [(candidates[choice], item.saved[candidates[choice]].rows) for choice in picked]
+            moved = sum(item.saved[index].nbytes for index, _rows in plan)
+            item.need_bytes += moved
+            evicted += moved
+            self._evict(item, plan)
+            if evicted >= need:
+                break
+        self._evictions.append({
+            "after_layer": layer.index,
+            "expected_layers": self._expected_layers,
+            "budget_gib": budget / GIB,
+            "projected_gib": projected / GIB,
+            "need_gib": need / GIB,
+            "evicted_gib": evicted / GIB,
+        })
+
+    def _evict(self, layer: _Layer, plan: list[tuple[int, int]]) -> None:
+        """Copy the planned (tensor index, rows) of one layer to host and release their device memory."""
+        if not plan:
+            return
+        new = [layer.saved[index] for index, _rows in plan]
         for index, rows in plan:
             layer.saved[index].rows_out = rows
-        layer.swapped = [layer.saved[index] for index, _rows in plan]
-        layer.swapped_bytes = sum(saved.host_bytes for saved in layer.swapped)
-        split = [saved for saved in layer.swapped if not saved.whole]
+        layer.swapped.extend(new)
+        layer.swapped_bytes += sum(saved.host_bytes for saved in new)
+        split = [saved for saved in new if not saved.whole]
         # The kept rows' buffers are allocated on the compute stream, before the copies.
         for saved in split:
             saved.kept = torch.empty((saved.rows - saved.rows_out,) + saved.shape[1:], dtype=saved.dtype,
                                      device=saved.device.device)
-        layer.device_copy_bytes = sum(saved.kept.numel() * saved.kept.element_size() for saved in split)
+        layer.device_copy_bytes += sum(saved.kept.numel() * saved.kept.element_size() for saved in split)
         if self._copy_stream is None:
             for saved in split:
                 saved.kept.copy_(saved.device[:saved.rows - saved.rows_out])
-            for saved in layer.swapped:
+            for saved in new:
                 self._to_host(saved)
         else:
             compute = self._device.current_stream()
@@ -430,15 +530,16 @@ class EPHostSwap:
                     saved.kept.copy_(saved.device[:saved.rows - saved.rows_out], non_blocking=True)
                     saved.kept.record_stream(self._copy_stream)
                 layer.events["d2d_out_end"] = self._event()
-                layer.events["d2h_start"] = self._event()
-                for saved in layer.swapped:
+                start = self._event()
+                for saved in new:
                     self._to_host(saved)
                     # The allocator keeps the block until the copy stream is done with it.
                     saved.device.record_stream(self._copy_stream)
-                layer.events["d2h_end"] = self._event()
-        for saved in layer.swapped:
+                layer.d2h_rounds.append((start, self._event()))
+        for saved in new:
             saved.device = None
-        self._swapped.append(layer)
+        if layer not in self._swapped:
+            self._swapped.append(layer)
 
     def _to_host(self, saved: _Saved) -> None:
         """Copy a saved tensor, or its last ``rows_out`` rows, into a pinned buffer."""
@@ -454,6 +555,7 @@ class EPHostSwap:
         """Return a saved tensor, bringing its layer back first if it was swapped."""
         if not isinstance(packed, _Saved):
             return packed
+        self._backward_seen = True
         layer = packed.layer
         if packed.device is None:
             if not layer.loading:
@@ -525,12 +627,15 @@ class EPHostSwap:
 
         Backward runs the MoE layers from the last to the first, so while one
         layer's backward computes, the swapped layer with the next lower index
-        comes back.
+        comes back. Under the step budget only the layer just below does: the
+        earliest layers are the swapped ones, and bringing them back one
+        swapped layer ahead would land their copies at the peak.
         """
         if layer.prefetch_done:
             return
         layer.prefetch_done = True
-        below = [other for other in self._swapped if other.index < layer.index and not other.loading]
+        below = [other for other in self._swapped if other.index < layer.index and not other.loading
+                 and (self.budget == "layer" or other.index == layer.index - 1)]
         if below:
             target = max(below, key=lambda other: other.index)
             target.prefetched = True
@@ -555,6 +660,13 @@ class EPHostSwap:
             return None
         return events[start].elapsed_time(events[end])
 
+    @staticmethod
+    def _d2h_ms(layer: _Layer) -> Optional[float]:
+        """Milliseconds of every copy of the layer to host, or None when none was timed."""
+        if not layer.d2h_rounds:
+            return None
+        return sum(start.elapsed_time(end) for start, end in layer.d2h_rounds)
+
     def _hidden(self, events: dict) -> Optional[float]:
         """Copy-back time that ran under compute: the whole load's duration less the compute stream's wait."""
         load = self._elapsed(events, "h2d_start", "loaded")
@@ -573,11 +685,11 @@ class EPHostSwap:
             "saved": [[list(saved.shape), str(saved.dtype), saved.nbytes] for saved in layer.saved],
             # (shape, rows sent to host) of every swapped tensor.
             "moved": [[list(saved.shape), saved.rows_out] for saved in layer.swapped],
-            "need_bytes": (layer.rows - layer.capacity) * sum(saved.row_bytes for saved in layer.saved),
+            "need_bytes": layer.need_bytes,
             "swapped_bytes": layer.swapped_bytes,
             "device_copy_bytes": layer.device_copy_bytes,
             "d2d_out_ms": self._elapsed(layer.events, "d2d_out_start", "d2d_out_end"),
-            "d2h_ms": self._elapsed(layer.events, "d2h_start", "d2h_end"),
+            "d2h_ms": self._d2h_ms(layer),
             "h2d_ms": self._elapsed(layer.events, "h2d_start", "h2d_end"),
             "d2d_in_ms": self._elapsed(layer.events, "d2d_in_start", "loaded"),
             "load_ms": self._elapsed(layer.events, "h2d_start", "loaded"),
@@ -596,7 +708,8 @@ class EPHostSwap:
             path = os.path.join(self.output_dir, f"host_swap_rank{rank}.jsonl")
             self._file = open(path, "w", encoding="utf-8")  # pylint: disable=consider-using-with
             header = {"header": True, "host": socket.gethostname(), "rank": rank,
-                      "capacity_factor": self.capacity_factor, "min_row_bytes": self.min_row_bytes}
+                      "capacity_factor": self.capacity_factor, "budget": self.budget,
+                      "min_row_bytes": self.min_row_bytes}
             self._file.write(json.dumps(header) + "\n")
         self._file.write(json.dumps(record) + "\n")
         self._file.flush()

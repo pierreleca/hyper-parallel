@@ -226,6 +226,10 @@ ep_instrument:
 ep_host_swap:
   enabled: true
   capacity_factor: 1.2
+  # layer: a budget per MoE layer. step: one budget for all MoE layers of the
+  # pass, earliest layers swapped first; its factor may be below 1, e.g.
+  # --ep_host_swap.budget=step --ep_host_swap.capacity_factor=0.9 (tensors only).
+  budget: layer
   # tensors: move whole saved tensors. rows: move about the excess only, at the
   # cost of a device copy of the kept rows of one tensor each way; its buffers
   # fragmented the allocator on A2 (reserve +0.5-1.2 GiB), so tensors is the
