@@ -64,3 +64,19 @@ def test_summarize_reports_spread_and_sum():
     bench = _load_bench()
     summary = bench.summarize([10.0, 30.0, 20.0])
     assert summary == pytest.approx({"min": 10.0, "median": 20.0, "max": 30.0, "sum": 60.0})
+
+
+def test_report_folds_the_dies_alone_into_one_line_per_direction():
+    """The digest lists every die alone on one line, then each other scenario."""
+    bench = _load_bench()
+    results = []
+    for direction, base in (("D2H", 30.0), ("H2D", 40.0)):
+        results += [{"scenario": f"alone r{rank}", "direction": direction, "ranks": [rank],
+                     **bench.summarize([base + rank])} for rank in range(2)]
+        results.append({"scenario": "first 2 dies", "direction": direction, "ranks": [0, 1],
+                        **bench.summarize([base / 2, base / 2])})
+    lines = bench.report({"world": 2, "gib": 1.0, "repeat": 5, "numa_of_rank": [0, 0], "results": results})
+    assert "r0:0 r1:0" in lines[1]
+    assert lines[2].startswith("alone D2H: min 30.0 median 30.5 max 31.0") and lines[2].endswith("r0:30 r1:31")
+    assert lines[3].startswith("alone H2D: min 40.0")
+    assert [line.split()[0] for line in lines[5:]] == ["first", "first"] and len(lines) == 7

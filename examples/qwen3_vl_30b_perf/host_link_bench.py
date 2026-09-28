@@ -31,6 +31,9 @@ dies share a link and how much a shared link gives each of them.
 Rank 0 prints one line per scenario and direction (per-die GB/s: min, median,
 max; and the sum over the dies that copied) and writes every measurement to
 ``--out``. GB/s is decimal (1e9 bytes per second), as in the host-swap records.
+A short digest of that file, the dies alone folded into one line per direction:
+
+    cluster exec "python examples/qwen3_vl_30b_perf/host_link_bench.py --report /home/pl/runs/host_link_bench.json"
 """
 
 from __future__ import annotations
@@ -117,6 +120,28 @@ def summarize(rates: list[float]) -> dict[str, float]:
     return {"min": min(rates), "median": statistics.median(rates), "max": max(rates), "sum": sum(rates)}
 
 
+def report(data: dict) -> list[str]:
+    """Return a short digest of a results file: the dies alone on one line per direction, then the rest."""
+    lines = [f"host link bench: {data['world']} dies, {data['gib']} GiB x {data['repeat']} copies",
+             "NUMA node of each rank's binding: "
+             + " ".join(f"r{rank}:{node}" for rank, node in enumerate(data["numa_of_rank"]))]
+    rows = data["results"]
+    for direction in ("D2H", "H2D"):
+        alone = {row["ranks"][0]: row["min"] for row in rows
+                 if row["direction"] == direction and row["scenario"].startswith("alone ")}
+        if alone:
+            spread = summarize(list(alone.values()))
+            lines.append(f"alone {direction}: min {spread['min']:.1f} median {spread['median']:.1f}"
+                         f" max {spread['max']:.1f} GB/s | " + " ".join(f"r{rank}:{rate:.0f}"
+                                                                    for rank, rate in sorted(alone.items())))
+    lines.append(f"{'scenario':38} dir  dies  per die: min median   max    sum GB/s")
+    for row in rows:
+        if not row["scenario"].startswith("alone "):
+            lines.append(f"{row['scenario']:38} {row['direction']} {len(row['ranks']):5}{row['min']:13.1f}"
+                         f"{row['median']:7.1f}{row['max']:6.1f}{row['sum']:7.1f}")
+    return lines
+
+
 def timed_copies(device: Any, target: torch.Tensor, source: torch.Tensor, repeat: int) -> float:
     """Copy ``source`` into ``target`` ``repeat`` times; return GB/s from device events."""
     start, end = device.Event(enable_timing=True), device.Event(enable_timing=True)
@@ -134,7 +159,13 @@ def main() -> int:
     parser.add_argument("--gib", type=float, default=1.0, help="buffer size per die, GiB")
     parser.add_argument("--repeat", type=int, default=5, help="copies per measurement")
     parser.add_argument("--out", default="host_link_bench.json", help="JSON file rank 0 writes")
+    parser.add_argument("--report", default=None, metavar="JSON",
+                        help="print a short digest of a results file and stop (no devices needed)")
     args = parser.parse_args()
+    if args.report:
+        with open(args.report, encoding="utf-8") as stream:
+            print("\n".join(report(json.load(stream))))
+        return 0
 
     dist.init_process_group("gloo")
     rank, world = dist.get_rank(), dist.get_world_size()
