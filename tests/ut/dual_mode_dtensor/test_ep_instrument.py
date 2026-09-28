@@ -458,3 +458,39 @@ def test_step_budget_compares_one_budget_with_per_layer_budgets(tmp_path, capsys
     assert at_mean["factor"] == 1.0 and at_mean["over_share"] == pytest.approx(0.25), "only rank 0"
     assert at_mean["worst_eviction_gib"] * 2 ** 30 == pytest.approx(0.5 * mean_total)
     capsys.readouterr()
+
+
+def test_compare_reports_the_slowest_rank_step_time(tmp_path):
+    """The step time is the slowest rank's, compared over the steps both runs kept."""
+    analyzer = _load_analyzer()
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    _synthetic_records(first, [150, 100, 80, 70], [2 ** 31] * 4)
+    _synthetic_records(second, [150, 100, 80, 70], [2 ** 31] * 4)
+    path = first / "rank001.jsonl"
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    lines[2]["wall_s"] = 0.3  # step 2 of rank 1 in the first run
+    path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+    summary = analyzer.compare_runs(str(first), str(second), [], skip=1)
+    assert summary["step_s_mean"] == pytest.approx((0.1, 0.3)), "only step 2 is kept, rank 1 sets it"
+
+
+def test_swap_activity_summarizes_the_swap_records(tmp_path):
+    """Per rank: steps swapping, bytes and copy times, warm-up steps left out."""
+    analyzer = _load_analyzer()
+    base = {"swapped_layers": 1, "d2h_gib": 0.5, "d2h_gbps": 30.0, "h2d_gbps": 40.0,
+            "h2d_hidden_ms": 10.0, "stall_ms": 2.0, "evictions": [{}]}
+    lines = [{"header": True, "budget": "step"},
+             {**base, "step": 1, "rank": 0, "d2h_gib": 9.0},  # warm-up
+             {**base, "step": 2, "rank": 0},
+             {**base, "step": 3, "rank": 0, "swapped_layers": 0, "d2h_gib": 0.0, "d2h_gbps": None,
+              "h2d_gbps": None, "h2d_hidden_ms": 0.0, "stall_ms": 0.0, "evictions": []}]
+    (tmp_path / "host_swap_rank0.jsonl").write_text("\n".join(json.dumps(line) for line in lines) + "\n",
+                                                    encoding="utf-8")
+    out = []
+    summary = analyzer.report_swap_activity(str(tmp_path), 1, out)
+    row = summary["ranks"][0]
+    assert summary["budget"] == "step" and row["steps"] == 2 and row["steps_swapping"] == 1
+    assert row["gib_per_step"] == pytest.approx(0.25) and row["d2h_gbps"] == pytest.approx(30.0)
+    assert row["exposed_ms"] == pytest.approx(1.0) and row["evictions_per_step"] == pytest.approx(0.5)

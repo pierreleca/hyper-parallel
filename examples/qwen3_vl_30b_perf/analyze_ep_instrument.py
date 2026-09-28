@@ -800,12 +800,13 @@ def _routing_by_step(steps: dict[int, list[dict]]) -> dict[tuple[int, int, int],
     return routing
 
 
-def compare_runs(first_dir: str, second_dir: str, out: list[str]) -> dict[str, Any]:
-    """Compare the routing of two runs step by step.
+def compare_runs(first_dir: str, second_dir: str, out: list[str], skip: int = 2) -> dict[str, Any]:
+    """Compare the routing of two runs step by step, then their step times.
 
     With full determinism, step i routes the same tokens to the same experts
     in every run; the first step where the counts differ is where the runs
-    diverge.
+    diverge. The step time is the slowest rank's wall time, over the steps
+    both runs kept after ``skip`` warm-up steps.
     """
     _headers_a, steps_a = load_records(first_dir, 0)
     _headers_b, steps_b = load_records(second_dir, 0)
@@ -837,7 +838,87 @@ def compare_runs(first_dir: str, second_dir: str, out: list[str]) -> dict[str, A
         )
     else:
         out.append("  the runs route identically: step i gives the same result in both")
+    _headers_a, kept_a = load_records(first_dir, skip)
+    _headers_b, kept_b = load_records(second_dir, skip)
+    wall_a, wall_b = _step_walls(kept_a), _step_walls(kept_b)
+    both = sorted(set(wall_a) & set(wall_b))
+    if both:
+        this = [wall_a[step] for step in both]
+        base = [wall_b[step] for step in both]
+        for name, pick in (("mean", statistics.fmean), ("median", statistics.median)):
+            before, after = pick(base), pick(this)
+            summary[f"step_s_{name}"] = (before, after)
+            out.append(
+                f"  step time, slowest rank, {name} over steps {both[0]}-{both[-1]}: {before:.3f} -> {after:.3f} s"
+                f" ({(after - before) * 1e3:+.0f} ms, {(after / before - 1) * 100:+.1f}%), second run -> first"
+            )
     return summary
+
+
+def _step_walls(steps: dict[int, list[dict]]) -> dict[int, float]:
+    """Return {step: the slowest rank's wall time in seconds}."""
+    walls: dict[int, float] = {}
+    for records in steps.values():
+        for record in records:
+            if record.get("wall_s") is not None:
+                walls[record["step"]] = max(walls.get(record["step"], 0.0), record["wall_s"])
+    return walls
+
+
+def report_swap_activity(swap_dir: str, skip: int, out: list[str]) -> dict[str, Any]:
+    """Summarize the host-swap records per rank: what moved, how fast, and what compute waited for.
+
+    Steps up to ``skip`` are warm-up and left out, as in the rest of the report.
+    """
+    per_rank: dict[int, list[dict]] = {}
+    budget = "layer"
+    for path in sorted(glob.glob(os.path.join(swap_dir, "host_swap_rank*.jsonl"))):
+        with open(path, encoding="utf-8") as stream:
+            for line in stream:
+                record = json.loads(line)
+                if record.get("header"):
+                    budget = record.get("budget", budget)
+                elif record["step"] > skip:
+                    per_rank.setdefault(record["rank"], []).append(record)
+    if not per_rank:
+        return {}
+    out.append(f"SWAP ACTIVITY ({budget} budget, per rank, mean over steps after {skip})")
+    out.append("  rank  steps swapping  layers/step  GiB/step  D2H GB/s  H2D GB/s  copy back hidden ms"
+               "  exposed ms  evictions/step")
+    rows = []
+    for rank, records in sorted(per_rank.items()):
+        swapping = [record for record in records if record["swapped_layers"]]
+        rates_out = [record["d2h_gbps"] for record in swapping if record["d2h_gbps"]]
+        rates_in = [record["h2d_gbps"] for record in swapping if record["h2d_gbps"]]
+        row = {
+            "rank": rank,
+            "steps": len(records),
+            "steps_swapping": len(swapping),
+            "layers_per_step": statistics.fmean(record["swapped_layers"] for record in records),
+            "gib_per_step": statistics.fmean(record["d2h_gib"] for record in records),
+            "d2h_gbps": statistics.fmean(rates_out) if rates_out else None,
+            "h2d_gbps": statistics.fmean(rates_in) if rates_in else None,
+            "hidden_ms": statistics.fmean(record["h2d_hidden_ms"] for record in records),
+            "exposed_ms": statistics.fmean(record["stall_ms"] for record in records),
+            "evictions_per_step": statistics.fmean(len(record.get("evictions", [])) for record in records),
+        }
+        rows.append(row)
+        out.append(
+            f"  r{rank:<4}{len(swapping):>7}/{len(records):<8}{row['layers_per_step']:11.1f}"
+            f"{row['gib_per_step']:10.2f}{_rate(row['d2h_gbps']):>10}{_rate(row['h2d_gbps']):>10}"
+            f"{row['hidden_ms']:21.1f}{row['exposed_ms']:12.1f}{row['evictions_per_step']:16.1f}"
+        )
+    out.append(
+        f"  all ranks: {statistics.fmean(row['gib_per_step'] for row in rows):.2f} GiB per rank and step,"
+        f" copy back exposed {statistics.fmean(row['exposed_ms'] for row in rows):.1f} ms per step on average,"
+        f" {max(row['exposed_ms'] for row in rows):.1f} ms at worst"
+    )
+    return {"budget": budget, "ranks": rows}
+
+
+def _rate(value: float | None) -> str:
+    """A bandwidth for a table cell, or '-' when nothing was timed."""
+    return "-" if value is None else f"{value:.1f}"
 
 
 def write_csv(path: str, rows: list[dict], columns: list[str]) -> None:
@@ -940,7 +1021,7 @@ def main() -> int:
 
     if args.compare:
         out = []
-        compare_runs(args.record_dir, args.compare, out)
+        compare_runs(args.record_dir, args.compare, out, args.skip)
         print("\n".join(out))
         return 0
 
@@ -974,6 +1055,9 @@ def main() -> int:
     swaps = load_swaps(args.swap_dir) if args.swap_dir else None
     summary["reserved_growth"] = report_reserved_growth(all_steps, out, swaps)
     out.append("")
+    if args.swap_dir:
+        summary["swap_activity"] = report_swap_activity(args.swap_dir, args.skip, out)
+        out.append("")
     summary["offload"] = report_offload(collected, headers, table, out, args.intermediate)
     out.append("")
     summary["layer_memory"] = report_layer_memory(table, collected["ranks"], out)
