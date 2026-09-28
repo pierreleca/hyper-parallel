@@ -1,0 +1,66 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Host-link benchmark: the scenario plan and the summaries (the copies need a device)."""
+
+import importlib.util
+import pathlib
+
+import pytest
+
+_BENCH = pathlib.Path(__file__).parents[3] / "examples" / "qwen3_vl_30b_perf" / "host_link_bench.py"
+
+
+def _load_bench():
+    """Import the example benchmark by path."""
+    spec = importlib.util.spec_from_file_location("host_link_bench", _BENCH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_scenarios_cover_solo_cards_counts_and_numa_groups():
+    """Every die alone, card pairs, growing counts, and the NUMA groups the binding shows."""
+    bench = _load_bench()
+    numa = [0, 0, 0, 0, 1, 1, 1, 1]  # 8 dies, 4 per NUMA node
+    scenarios = dict(bench.build_scenarios(8, numa))
+    assert [scenarios[f"alone r{rank}"] for rank in range(8)] == [[rank] for rank in range(8)]
+    assert scenarios["one card, both dies (r0, r1)"] == [0, 1]
+    assert scenarios["two cards, one die each (r0, r2)"] == [0, 2]
+    assert scenarios["first 8 dies"] == list(range(8)) and "first 16 dies" not in scenarios
+    assert scenarios["one die per card"] == [0, 2, 4, 6]
+    assert scenarios["all dies on NUMA 1"] == [4, 5, 6, 7]
+    assert scenarios["one die per NUMA node"] == [0, 4]
+
+
+def test_scenarios_skip_numa_groups_when_the_binding_is_unknown():
+    """Without a CPU binding there is nothing to group by."""
+    bench = _load_bench()
+    names = [name for name, _ranks in bench.build_scenarios(4, [-1] * 4)]
+    assert not any("NUMA" in name for name in names)
+
+
+def test_bound_numa_takes_the_node_holding_most_cpus():
+    """A process bound across nodes counts where most of its CPUs are."""
+    bench = _load_bench()
+    mapping = {cpu: cpu // 24 for cpu in range(96)}
+    assert bench.bound_numa({24, 25, 26, 50}, mapping) == 1
+    assert bench.bound_numa({500}, mapping) == -1
+
+
+def test_summarize_reports_spread_and_sum():
+    """Per-die spread and what the dies moved together."""
+    bench = _load_bench()
+    summary = bench.summarize([10.0, 30.0, 20.0])
+    assert summary == pytest.approx({"min": 10.0, "median": 20.0, "max": 30.0, "sum": 60.0})
