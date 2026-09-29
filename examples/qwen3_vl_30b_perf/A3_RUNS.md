@@ -26,7 +26,7 @@ examples/qwen3_vl_30b_perf/a3_campaign.sh examples/qwen3_vl_30b_perf/plans/smoke
 ```
 
 Plans live in `plans/`: `smoke_64dev.sh` (one 10-step run, does 64 dies work?) and
-`sweep_64dev.sh` (baseline, budgets, a profiled pair). The sections below are the
+`sweep_64dev.sh` (8 text layers: baseline, budgets 8.8 to 1.6, a profiled pair). The sections below are the
 same steps by hand.
 
 ## Where things live
