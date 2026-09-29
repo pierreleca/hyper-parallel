@@ -22,16 +22,11 @@
 #   the swap's own cost; keep train_iters equal, since the cosine LR schedule
 #   depends on it.
 #
-# Depth: 6 of the 48 text layers, as on A2 (the builder crops the checkpoint). With the
-# MoE blocks kept, each text layer holds about 2.7 GiB of activations at 16384
-# tokens per rank, plus its share of weights, gradients and moments. 10 layers
-# ran out of memory on 16 dies in the first step: 48.6 GiB allocated when the
-# loss asked for the 9.28 GiB fp32 logits gradient (16384 x 151936 x 4 B), on a
-# die exposing 61.3 GiB. 8 layers ran, but peaked at 58.0 GiB allocated and
-# 60.1 GiB reserved by step 1, too close to the edge for the busiest rank's
-# worse steps and for the swap's own copies; 6 layers leave about 9 GiB.
-# Expandable segments are needed as well (see A3_RUNS.md): without them the
-# cache held 10 GiB it could not hand out as one block.
+# Depth: 6 of the 48 text layers, as on one node (the builder crops the
+# checkpoint). One node fits 8 without swap at 59.4 GiB reserved on the worst
+# rank of a 61.3 GiB die; here FSDP over 64 ranks and experts sharded over 4
+# nodes hold less of the weights, gradients and moments per rank, so 6 leaves
+# room for a first run. Expandable segments are needed (see A3_RUNS.md).
 #
 # Paths, all outside the repository (the code travels as a zip; data and runs
 # stay put): the checkpoint in /home/e00642590/Qwen3-VL-30B-A3B-Instruct on every A3
@@ -42,10 +37,10 @@
 #
 # Launch with cluster-kit (NPROC_PER_NODE=16 in cluster.env). REMOTE_ENV_SETUP
 # must export, next to the toolkit and the Python environment:
-#   PYTORCH_NPU_ALLOC_CONF=expandable_segments:True TASK_QUEUE_ENABLE=2
+#   PYTORCH_NPU_ALLOC_CONF=expandable_segments:True TASK_QUEUE_ENABLE=1
 #   CPU_AFFINITY_CONF=1 HCCL_CONNECT_TIMEOUT=1800
-# (full determinism sets HCCL_DETERMINISTIC itself). The commands, from the
-# control node, are in examples/qwen3_vl_30b_perf/A3_RUNS.md.
+# (full determinism sets HCCL_DETERMINISTIC itself). Run it with a3_campaign.sh
+# and a plan (plans/smoke_64dev.sh, plans/sweep_64dev.sh); see A3_RUNS.md.
 
 model:
   _target_: examples.qwen3_vl_30b_perf.cropped_qwen3_vl.build_cropped_qwen3_vl

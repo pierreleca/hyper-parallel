@@ -12,6 +12,22 @@ zip of the A2 checkout. So nothing but code lives in the repository: data and
 run outputs sit at fixed paths under `/home/pl`, the same on A2 and on every A3
 node; only the checkpoint differs.
 
+## Campaigns: `a3_campaign.sh`
+
+From the control node, one call runs a whole plan on one set of nodes: it waits
+for them, installs the zip, builds the dataset where missing, runs every entry of
+the plan in order (a failed run is killed and recorded, the next one starts), then
+gathers the records and writes every report next to a `SUMMARY.txt`:
+
+```bash
+python3 -c "import zipfile,sys; z=zipfile.ZipFile(sys.argv[1]); [open(n.rsplit('/',1)[1],'wb').write(z.read(n)) for n in z.namelist() if n.endswith(('a3_campaign.sh','smoke_64dev.sh','sweep_64dev.sh'))]" <code.zip>
+bash a3_campaign.sh <code.zip> smoke_64dev.sh      # results in /home/pl/a3_runs/smoke_64dev_<stamp>/
+```
+
+Plans live in `plans/`: `smoke_64dev.sh` (one 10-step run, does 64 dies work?) and
+`sweep_64dev.sh` (baseline, budgets, a profiled pair). The sections below are the
+same steps by hand.
+
 ## Where things live
 
 | What | Path | A2 | A3 |
