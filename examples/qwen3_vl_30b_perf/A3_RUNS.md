@@ -14,14 +14,15 @@ node; only the checkpoint differs.
 
 ## Campaigns: `a3_campaign.sh`
 
-From the control node, one call runs a whole plan on one set of nodes: it waits
-for them, installs the zip, builds the dataset where missing, runs every entry of
-the plan in order (a failed run is killed and recorded, the next one starts), then
-gathers the records and writes every report next to a `SUMMARY.txt`:
+Select the nodes (`cluster select`) and deploy the zip to them and to the control
+node first. Then, from the control node's checkout, one call runs a whole plan on
+that selection: it builds the dataset where missing, runs every entry of the plan
+in order (a failed run is killed and recorded, the next one starts), then gathers
+the records and writes every report next to a `SUMMARY.txt`:
 
 ```bash
-python3 -c "import zipfile,sys; z=zipfile.ZipFile(sys.argv[1]); [open(n.rsplit('/',1)[1],'wb').write(z.read(n)) for n in z.namelist() if n.endswith(('a3_campaign.sh','smoke_64dev.sh','sweep_64dev.sh'))]" <code.zip>
-bash a3_campaign.sh <code.zip> smoke_64dev.sh      # results in /home/pl/a3_runs/smoke_64dev_<stamp>/
+examples/qwen3_vl_30b_perf/a3_campaign.sh examples/qwen3_vl_30b_perf/plans/smoke_64dev.sh
+# results in /home/pl/a3_runs/smoke_64dev_<stamp>/
 ```
 
 Plans live in `plans/`: `smoke_64dev.sh` (one 10-step run, does 64 dies work?) and
