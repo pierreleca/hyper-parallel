@@ -14,9 +14,9 @@ node; only the checkpoint differs.
 
 ## Campaigns: `a3_campaign.sh`
 
-Select the nodes (`cluster select`) and deploy the zip to them and to the control
-node first. Then, from the control node's checkout, one call runs a whole plan on
-that selection: it builds the dataset where missing, runs every entry of the plan
+Select the nodes (`cluster select`), deploy the zip to them and to the control
+node, and build the plan's dataset on each node once (below). Then, from the
+control node's checkout, one call runs a whole plan on that selection: it runs every entry of the plan
 in order (a failed run is killed and recorded, the next one starts), then gathers
 the records and writes every report next to a `SUMMARY.txt`:
 

@@ -18,26 +18,25 @@
 #
 #   examples/qwen3_vl_30b_perf/a3_campaign.sh <plan.sh>
 #
-# Before it: select the nodes (cluster select) and deploy the code to them and to
-# the control node; run it from the control node's checkout of that same code,
+# Before it: select the nodes (cluster select), deploy the code to them and to the
+# control node, and build the dataset CONFIG reads on every node (A3_RUNS.md); run
+# it from the control node's checkout of that same code,
 # which provides the analysis scripts. Every run goes to the selection active when
 # it starts, so leave the selection alone until the campaign ends.
 #
 # The plan (see plans/*.sh) is a bash file that sets:
 #   CONFIG     training YAML, repository-relative
-#   DATASET    prepare_cauldron_data.py arguments for the dataset CONFIG reads
 #   BASELINE   (optional) the run the others are compared with: routing, sweep
 #   RUNS       one entry per run: "<name> [--override=value ...]", run in order
 #
 # What it does, stopping a run (not the campaign) at its first failure:
-#   1. builds the dataset on each node where it is missing;
-#   2. per run: launches it once every device is free (torchrun -w --run-id),
+#   1. per run: launches it once every device is free (torchrun -w --run-id),
 #      waits for its end (status -w), kills what is left if it failed;
-#   3. gathers the small records (not the traces), merges the ranks of every node
+#   2. gathers the small records (not the traces), merges the ranks of every node
 #      into one directory, and runs the reports: the EP instrument report (with
 #      the swap activity), the routing comparison with BASELINE, the rule replay
 #      on no-swap runs, the trace report on the nodes for profiled runs;
-#   4. writes SUMMARY.txt with each run's state and, over all runs, the sweep.
+#   3. writes SUMMARY.txt with each run's state and, over all runs, the sweep.
 #
 # Everything lands in $OUT_BASE/<campaign>/ on the control node; paste SUMMARY.txt
 # and the reports it points to. Environment knobs (defaults in brackets):
@@ -50,7 +49,7 @@ PLAN="$(realpath "$1")"
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # this checkout's analysis scripts
 # shellcheck source=/dev/null
 source "$PLAN"
-: "${CONFIG:?plan sets CONFIG}" "${DATASET:?plan sets DATASET}"
+: "${CONFIG:?plan sets CONFIG}"
 [[ ${#RUNS[@]} -ge 1 ]] || { echo "the plan sets no RUNS" >&2; exit 2; }
 BASELINE="${BASELINE:-}"
 
@@ -68,10 +67,7 @@ echo "campaign $CAMPAIGN: ${#RUNS[@]} run(s), $CONFIG; output in $OUT"
 echo "code: $(git -C "$TOOLS" rev-parse --short HEAD 2>/dev/null || echo "not a git checkout") at $TOOLS"
 cp "$PLAN" "$OUT/plan.sh"
 
-# 1. The data.
-"${CL[@]}" exec -p "python examples/qwen3_vl_30b_perf/prepare_cauldron_data.py $DATASET"
-
-# 2 and 3. The runs, each analysed before the next starts.
+# 1 and 2. The runs, each analysed before the next starts.
 states=()
 for entry in "${RUNS[@]}"; do
   read -r -a words <<< "$entry"
@@ -122,7 +118,7 @@ for entry in "${RUNS[@]}"; do
   fi
 done
 
-# 4. The summary.
+# 3. The summary.
 {
   echo "campaign $CAMPAIGN, config $CONFIG"
   printf '  %s\n' "${states[@]}"
