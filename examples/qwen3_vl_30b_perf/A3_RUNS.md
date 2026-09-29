@@ -212,11 +212,13 @@ cluster sync
 cluster exec -p 'python examples/qwen3_vl_30b_perf/prepare_cauldron_data.py \
   --output-dir /home/pl/data/qwen3_vl_30b_perf/cauldron_seq16384_n1280 \
   --seq-len 16384 --num-samples 1280 --processor-path /home/e00642590/Qwen3-VL-30B-A3B-Instruct \
-  --download-dir /home/pl/data/the_cauldron --offline'
+  --download-dir /home/pl/data/the_cauldron --offline --passes 4'
 ```
 
-If the four cauldron subsets run out of conversations, build what they hold on
-every node and lower `--training.train_iters` to samples / 64, the same in both runs.
+The four cauldron subsets (about 14,500 conversations) fill fewer than 1280
+samples of 16384 tokens in one pass; `--passes` lets the builder go through them
+again under another shuffle, so a conversation can recur, packed with other
+neighbours. `meta.json` records how many passes it took.
 
 ```bash
 C=examples/qwen3_vl_30b_perf/train_64dev_a3_ep_host_swap.yaml

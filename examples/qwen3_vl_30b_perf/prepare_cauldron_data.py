@@ -252,7 +252,7 @@ class SampleBuilder:
                 messages.append({"role": "user", "content": prefix + user})
                 messages.append({"role": "assistant", "content": answer})
         if overflow is None:
-            raise RuntimeError("ran out of conversations; lower --num-samples or --seq-len")
+            raise RuntimeError("ran out of conversations; lower --num-samples or --seq-len, or raise --passes")
 
         # The text tail: the next conversations' text, without their images.
         question, tail, tail_tokens = None, [], 0
@@ -261,7 +261,7 @@ class SampleBuilder:
             if not pending:
                 conversation = next(stream, None)
                 if conversation is None:
-                    raise RuntimeError("ran out of conversations; lower --num-samples or --seq-len")
+                    raise RuntimeError("ran out of conversations; lower --num-samples or --seq-len, or raise --passes")
                 pending.append(conversation)
             for user, answer in pending.pop().turns:
                 if question is None:
@@ -316,8 +316,8 @@ def prepare(args: argparse.Namespace) -> None:
 
     tokenizer = AutoTokenizer.from_pretrained(args.processor_path, local_files_only=True)
     conversations = read_conversations(download(args.download_dir, insecure=args.insecure, offline=args.offline))
-    random.Random(args.seed).shuffle(conversations)
-    stream = iter(conversations)
+    passes = [0]
+    stream = _conversation_stream(conversations, args.seed, args.passes, passes)
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.", dir=output_dir.parent))
@@ -338,6 +338,7 @@ def prepare(args: argparse.Namespace) -> None:
             "num_samples": args.num_samples,
             "seed": args.seed,
             "conversations_available": len(conversations),
+            "passes_over_conversations": passes[0],
             "images_per_sample_mean": sum(s["images"] for s in stats) / len(stats),
             "visual_token_share_mean": sum(s["visual_tokens"] for s in stats) / (len(stats) * args.seq_len),
             "build_seconds": round(time.perf_counter() - start, 1),
@@ -357,6 +358,21 @@ def prepare(args: argparse.Namespace) -> None:
     )
 
 
+def _conversation_stream(conversations: list[Conversation], seed: int, passes: int,
+                         seen: list[int]) -> Iterator[Conversation]:
+    """Yield the conversations shuffled, then again under another shuffle, up to ``passes`` times.
+
+    The first pass is the order a single pass always had, so a dataset built
+    with one pass is unchanged. A later pass packs the same conversations with
+    other neighbours into other samples. ``seen[0]`` counts the passes started.
+    """
+    for index in range(passes):
+        seen[0] = index + 1
+        order = list(conversations)
+        random.Random(seed + index).shuffle(order)
+        yield from order
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse command-line options."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -369,6 +385,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=Path("/home/pl/data/the_cauldron"),
     )
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument(
+        "--passes", type=int, default=1,
+        help="times the conversations may be used, each pass under another shuffle, when one pass "
+             "cannot fill --num-samples (the first pass is the single-pass order)",
+    )
     parser.add_argument(
         "--offline", action="store_true",
         help="never download: stop with the missing file names instead (for machines without internet)",
