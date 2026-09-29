@@ -136,6 +136,57 @@ python examples/qwen3_vl_30b_perf/analyze_ep_instrument.py $A/a3_16dev_swap/inst
   --swap-dir $A/a3_16dev_swap/ep_host_swap
 ```
 
+## Budget sweep, one node
+
+Every configuration against its own no-swap baseline, at 6 and 8 text layers. The
+runs are sequential; `wait_run` polls until the current one ends and stops the
+loop if it failed.
+
+```bash
+wait_run() {
+  sleep 60
+  while cluster status | grep -q RUNNING; do sleep 30; done
+  ! cluster status | grep -q -e DEAD -e KILLED
+}
+C=examples/qwen3_vl_30b_perf/train_16dev_a3_ep_host_swap.yaml
+R=/home/pl/runs/qwen3_vl_30b_perf
+run() {  # run <name> <overrides...>
+  local name=$1; shift
+  cluster torchrun scripts/train_vl.py $C --ep_instrument.output_dir=$R/$name/instrument \
+    --ep_host_swap.output_dir=$R/$name/ep_host_swap "$@" && wait_run
+}
+run a3_16dev_noswap --ep_host_swap.enabled=false &&
+run a3_16dev_k54 --ep_host_swap.budget_layers=5.4 &&
+run a3_16dev_8l_noswap --model.num_hidden_layers=8 --ep_host_swap.enabled=false &&
+for K in 8.8 8.0 7.2 6.4 5.6 4.8 4.0 3.2 2.4 1.6 0.8; do
+  run a3_16dev_8l_k${K/./} --model.num_hidden_layers=8 --ep_host_swap.budget_layers=$K || break
+done
+# profiles of one pair: every rank, steps 6-9, instrument off
+for K in noswap 6.4; do
+  if [ $K = noswap ]; then swap=--ep_host_swap.enabled=false; else swap=--ep_host_swap.budget_layers=$K; fi
+  cluster torchrun scripts/train_vl.py $C --model.num_hidden_layers=8 $swap \
+    --training.train_iters=10 --ep_instrument.enabled=false \
+    --profiling.enabled=true --profiling.rank=-1 --profiling.start_step=6 --profiling.end_step=10 \
+    --profiling.trace_dir=$R/a3_16dev_8l_profile_${K/./} \
+    --ep_host_swap.output_dir=$R/a3_16dev_8l_profile_${K/./}/ep_host_swap && wait_run || break
+done
+```
+
+Reports, from the gathered records (`8.8` is over one mean layer per layer, the
+others at or under it):
+
+```bash
+runs="a3_16dev_noswap a3_16dev_k54 a3_16dev_8l_noswap"
+for K in 88 80 72 64 56 48 40 32 24 16 08; do runs="$runs a3_16dev_8l_k$K"; done
+cluster gather $(for run in $runs; do echo $R/$run; done) ./a3_runs   # records only, not the traces
+A=./a3_runs/node0
+python examples/qwen3_vl_30b_perf/analyze_ep_instrument.py --sweep $A/a3_16dev_8l_noswap $A/a3_16dev_8l_k*
+python examples/qwen3_vl_30b_perf/analyze_ep_instrument.py $A/a3_16dev_k54/instrument --compare $A/a3_16dev_noswap/instrument
+python examples/qwen3_vl_30b_perf/analyze_ep_instrument.py $A/a3_16dev_k54/instrument --swap-dir $A/a3_16dev_k54/ep_host_swap
+python examples/qwen3_vl_30b_perf/replay_ep_host_swap.py $A/a3_16dev_8l_noswap/instrument
+cluster exec "python examples/qwen3_vl_30b_perf/analyze_npu_trace.py $R/a3_16dev_8l_profile_64 --ranks"
+```
+
 ## 64 dies, four nodes
 
 ```bash
