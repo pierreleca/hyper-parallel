@@ -1,5 +1,5 @@
 # Qwen3-VL-30B-A3B-Instruct on 64 Ascend A3 dies (four 16-die nodes): EP
-# imbalance and the per-layer MoE host swap. FSDP 64 over the dense weights;
+# imbalance and the MoE host swap. FSDP 64 over the dense weights;
 # EP 16 inside each node (8 of the 128 experts per rank, all-to-all intra-node);
 # each expert group FSDP-sharded over the 4 nodes (edp_shard 4).
 #
@@ -13,8 +13,8 @@
 # What it measures, as the 4-die A2 runs did (train_4dev_a2_ep_host_swap.yaml):
 # - the EP imbalance per layer and per rank, and the MoE memory it causes
 #   (EP instrument on, MoE blocks kept: activation_checkpoint full_except_moe);
-# - the per-layer host swap (ep_host_swap, whole tensors, budget 1.2 x the
-#   mean): which layers go over, the bytes moved, the copy bandwidth each way,
+# - the host swap (ep_host_swap, one budget per pass at 0.9 x the mean load):
+#   which layers are evicted, the bytes moved, the copy bandwidth each way,
 #   how much of the copy back compute hides, and where the allocator's reserve
 #   grows;
 # - against a baseline run with the swap off. Full determinism makes step i
@@ -229,15 +229,13 @@ ep_instrument:
   align_steps: false
   record_counts: true
 
-# Per-layer budget for the MoE activations; the excess goes to pinned host memory.
+# MoE host swap: bound the MoE activations of a pass, the excess goes to pinned host memory.
 ep_host_swap:
   enabled: true
-  capacity_factor: 1.2
-  # tensors: move whole saved tensors. rows: move about the excess only, at the
-  # cost of a device copy of the kept rows of one tensor each way; its buffers
-  # fragmented the allocator on A2 (reserve +0.5-1.2 GiB), so tensors is the
-  # default.
-  granularity: tensors
+  # One budget for the MoE activations of a forward pass: capacity_factor times
+  # the mean load, earliest layers swapped to host first. 1.0 to 0.3 is the
+  # useful range on 16 A3 dies; 0.9 was measured at 6 and 8 text layers.
+  capacity_factor: 0.9
   # Index tensors (8 bytes per pair) stay on device.
   min_row_bytes: 1024
   output_dir: /home/pl/runs/qwen3_vl_30b_perf/a3_64dev_swap/ep_host_swap

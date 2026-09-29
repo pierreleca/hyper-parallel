@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Per-layer MoE activation budget with the excess swapped to host (CPU path)."""
+"""MoE activation budget for a forward pass, earliest layers swapped to host (CPU path)."""
 
 import json
 import pathlib
@@ -26,21 +26,20 @@ import torch.nn.functional as F
 from torch import nn
 
 from hyper_parallel.distributed.expert_parallel.experts import bind_local_expert_forward, ep_routed_forward
-from hyper_parallel.distributed.expert_parallel.host_swap import HOST_SWAP, EPHostSwap, choose_offload, plan_rows
+from hyper_parallel.distributed.expert_parallel.host_swap import HOST_SWAP, EPHostSwap, choose_offload
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
 
 HIDDEN, INTER = 16, 8
 
 
-@pytest.fixture(name="swap", params=["rows", "tensors"])
-def fixture_swap(tmp_path: pathlib.Path, request: pytest.FixtureRequest) -> Iterator[EPHostSwap]:
-    """Enable the swap, in each granularity, with a small row threshold; disable it after the test."""
-    HOST_SWAP.configure(enabled=True, capacity_factor=1.0, min_row_bytes=16, output_dir=str(tmp_path),
-                        granularity=request.param)
+@pytest.fixture(name="swap")
+def fixture_swap(tmp_path: pathlib.Path) -> Iterator[EPHostSwap]:
+    """Enable the swap below the mean load, with a small row threshold; disable it after the test."""
+    HOST_SWAP.configure(enabled=True, capacity_factor=0.9, min_row_bytes=16, output_dir=str(tmp_path))
     HOST_SWAP.begin_step(1)
     yield HOST_SWAP
     HOST_SWAP.close()
-    HOST_SWAP.configure(enabled=False, capacity_factor=1.2, min_row_bytes=1024, output_dir="")
+    HOST_SWAP.configure(enabled=False, capacity_factor=1.0, min_row_bytes=1024, output_dir="")
     HOST_SWAP.begin_step(0)
 
 
@@ -94,36 +93,17 @@ def test_pinned_pool_hands_out_the_best_fit_among_mixed_sizes():
     assert not pool.free
 
 
-def test_plan_rows_moves_about_the_excess_and_splits_the_cheapest_tensor():
-    """Rows of the smallest tensor cover a small excess; bigger ones add whole tensors first."""
-    tensors = [(100, 4096), (100, 3072), (100, 1536)]
-    assert plan_rows(tensors, 0) == []
-    assert plan_rows(tensors, 10 * 1536) == [(2, 10)], "ten rows of the smallest: least kept on device"
-    # Past the smallest tensor: 51 rows of the middle one move the same bytes as the whole
-    # smallest plus one row, and keep 49 rows on device instead of 99.
-    assert plan_rows(tensors, 100 * 1536 + 3072) == [(1, 51)]
-    moved = plan_rows(tensors, 500_000)
-    assert sum(rows * tensors[index][1] for index, rows in moved) >= 500_000
-    assert plan_rows(tensors, 10 ** 9) == [(0, 100), (1, 100), (2, 100)]
-
-
 def test_swapped_layers_give_the_same_gradients(swap):
-    """Layers over budget move tensors to host and back; the gradients do not change."""
-    rows = [12, 6, 15]  # budget 8 rows: layers 0 and 2 are over it
+    """Layers over the budget move tensors to host and back; the gradients do not change."""
+    rows = [12, 6, 15]  # 33 rows against a budget of 0.9 x 24
     expected, _ = _run(rows, sent=8, swap_on=False)
     swap.begin_step(1)
     got, layers = _run(rows, sent=8, swap_on=True)
     for want, have in zip(expected, got):
         torch.testing.assert_close(have, want)
-    assert [layer.index for layer in layers] == [0, 2]
+    assert layers and layers[0].index == 0, "the earliest layer goes first"
     for layer in layers:
-        excess_bytes = (layer.rows - layer.capacity) * sum(item.nbytes for item in layer.saved) / layer.rows
-        assert layer.swapped_bytes >= excess_bytes, "the layer ends within its budget"
-        assert all(item.device is None and item.kept is None for item in layer.swapped), "all released"
-        if swap.granularity == "rows":
-            row_bytes = max(item.row_bytes for item in layer.saved)
-            assert layer.swapped_bytes < excess_bytes + row_bytes, "rows move about the excess only"
-    assert layers[0].prefetched and not layers[1].prefetched, "layer 0 came back while layer 2 ran backward"
+        assert all(item.device is None for item in layer.swapped), "released after backward"
 
 
 def test_record_counts_the_moved_bytes(swap, tmp_path):
@@ -204,84 +184,70 @@ def _ep_grads(world_one_group, swap_on: bool) -> list[torch.Tensor]:
 
 
 def test_ep_blocks_swap_and_keep_their_gradients(world_one_group, swap):
-    """Through ep_routed_forward, a budget below the load swaps every layer and changes nothing."""
-    granularity = swap.granularity
+    """Through ep_routed_forward, a budget below the load swaps and changes nothing."""
     swap.configure(enabled=False, capacity_factor=1.0, min_row_bytes=16, output_dir="")
     expected = _ep_grads(world_one_group, swap_on=False)
-    # One rank receives what it sends; a budget of half of that puts every layer over it.
-    swap.configure(enabled=True, capacity_factor=0.5, min_row_bytes=16, output_dir="", granularity=granularity)
+    # One rank receives what it sends; a budget of half of that puts the pass over it.
+    swap.configure(enabled=True, capacity_factor=0.5, min_row_bytes=16, output_dir="")
     swap.begin_step(1)
     got = _ep_grads(world_one_group, swap_on=True)
     for want, have in zip(expected, got):
         torch.testing.assert_close(have, want)
     record = swap.end_step(rank=0)
-    assert record["moe_layers"] == 2 and record["swapped_layers"] == 2
+    assert record["moe_layers"] == 2 and record["swapped_layers"] >= 1
     assert all(layer["swapped_bytes"] > 0 for layer in record["layers"])
 
 
-@pytest.fixture(name="step_swap")
-def fixture_step_swap(tmp_path: pathlib.Path) -> Iterator[EPHostSwap]:
-    """Enable the step budget below the mean load; disable it after the test."""
-    HOST_SWAP.configure(enabled=True, capacity_factor=0.9, min_row_bytes=16, output_dir=str(tmp_path),
-                        budget="step")
-    HOST_SWAP.begin_step(1)
-    yield HOST_SWAP
-    HOST_SWAP.close()
-    HOST_SWAP.configure(enabled=False, capacity_factor=1.2, min_row_bytes=1024, output_dir="")
-    HOST_SWAP.begin_step(0)
-
-
-def test_step_budget_below_the_mean_swaps_balanced_layers_and_keeps_gradients(step_swap):
+def test_factor_below_one_swaps_balanced_layers_and_keeps_gradients(swap):
     """A factor under 1 swaps even when every layer is at the mean, earliest layers first."""
     rows = [8, 8, 8]  # every layer exactly at the mean load
     expected, _ = _run(rows, sent=8, swap_on=False)
-    step_swap.begin_step(1)
+    swap.begin_step(1)
     got, layers = _run(rows, sent=8, swap_on=True)
     for want, have in zip(expected, got):
         torch.testing.assert_close(have, want)
     assert layers and min(layer.index for layer in layers) == 0, "the earliest layer goes first"
-    record = step_swap.end_step(rank=0)
-    assert record["budget"] == "step" and record["evictions"]
+    record = swap.end_step(rank=0)
+    assert record["evictions"]
     for decision in record["evictions"]:
         assert decision["projected_gib"] - decision["evicted_gib"] <= decision["budget_gib"] + 1e-12
 
 
-def test_step_budget_learns_the_pass_length_and_acts_early(step_swap):
+def test_budget_learns_the_pass_length_and_acts_early(swap):
     """Once a pass's length is known, the projection swaps after the very first layer."""
     _run([8, 8, 8], sent=8, swap_on=True)
-    first = step_swap.end_step(rank=0)["evictions"]
-    step_swap.begin_step(2)
+    first = swap.end_step(rank=0)["evictions"]
+    swap.begin_step(2)
     _run([8, 8, 8], sent=8, swap_on=True)
-    second = step_swap.end_step(rank=0)["evictions"]
+    second = swap.end_step(rank=0)["evictions"]
     assert second[0]["expected_layers"] == 3 and second[0]["after_layer"] == 0
     assert second[0]["need_gib"] > first[0]["need_gib"], "the remaining layers count from the start"
 
 
-def test_step_budget_above_the_spread_swaps_nothing(step_swap):
+def test_budget_above_the_spread_swaps_nothing(swap):
     """A budget over every rank's total leaves the pass on device."""
-    step_swap.configure(enabled=True, capacity_factor=1.5, min_row_bytes=16, output_dir="", budget="step")
-    step_swap.begin_step(1)
+    swap.configure(enabled=True, capacity_factor=1.5, min_row_bytes=16, output_dir="")
+    swap.begin_step(1)
     _grads, layers = _run([12, 6, 9], sent=8, swap_on=True)  # total 27 rows against 1.5 x 24
     assert not layers
 
 
-def test_step_budget_brings_a_layer_back_only_from_the_layer_above(step_swap, monkeypatch):
+def test_a_layer_comes_back_only_from_the_layer_above(swap, monkeypatch):
     """Swapped early layers come back one layer ahead of their backward, not at its start."""
-    step_swap.configure(enabled=True, capacity_factor=0.5, min_row_bytes=16, output_dir="", budget="step")
-    step_swap.begin_step(1)
+    swap.configure(enabled=True, capacity_factor=0.5, min_row_bytes=16, output_dir="")
+    swap.begin_step(1)
     trace = []
-    unpack, load = step_swap._unpack, step_swap._load  # pylint: disable=protected-access
-    monkeypatch.setattr(step_swap, "_unpack", lambda packed: (
+    unpack, load = swap._unpack, swap._load  # pylint: disable=protected-access
+    monkeypatch.setattr(swap, "_unpack", lambda packed: (
         trace.append(("unpack", packed.layer.index)) if hasattr(packed, "layer") else None, unpack(packed))[1])
-    monkeypatch.setattr(step_swap, "_load", lambda layer: (trace.append(("load", layer.index)), load(layer))[0])
+    monkeypatch.setattr(swap, "_load", lambda layer: (trace.append(("load", layer.index)), load(layer))[0])
     _grads, layers = _run([8, 8, 8, 8], sent=8, swap_on=True)
     for layer in layers:
         first_unpack_above = trace.index(("unpack", layer.index + 1))
         assert trace.index(("load", layer.index)) > first_unpack_above, f"layer {layer.index} loaded early"
 
 
-def test_step_budget_rejects_rows_granularity():
-    """The step budget moves whole tensors only."""
-    with pytest.raises(ValueError, match="tensors"):
-        EPHostSwap().configure(enabled=False, capacity_factor=0.9, min_row_bytes=16, output_dir="",
-                               granularity="rows", budget="step")
+def test_capacity_factor_must_be_positive():
+    """A budget of zero or less could hold nothing."""
+    with pytest.raises(ValueError, match="positive"):
+        EPHostSwap().configure(enabled=False, capacity_factor=0.0, min_row_bytes=16, output_dir="")

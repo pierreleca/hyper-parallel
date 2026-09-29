@@ -1,18 +1,17 @@
-# Qwen3-VL-30B-A3B-Instruct: per-layer MoE activation budget with the excess
-# swapped to host (ep_host_swap). 4 Ascend A2 devices, FSDP + EP; same model,
+# Qwen3-VL-30B-A3B-Instruct: MoE activation budget with the excess swapped to
+# host (ep_host_swap). 4 Ascend A2 devices, FSDP + EP; same model,
 # data, parallelism and determinism as train_4dev_a2_ep_instrument_moe_kept.yaml,
 # so its run (ep_instrument_cauldron) is the baseline, step for step.
 #
-# What the swap does: each MoE layer may keep capacity_factor times the routed
-# pairs a rank sends (the mean a rank receives). When a layer receives more,
-# the smallest set of its saved tensors that covers the excess goes to pinned
-# host memory at the end of the layer's forward, on a side stream, and comes
-# back in backward, one swapped layer ahead. capacity_factor 1.2 swaps on the
-# busiest rank of most layers (per-layer load reaches 1.43 times the mean on
-# this data); 1.0 swaps on every rank above the mean, to stress the host link.
+# What the swap does: the MoE layers of a forward pass may together keep
+# capacity_factor times the routed pairs a rank sends, summed over the layers.
+# When a rank's projected end-of-forward total goes over, whole saved tensors of
+# its earliest layers go to pinned host memory on a side stream, and come back
+# in backward while the layer above them runs. Below 1, every rank swaps every
+# step.
 #
 # What to read:
-# - the log line "EP host swap rankN step S": layers over budget, GiB moved,
+# - the log line "EP host swap rankN step S": layers swapped, GiB moved,
 #   the D2H and H2D bandwidths and how long the compute stream waited;
 # - ep_host_swap/host_swap_rank<N>.jsonl: the same per layer;
 # - the EP instrument (on, as in the baseline): the per-layer memory, the step
@@ -218,15 +217,13 @@ ep_instrument:
   align_steps: true
   record_counts: true
 
-# Per-layer budget for the MoE activations; the excess goes to pinned host memory.
+# MoE host swap: bound the MoE activations of a pass, the excess goes to pinned host memory.
 ep_host_swap:
   enabled: true
-  capacity_factor: 1.2
-  # tensors: move whole saved tensors. rows: move about the excess only, at the
-  # cost of a device copy of the kept rows of one tensor each way; its buffers
-  # fragmented the allocator on A2 (reserve +0.5-1.2 GiB), so tensors is the
-  # default.
-  granularity: tensors
+  # One budget for the MoE activations of a forward pass: capacity_factor times
+  # the mean load, earliest layers swapped to host first. 1.0 to 0.3 is the
+  # useful range on 16 A3 dies; 0.9 was measured at 6 and 8 text layers.
+  capacity_factor: 0.9
   # Index tensors (8 bytes per pair) stay on device.
   min_row_bytes: 1024
   output_dir: /home/pl/runs/qwen3_vl_30b_perf/ep_host_swap_cauldron/ep_host_swap

@@ -36,8 +36,6 @@ class EPHostSwapCallback(Callback):
             capacity_factor=self.config.capacity_factor,
             min_row_bytes=self.config.min_row_bytes,
             output_dir=self.config.output_dir,
-            granularity=self.config.granularity,
-            budget=self.config.budget,
         )
 
     def on_train_begin(self, state: TrainerState, **kwargs: Any) -> None:
@@ -45,10 +43,8 @@ class EPHostSwapCallback(Callback):
         del state, kwargs
         if self.config.enabled:
             logger.info(
-                "EP host swap: MoE %s budget %.2f x sent pairs, %s granularity, records in %s",
-                self.config.budget,
+                "EP host swap: MoE activations of a pass budgeted at %.2f x sent pairs, records in %s",
                 self.config.capacity_factor,
-                self.config.granularity,
                 self.config.output_dir,
             )
 
@@ -67,9 +63,9 @@ class EPHostSwapCallback(Callback):
         if record is None or not record["swapped_layers"]:
             return
         logger.info(
-            "EP host swap rank%s step %s: %d of %d MoE layers over budget, %.2f GiB to host in %.1f ms"
-            " at %s GB/s (never waited for), back in %.1f ms at %s GB/s; kept rows %.2f GiB copied"
-            " out in %.1f ms and in in %.1f ms; copy back %.1f ms hidden under compute, %.1f ms exposed",
+            "EP host swap rank%s step %s: %d of %d MoE layers swapped, %.2f GiB to host in %.1f ms"
+            " at %s GB/s (never waited for), back in %.1f ms at %s GB/s; copy back %.1f ms hidden"
+            " under compute, %.1f ms exposed",
             self.trainer.global_rank,
             state.global_step + 1,
             record["swapped_layers"],
@@ -79,9 +75,6 @@ class EPHostSwapCallback(Callback):
             _rate(record["d2h_gbps"]),
             record["h2d_ms"],
             _rate(record["h2d_gbps"]),
-            record["device_copy_gib"],
-            record["d2d_out_ms"],
-            record["d2d_in_ms"],
             record["h2d_hidden_ms"],
             record["stall_ms"],
         )

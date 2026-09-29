@@ -481,7 +481,7 @@ def test_swap_activity_summarizes_the_swap_records(tmp_path):
     analyzer = _load_analyzer()
     base = {"swapped_layers": 1, "d2h_gib": 0.5, "d2h_gbps": 30.0, "h2d_gbps": 40.0,
             "h2d_hidden_ms": 10.0, "stall_ms": 2.0, "evictions": [{}]}
-    lines = [{"header": True, "budget": "step"},
+    lines = [{"header": True, "capacity_factor": 0.9},
              {**base, "step": 1, "rank": 0, "d2h_gib": 9.0},  # warm-up
              {**base, "step": 2, "rank": 0},
              {**base, "step": 3, "rank": 0, "swapped_layers": 0, "d2h_gib": 0.0, "d2h_gbps": None,
@@ -491,7 +491,7 @@ def test_swap_activity_summarizes_the_swap_records(tmp_path):
     out = []
     summary = analyzer.report_swap_activity(str(tmp_path), 1, out)
     row = summary["ranks"][0]
-    assert summary["budget"] == "step" and row["steps"] == 2 and row["steps_swapping"] == 1
+    assert summary["capacity_factor"] == 0.9 and row["steps"] == 2 and row["steps_swapping"] == 1
     assert row["gib_per_step"] == pytest.approx(0.25) and row["d2h_gbps"] == pytest.approx(30.0)
     assert row["exposed_ms"] == pytest.approx(1.0) and row["evictions_per_step"] == pytest.approx(0.5)
 
@@ -506,7 +506,7 @@ def test_sweep_compares_runs_one_row_each(tmp_path, capsys):
         if moved is None:
             continue
         (run / "ep_host_swap").mkdir()
-        lines = [{"header": True, "budget": "step"}] + [
+        lines = [{"header": True, "capacity_factor": 0.9}] + [
             {"step": step, "rank": 0, "swapped_layers": 1, "d2h_gib": moved, "d2h_gbps": 30.0,
              "h2d_gbps": 40.0, "h2d_hidden_ms": 9.0, "stall_ms": 4.0, "pinned_gib": 2.0, "evictions": [{}]}
             for step in (1, 2)]

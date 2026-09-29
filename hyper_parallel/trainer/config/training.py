@@ -95,44 +95,27 @@ class EPInstrumentConfig:
 
 @dataclass
 class EPHostSwapConfig:
-    """Budget for the MoE activations, per layer or per step, the excess swapped to host.
+    """One budget for a forward pass's MoE activations, the earliest layers swapped to host.
 
     Read by ``EPHostSwapCallback``; the swap itself lives in
-    ``hyper_parallel.distributed.expert_parallel.host_swap``. With ``budget:
-    layer`` each MoE layer keeps at most ``capacity_factor`` times the routed
-    pairs a rank sends; the saved tensors beyond that go to pinned host memory
-    in forward and come back in backward. With ``budget: step`` a rank keeps at
-    most ``capacity_factor`` times its mean load summed over all its MoE layers,
-    and swaps its earliest layers as soon as its projected total goes over; the
-    factor may then be below 1, making every rank swap every step.
+    ``hyper_parallel.distributed.expert_parallel.host_swap``. Each rank keeps at
+    most ``capacity_factor`` times its mean load, summed over all its MoE layers,
+    of the activations the experts save for backward, and swaps its earliest
+    layers to pinned host memory as soon as its projected total goes over. A
+    factor below 1 makes every rank swap every step.
     """
 
     enabled: bool = False
-    capacity_factor: float = 1.2
-    # "layer": a budget per MoE layer. "step": one budget for all MoE layers of a
-    # forward pass, earliest layers swapped first ("tensors" granularity only).
-    budget: str = "layer"
-    # What goes to host: "tensors" moves whole saved tensors, with no device copy
-    # but up to a whole tensor more host traffic; "rows" moves about the excess
-    # only, but its kept-rows buffers (a new size every step, allocated near the
-    # peak) fragment the allocator: on 4 A2 dies the reserve grew 0.5-1.2 GiB,
-    # more than the swap saved.
-    granularity: str = "tensors"
+    capacity_factor: float = 1.0
     # Saved tensors with fewer bytes per routed pair (indices) stay on device.
     min_row_bytes: int = 1024
-    # One JSON Lines file per rank: bytes moved, copy times and waits per step.
+    # One JSON Lines file per rank: evictions, bytes moved, copy times and waits per step.
     output_dir: str = "./outputs/ep_host_swap"
 
     def __post_init__(self) -> None:
         """Reject a budget that cannot hold anything."""
         if self.capacity_factor <= 0:
             raise ValueError("ep_host_swap.capacity_factor must be positive")
-        if self.granularity not in ("rows", "tensors"):
-            raise ValueError(f"ep_host_swap.granularity must be 'rows' or 'tensors', not {self.granularity!r}")
-        if self.budget not in ("layer", "step"):
-            raise ValueError(f"ep_host_swap.budget must be 'layer' or 'step', not {self.budget!r}")
-        if self.budget == "step" and self.granularity != "tensors":
-            raise ValueError("ep_host_swap.budget 'step' supports 'tensors' granularity only")
 
 
 @dataclass
