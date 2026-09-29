@@ -138,6 +138,10 @@ update_expert_bias(moe, lr=1e-3, num_recomputations=1)
 loss_value = output._load_balance_loss
 ```
 
+### 负载不均衡下的激活显存：MoE host swap
+
+路由不均衡会让最忙的 rank 为反向保留更多 MoE 激活，显存峰值随路由变化。Trainer 的 EP 路径（`hyper_parallel/distributed/expert_parallel`）提供 `ep_host_swap`：一次前向中各 MoE 层为反向保留的激活，合计不超过 `capacity_factor` × 本 rank 的平均负载（本 rank 发送的 token-expert 对数）× MoE 层数；预测将超出预算时，最早几层的激活拷贝到 pinned host 内存，并在反向时取回，不丢弃 token。详见 [MoE host swap 指南](./ep_host_swap.md)（英文）。
+
 ---
 
 ## MoE+EP token dispatch 解耦
@@ -170,3 +174,4 @@ EP hooks 不干扰 FSDP unshard/reshard 或 pipeline micro-batch scheduling。
 ## 更多参考
 
 - [API 参考](../api/api_reference.md) — EP 模块接口详细说明
+- [MoE host swap](./ep_host_swap.md) — 以固定预算限制 EP 的 MoE 激活显存，超出部分换出到 host
