@@ -871,18 +871,19 @@ def report_swap_activity(swap_dir: str, skip: int, out: list[str]) -> dict[str, 
     Steps up to ``skip`` are warm-up and left out, as in the rest of the report.
     """
     per_rank: dict[int, list[dict]] = {}
-    factor = None
+    budget = None
     for path in sorted(glob.glob(os.path.join(swap_dir, "host_swap_rank*.jsonl"))):
         with open(path, encoding="utf-8") as stream:
             for line in stream:
                 record = json.loads(line)
                 if record.get("header"):
-                    factor = record.get("capacity_factor", factor)
+                    # Older records give a capacity factor: the budget in mean layers per MoE layer.
+                    budget = record.get("budget_layers", record.get("capacity_factor", budget))
                 elif record["step"] > skip:
                     per_rank.setdefault(record["rank"], []).append(record)
     if not per_rank:
         return {}
-    out.append(f"SWAP ACTIVITY (capacity factor {factor}, per rank, mean over steps after {skip})")
+    out.append(f"SWAP ACTIVITY (budget {budget}, per rank, mean over steps after {skip})")
     out.append("  rank  steps swapping  layers/step  GiB/step  D2H GB/s  H2D GB/s  copy back hidden ms"
                "  exposed ms  evictions/step")
     rows = []
@@ -913,7 +914,7 @@ def report_swap_activity(swap_dir: str, skip: int, out: list[str]) -> dict[str, 
         f" copy back exposed {statistics.fmean(row['exposed_ms'] for row in rows):.1f} ms per step on average,"
         f" {max(row['exposed_ms'] for row in rows):.1f} ms at worst"
     )
-    return {"capacity_factor": factor, "ranks": rows}
+    return {"budget": budget, "ranks": rows}
 
 
 def sweep_row(run_dir: str, skip: int) -> dict[str, Any]:

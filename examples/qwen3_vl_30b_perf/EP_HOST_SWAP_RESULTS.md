@@ -10,13 +10,17 @@ One A3 node of 16 dies, `train_16dev_a3_ep_host_swap.yaml`: Qwen3-VL-30B-A3B-Ins
 cropped to 6 text layers (8 for the runs named `8l`), FSDP 16 and EP 16, activation
 recompute `full_except_moe`, 20 steps, 320 the_cauldron samples at sequence length
 16384. Memory and step time cover steps 5–20; the swap records cover steps 3–20.
+The runs predate `budget_layers` and the current trigger: they set
+`capacity_factor`, the budget in mean layers per MoE layer (0.9 at 6 layers is
+`budget_layers` 5.4), and evicted as soon as a projection of the remaining layers
+at the mean crossed the budget.
 
 | Run | What it is |
 | --- | --- |
 | `a3_16dev_noswap` | baseline, `--ep_host_swap.enabled=false` |
-| `a3_16dev_step090` | `--ep_host_swap.capacity_factor=0.9` |
+| `a3_16dev_step090` | `--ep_host_swap.capacity_factor=0.9` (5.4 mean layers of 6) |
 | `a3_16dev_8l_noswap` | 8 text layers, baseline (`--model.num_hidden_layers=8`) |
-| `a3_16dev_8l_step100` … `_step010` | 8 text layers, factor 1.0 down to 0.1 in steps of 0.1 |
+| `a3_16dev_8l_step100` … `_step010` | 8 text layers, factor 1.0 down to 0.1 in steps of 0.1 (8 down to 0.8 mean layers) |
 | `a3_16dev_8l_profile_noswap` / `_step080` | torch_npu profile of the 8-layer pair, all ranks, instrument off |
 | `host_link_bench` | `host_link_bench.py`: dies copying to host alone and together |
 
@@ -64,7 +68,7 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True TASK_QUEUE_ENABLE=1 CPU_A
 
 **Budget sizing from the no-swap routing.** MoE memory summed over the six layers,
 against a budget of a multiple of its mean (of MoE memory, including the part every
-rank holds alike; `capacity_factor` multiplies only the routed part):
+rank holds alike; `budget_layers` counts only the routed part):
 
 | Budget (× mean MoE memory) | GiB | (step, rank) over | worst eviction, GiB |
 | --- | --- | --- | --- |
@@ -130,7 +134,7 @@ at 15–30 GB/s to host and 23–46 GB/s back, none waited for. Routing is harde
 layers: per-layer max/mean 1.75 on average and 2.57 at worst (L6), step level 1.17 at
 worst.
 
-## Factor sweep (8 layers)
+## Factor sweep (8 layers; `budget_layers` = factor × 8)
 
 | Factor | to host, GiB/rank/step | alloc mean | alloc worst | reserved mean | reserved worst | step s, mean / median | D2H GB/s | copy back waited, max ms | pinned GiB |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |

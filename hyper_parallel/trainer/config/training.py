@@ -95,18 +95,21 @@ class EPInstrumentConfig:
 
 @dataclass
 class EPHostSwapConfig:
-    """One budget for a forward pass's MoE activations, the earliest layers swapped to host.
+    """A budget in mean layers for a forward pass's MoE activations, the earliest layers swapped to host.
 
     Read by ``EPHostSwapCallback``; the swap itself lives in
-    ``hyper_parallel.distributed.expert_parallel.host_swap``. Each rank keeps at
-    most ``capacity_factor`` times its mean load, summed over all its MoE layers,
-    of the activations the experts save for backward, and swaps its earliest
-    layers to pinned host memory as soon as its projected total goes over. A
-    factor below 1 makes every rank swap every step.
+    ``hyper_parallel.distributed.expert_parallel.host_swap``. A mean layer is
+    what one MoE layer saves for backward when a rank receives exactly the
+    routed pairs it sends. Each rank ends every forward pass holding at most
+    ``budget_layers`` mean layers of these activations, whatever the routing;
+    the rest goes to pinned host memory, earliest layers first, and comes back
+    in backward. Fewer mean layers than MoE layers makes every rank swap every
+    step; more leaves room for routing imbalance before anything moves.
     """
 
     enabled: bool = False
-    capacity_factor: float = 1.0
+    # Mean layers of MoE activations a rank may keep; required when enabled.
+    budget_layers: float = 0.0
     # Saved tensors with fewer bytes per routed pair (indices) stay on device.
     min_row_bytes: int = 1024
     # One JSON Lines file per rank: evictions, bytes moved, copy times and waits per step.
@@ -114,8 +117,8 @@ class EPHostSwapConfig:
 
     def __post_init__(self) -> None:
         """Reject a budget that cannot hold anything."""
-        if self.capacity_factor <= 0:
-            raise ValueError("ep_host_swap.capacity_factor must be positive")
+        if self.enabled and self.budget_layers <= 0:
+            raise ValueError("ep_host_swap.budget_layers must be positive when ep_host_swap.enabled")
 
 
 @dataclass

@@ -220,10 +220,11 @@ ep_instrument:
 # MoE host swap: bound the MoE activations of a pass, the excess goes to pinned host memory.
 ep_host_swap:
   enabled: true
-  # One budget for the MoE activations of a forward pass: capacity_factor times
-  # the mean load, earliest layers swapped to host first. 1.0 to 0.3 is the
-  # useful range on 16 A3 dies; 0.9 was measured at 6 and 8 text layers.
-  capacity_factor: 0.9
+  # Mean layers of MoE activations a rank may keep over the pass (a mean layer:
+  # one layer at the rank's own sent pairs); the rest goes to host, earliest
+  # layers first. 5.4 of 6 layers is 0.9 per layer; 1.0 to 0.3 per layer was
+  # the useful range on 16 A3 dies.
+  budget_layers: 5.4
   # Index tensors (8 bytes per pair) stay on device.
   min_row_bytes: 1024
   output_dir: /home/pl/runs/qwen3_vl_30b_perf/ep_host_swap_cauldron/ep_host_swap

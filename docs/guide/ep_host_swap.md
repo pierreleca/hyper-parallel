@@ -3,8 +3,9 @@
 Under expert parallelism the router decides, every step, how many tokens each rank
 receives, and so how much activation memory each rank's MoE layers keep for
 backward. `ep_host_swap` bounds that memory by a number the routing cannot change:
-each rank keeps at most `capacity_factor` times its mean load, summed over the MoE
-layers of a forward pass, and swaps the rest to pinned host memory. No token is
+each rank ends every forward pass holding at most `budget_layers` **mean layers** of
+these activations, and swaps the rest to pinned host memory. A mean layer is what
+one MoE layer keeps when a rank receives exactly the tokens it sends. No token is
 dropped and the gradients are unchanged.
 
 On 16 Ascend A3 dies (Qwen3-VL-30B-A3B, FSDP 16, EP 16) it cut the worst rank's
@@ -26,21 +27,27 @@ worst routing ever seen.
 
 ![The swap through one step](../images/ep_host_swap_mechanism.png)
 
-- **Budget.** Each rank's budget is `capacity_factor` times its mean load (its own
-  tokens times top-k, known before routing) summed over the MoE layers of the pass.
-  It needs no collective and no routing can move it.
-- **Trigger.** After each MoE layer the rank checks whether what it holds, plus the
-  remaining layers at the mean, would end the pass over the budget. That makes the
-  eviction threshold a diagonal (red): budget − remaining layers × mean load, rising by
-  one mean load per layer and meeting the budget at the last layer. The factor shifts
-  the diagonal down; when the rank is above it (circles), it evicts down to it.
+- **Budget.** `budget_layers` mean layers per rank. A rank's mean layer follows from
+  its own tokens times top-k, known before routing, so the budget needs no collective
+  and no routing can move it.
+- **Trigger.** After each MoE layer the rank compares what it holds with a threshold
+  (red) and, when over it (circles), evicts down to it. The threshold is the larger
+  of two lines that both end at the budget after the last layer:
+  - the budget spread evenly over the layers, `budget × i / L`: when the budget is
+    under one mean layer per layer (right), a rank has a deficit to move whatever
+    the routing, and moves it evenly across the pass;
+  - what the rank may hold now if the remaining layers come at the mean,
+    `budget − (L − i) × mean layer`: when the budget is over one mean layer per layer
+    (left), a rank moves bytes only when it is on course to end over budget, so a
+    rank that is heavy early and light later moves nothing.
 - **What moves.** Whole tensors the experts saved for backward, earliest layers
   first: their backward comes last, so their copies have the most time on both ends.
   Copies run on a side stream during the next attention and are never waited for.
 - **Coming back.** A swapped layer is copied back while the layer above it runs
   backward, so the reload lands after backward has freed most activations.
-- **Below 1.** With `capacity_factor` under 1 every rank evicts every step (right
-  panel): the budget becomes a memory setting rather than a safety net.
+- **Under one mean layer per layer**, every rank evicts every step (right panel):
+  the budget becomes a memory setting rather than a safety net. Over it, the budget
+  is headroom for routing imbalance (left panel).
 
 The figure replays the eviction rule on one rank's measured step; the x axis counts
 MoE layers, not time.
@@ -50,32 +57,37 @@ MoE layers, not time.
 ```yaml
 ep_host_swap:
   enabled: true
-  capacity_factor: 0.9    # > 0; 1.0 to 0.3 is the useful range
+  budget_layers: 5.4      # mean layers a rank may keep; here 0.9 per MoE layer of 6
   min_row_bytes: 1024     # saved tensors with fewer bytes per pair (indices) stay on device
   output_dir: ./outputs/ep_host_swap   # one JSON Lines file per rank: evictions, bytes, copy times
 ```
 
-Fields can be overridden on the command line (`--ep_host_swap.capacity_factor=0.5`).
+Fields can be overridden on the command line (`--ep_host_swap.budget_layers=3`).
+On 16 A3 dies, 1 to 0.3 mean layers per MoE layer was the useful range.
 The swap applies to the trainer's EP path
 (`hyper_parallel/distributed/expert_parallel/experts.py`). On Ascend, set
 `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True`, or fragmentation can undo the bound.
 
 ## Results
 
-![Factor sweep](../images/ep_host_swap_sweep.png)
+![Budget sweep](../images/ep_host_swap_sweep.png)
+
+These runs used an earlier trigger that evicted as soon as a projection of the
+remaining layers at the mean crossed the budget, which front-loads the evictions
+under one mean layer per layer; the budgets reached are the same.
 
 | 16 A3 dies | Worst reserved, GiB | Median step time | Copy back waited |
 | --- | --- | --- | --- |
 | 6 layers, no swap | 54.49 | 3.709 s | – |
-| 6 layers, factor 0.9 | 52.94 (−1.55) | −0.7% | 0 ms |
+| 6 layers, 5.4 mean layers | 52.94 (−1.55) | −0.7% | 0 ms |
 | 8 layers, no swap | 59.44 | 4.186 s | – |
-| 8 layers, factor 0.9 | 57.74 (−1.70) | +2.1% | 0 ms |
-| 8 layers, factor 0.3 | 54.06 (−5.38) | +3.2% | 0 ms |
+| 8 layers, 7.2 mean layers | 57.74 (−1.70) | +2.1% | 0 ms |
+| 8 layers, 2.4 mean layers | 54.06 (−5.38) | +3.2% | 0 ms |
 
-- **Memory falls almost one-for-one with the bytes moved** down to factor 0.3; below,
-  the compute stream starts waiting for copies and each step of the factor buys half
+- **Memory falls almost one-for-one with the bytes moved** down to 2.4 mean layers of
+  8; below, the compute stream starts waiting for copies and each step down buys half
   as much.
-- **The cost is having evictions, not their volume**: from 0.8 to 0.2 the bytes
+- **The cost is having evictions, not their volume**: from 6.4 to 1.6 mean layers the bytes
   triple while the median step time stays at 3 to 4%. Profiles show compute
   unchanged and transfer flat; the cost is arrival skew at the all-to-all (a rank
   that evicts more arrives later), mostly absorbed by time the ranks already spent
@@ -87,11 +99,18 @@ Per-rank tables, profiles and the host-link benchmark:
 
 ## Limitations
 
-- **Only what a layer keeps is bounded**, not its transient while it computes
-  (4.8 to 8.2 GiB per layer at 8 layers), nor the allocator's fragmentation (6 to 8 GiB
-  reserved but not allocated per rank here).
-- **The factor multiplies the routed part** (8.7 KB per pair), not the ~1.6 GiB per
-  layer every rank holds regardless.
+- **What the budget guarantees.** Whatever the routing, a rank ends each forward
+  pass holding at most `budget_layers` mean layers of the activations the MoE layers
+  keep for backward, plus evictions whose copy has not finished. This covers only the
+  routed part (8.7 KB per pair); the ~1.6 GiB per layer every rank holds regardless,
+  and the allocator's fragmentation (6 to 8 GiB reserved but not allocated per rank
+  here), are outside it.
+- **What it does not guarantee.** A MoE layer's working memory while it computes
+  follows what the rank received in that layer (4.8 to 8.2 GiB per layer at 8 layers
+  here). The EP path drops no tokens and has no capacity limit, so nothing bounds a
+  single layer's receive: if every token chose experts on one rank, that rank would
+  receive up to EP times the mean. Keeping it bounded rests on the router's load
+  balancing, that is, on probability.
 - **Evictions in flight** count until their copy finishes. The caching allocator
   should stall rather than fail when copies are late; this holds for the CUDA
   allocator and is still to be confirmed for torch_npu's.

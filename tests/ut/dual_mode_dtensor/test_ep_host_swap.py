@@ -14,9 +14,12 @@
 # ============================================================================
 """MoE activation budget for a forward pass, earliest layers swapped to host (CPU path)."""
 
+import importlib.util
 import json
 import pathlib
+import random
 import socket
+import sys
 from typing import Any, Iterator
 
 import pytest
@@ -34,12 +37,12 @@ HIDDEN, INTER = 16, 8
 
 @pytest.fixture(name="swap")
 def fixture_swap(tmp_path: pathlib.Path) -> Iterator[EPHostSwap]:
-    """Enable the swap below the mean load, with a small row threshold; disable it after the test."""
-    HOST_SWAP.configure(enabled=True, capacity_factor=0.9, min_row_bytes=16, output_dir=str(tmp_path))
+    """Enable the swap at 2.7 mean layers (below 3 layers at the mean), small row threshold; disable it after."""
+    HOST_SWAP.configure(enabled=True, budget_layers=2.7, min_row_bytes=16, output_dir=str(tmp_path))
     HOST_SWAP.begin_step(1)
     yield HOST_SWAP
     HOST_SWAP.close()
-    HOST_SWAP.configure(enabled=False, capacity_factor=1.0, min_row_bytes=1024, output_dir="")
+    HOST_SWAP.configure(enabled=False, budget_layers=0.0, min_row_bytes=1024, output_dir="")
     HOST_SWAP.begin_step(0)
 
 
@@ -95,7 +98,7 @@ def test_pinned_pool_hands_out_the_best_fit_among_mixed_sizes():
 
 def test_swapped_layers_give_the_same_gradients(swap):
     """Layers over the budget move tensors to host and back; the gradients do not change."""
-    rows = [12, 6, 15]  # 33 rows against a budget of 0.9 x 24
+    rows = [12, 6, 15]  # 33 rows against a budget of 2.7 x 8
     expected, _ = _run(rows, sent=8, swap_on=False)
     swap.begin_step(1)
     got, layers = _run(rows, sent=8, swap_on=True)
@@ -108,7 +111,8 @@ def test_swapped_layers_give_the_same_gradients(swap):
 
 def test_record_counts_the_moved_bytes(swap, tmp_path):
     """The step record lists every swapped layer and the bytes both ways."""
-    _run([12, 6], sent=8, swap_on=True)
+    swap.configure(enabled=True, budget_layers=1.0, min_row_bytes=16, output_dir=str(tmp_path))
+    _run([12, 6], sent=8, swap_on=True)  # layer 0 alone is over one mean layer
     record = swap.end_step(rank=0)
     assert record["moe_layers"] == 2 and record["swapped_layers"] == 1
     assert record["d2h_gib"] == record["h2d_gib"] > 0
@@ -185,10 +189,10 @@ def _ep_grads(world_one_group, swap_on: bool) -> list[torch.Tensor]:
 
 def test_ep_blocks_swap_and_keep_their_gradients(world_one_group, swap):
     """Through ep_routed_forward, a budget below the load swaps and changes nothing."""
-    swap.configure(enabled=False, capacity_factor=1.0, min_row_bytes=16, output_dir="")
+    swap.configure(enabled=False, budget_layers=0.0, min_row_bytes=16, output_dir="")
     expected = _ep_grads(world_one_group, swap_on=False)
-    # One rank receives what it sends; a budget of half of that puts the pass over it.
-    swap.configure(enabled=True, capacity_factor=0.5, min_row_bytes=16, output_dir="")
+    # One rank receives what it sends; one mean layer for two layers puts the pass over it.
+    swap.configure(enabled=True, budget_layers=1.0, min_row_bytes=16, output_dir="")
     swap.begin_step(1)
     got = _ep_grads(world_one_group, swap_on=True)
     for want, have in zip(expected, got):
@@ -198,8 +202,8 @@ def test_ep_blocks_swap_and_keep_their_gradients(world_one_group, swap):
     assert all(layer["swapped_bytes"] > 0 for layer in record["layers"])
 
 
-def test_factor_below_one_swaps_balanced_layers_and_keeps_gradients(swap):
-    """A factor under 1 swaps even when every layer is at the mean, earliest layers first."""
+def test_a_budget_under_the_layers_swaps_balanced_layers_and_keeps_gradients(swap):
+    """Under one mean layer per layer, the pass swaps even when every layer is at the mean."""
     rows = [8, 8, 8]  # every layer exactly at the mean load
     expected, _ = _run(rows, sent=8, swap_on=False)
     swap.begin_step(1)
@@ -210,31 +214,43 @@ def test_factor_below_one_swaps_balanced_layers_and_keeps_gradients(swap):
     record = swap.end_step(rank=0)
     assert record["evictions"]
     for decision in record["evictions"]:
-        assert decision["projected_gib"] - decision["evicted_gib"] <= decision["budget_gib"] + 1e-12
+        assert decision["held_gib"] - decision["evicted_gib"] <= decision["threshold_gib"] + 1e-12
 
 
-def test_budget_learns_the_pass_length_and_acts_early(swap):
-    """Once a pass's length is known, the projection swaps after the very first layer."""
+def test_a_budget_under_the_layers_spreads_the_evictions(swap):
+    """Once the pass length is known, the deficit starts leaving after the first layer, not at the end."""
     _run([8, 8, 8], sent=8, swap_on=True)
     first = swap.end_step(rank=0)["evictions"]
+    assert [decision["after_layer"] for decision in first] == [2], "the first pass budgets the layers it has seen"
     swap.begin_step(2)
     _run([8, 8, 8], sent=8, swap_on=True)
     second = swap.end_step(rank=0)["evictions"]
-    assert second[0]["expected_layers"] == 3 and second[0]["after_layer"] == 0
-    assert second[0]["need_gib"] > first[0]["need_gib"], "the remaining layers count from the start"
+    assert second[0]["after_layer"] == 0 and second[0]["expected_layers"] == 3
+    # 2.7 of 3 mean layers: after the first layer the threshold is 0.9 of it, the budget spread evenly.
+    assert second[0]["threshold_gib"] == pytest.approx(0.9 * second[0]["budget_gib"] / 2.7)
+
+
+def test_a_budget_over_the_layers_lets_an_early_peak_through(swap):
+    """Over one mean layer per layer, a rank heavy early but light later moves nothing."""
+    swap.configure(enabled=True, budget_layers=3.3, min_row_bytes=16, output_dir="")
+    for step in (1, 2):  # the second pass knows it has three layers
+        swap.begin_step(step)
+        # 10 rows first is over 3.3 / 3 of the budget, but not over what it leaves for two mean layers.
+        _grads, layers = _run([10, 6, 7], sent=8, swap_on=True)  # 23 rows against 3.3 x 8 = 26.4
+    assert not layers, "ahead of the mean after the first layer, yet within the budget at the end"
 
 
 def test_budget_above_the_spread_swaps_nothing(swap):
     """A budget over every rank's total leaves the pass on device."""
-    swap.configure(enabled=True, capacity_factor=1.5, min_row_bytes=16, output_dir="")
+    swap.configure(enabled=True, budget_layers=4.5, min_row_bytes=16, output_dir="")
     swap.begin_step(1)
-    _grads, layers = _run([12, 6, 9], sent=8, swap_on=True)  # total 27 rows against 1.5 x 24
+    _grads, layers = _run([12, 6, 9], sent=8, swap_on=True)  # total 27 rows against 4.5 x 8
     assert not layers
 
 
 def test_a_layer_comes_back_only_from_the_layer_above(swap, monkeypatch):
     """Swapped early layers come back one layer ahead of their backward, not at its start."""
-    swap.configure(enabled=True, capacity_factor=0.5, min_row_bytes=16, output_dir="")
+    swap.configure(enabled=True, budget_layers=2.0, min_row_bytes=16, output_dir="")
     swap.begin_step(1)
     trace = []
     unpack, load = swap._unpack, swap._load  # pylint: disable=protected-access
@@ -247,7 +263,22 @@ def test_a_layer_comes_back_only_from_the_layer_above(swap, monkeypatch):
         assert trace.index(("load", layer.index)) > first_unpack_above, f"layer {layer.index} loaded early"
 
 
-def test_capacity_factor_must_be_positive():
+def test_budget_layers_must_be_positive_when_enabled():
     """A budget of zero or less could hold nothing."""
     with pytest.raises(ValueError, match="positive"):
-        EPHostSwap().configure(enabled=False, capacity_factor=0.0, min_row_bytes=16, output_dir="")
+        EPHostSwap().configure(enabled=True, budget_layers=0.0, min_row_bytes=16, output_dir="")
+
+
+def test_the_replay_script_picks_tensors_as_the_swap_does(monkeypatch):
+    """replay_ep_host_swap.py carries its own copy of choose_offload; it must agree with the swap's."""
+    examples = pathlib.Path(__file__).resolve().parents[3] / "examples" / "qwen3_vl_30b_perf"
+    monkeypatch.syspath_prepend(str(examples))
+    spec = importlib.util.spec_from_file_location("replay_ep_host_swap", examples / "replay_ep_host_swap.py")
+    replay = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "replay_ep_host_swap", replay)  # its dataclasses look the module up
+    spec.loader.exec_module(replay)
+    generator = random.Random(0)
+    for _ in range(200):
+        sizes = [generator.randint(1, 5000) for _ in range(generator.randint(1, 6))]
+        need = generator.randint(-10, sum(sizes) + 10)
+        assert replay.choose_offload(sizes, need) == choose_offload(sizes, need), (sizes, need)

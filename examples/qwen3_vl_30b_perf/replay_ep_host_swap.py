@@ -22,10 +22,10 @@ exactly as ``host_swap.py`` picks them. With m the rank's mean bytes per layer (
 sent pairs), L layers and f the factor, the budget is B = f·L·m and the threshold
 after layer i (1-based) is:
 
-- ``projection``: B − (L − i)·m, what the swap does today;
+- ``projection``: B − (L − i)·m, the rule of the first measurements;
 - ``angled``: f·i·m, the budget spread evenly over the layers;
 - ``combined``: the larger of the two, which is ``angled`` for f ≤ 1 and
-  ``projection`` for f ≥ 1.
+  ``projection`` for f ≥ 1: what the swap does today (``budget_layers`` = f·L).
 
 ``--no-last`` skips the decision after the last layer, so nothing is still being
 copied when forward ends. Per rule and factor the report gives, over every
@@ -35,21 +35,42 @@ highest end-of-forward total against the budget, and the share of rank-steps tha
 evicted although their whole pass fit the budget (bytes moved for nothing)::
 
     python examples/qwen3_vl_30b_perf/replay_ep_host_swap.py $R/a3_16dev_8l_noswap/instrument
+
+Standard library only, like ``analyze_ep_instrument.py`` next to it.
 """
 
 from __future__ import annotations
 
 import argparse
+import itertools
 import statistics
 from dataclasses import dataclass, field
 
 from analyze_ep_instrument import call_loads, load_records
-from hyper_parallel.distributed.expert_parallel.host_swap import choose_offload
 
 GIB = 1024 ** 3
 # Bytes each saved tensor keeps per received pair, Qwen3-VL-30B-A3B (hidden 2048, expert intermediate 768, bf16).
 TENSOR_BYTES = (4096, 3072, 1536)
-RULES = ("projection", "angled", "combined")
+RULES = ("combined", "projection", "angled")
+
+
+def choose_offload(sizes: list[int], need: int) -> list[int]:
+    """The smallest-total subset of ``sizes`` holding at least ``need``: ``host_swap.choose_offload``.
+
+    Copied so that this script, like the report, runs with the standard library
+    only; a unit test checks that the two agree.
+    """
+    if need <= 0 or not sizes:
+        return []
+    if sum(sizes) <= need:
+        return list(range(len(sizes)))
+    best, best_total = None, 0
+    for count in range(1, len(sizes) + 1):
+        for subset in itertools.combinations(range(len(sizes)), count):
+            total = sum(sizes[index] for index in subset)
+            if total >= need and (best is None or total < best_total):
+                best, best_total = subset, total
+    return list(best or ())
 
 
 def threshold(rule: str, factor: float, layer: int, layers: int, mean: float) -> float:
@@ -68,6 +89,7 @@ class Pass:
     """One rank's forward pass under one rule: what it held, moved and decided."""
 
     decisions: list[tuple[int, float]] = field(default_factory=list)  # (layer, bytes evicted), 0-based
+    swapped: dict[int, float] = field(default_factory=dict)  # bytes on host per layer, 0-based
     held_end: float = 0.0
 
     @property
@@ -76,11 +98,14 @@ class Pass:
         return sum(amount for _layer, amount in self.decisions)
 
 
-def replay_pass(received: list[int], sent: list[int], rule: str, factor: float, no_last: bool) -> Pass:
-    """Apply one rule to one rank's pass, earliest tensors first, as the swap picks them."""
+def replay_pass(received: list[float], sent: list[float], rule: str, factor: float, no_last: bool = False) -> Pass:
+    """Apply one rule to one rank's pass, earliest tensors first, as the swap picks them.
+
+    ``received`` and ``sent`` are pairs per layer; fractional pairs are fine.
+    """
     layers = len(received)
     mean = sum(TENSOR_BYTES) * statistics.fmean(sent)
-    on_device = [[size * pairs for size in TENSOR_BYTES] for pairs in received]
+    on_device = [[int(size * pairs) for size in TENSOR_BYTES] for pairs in received]
     result = Pass()
     for layer in range(layers):
         if no_last and layer == layers - 1:
@@ -90,10 +115,11 @@ def replay_pass(received: list[int], sent: list[int], rule: str, factor: float, 
         if need <= 0:
             continue
         evicted = 0.0
-        for sizes in on_device[:layer + 1]:
+        for item, sizes in enumerate(on_device[:layer + 1]):
             candidates = [index for index, size in enumerate(sizes) if size > 0]
             for choice in choose_offload([sizes[index] for index in candidates], int(need - evicted) + 1):
                 evicted += sizes[candidates[choice]]
+                result.swapped[item] = result.swapped.get(item, 0.0) + sizes[candidates[choice]]
                 sizes[candidates[choice]] = 0
             if evicted >= need:
                 break

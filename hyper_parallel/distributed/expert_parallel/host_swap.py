@@ -21,19 +21,28 @@ The number of pairs follows the routing, so what a rank holds at the end of
 forward changes from step to step and from rank to rank, and a bad step can
 run out of memory.
 
-Each rank gets one budget for the saved activations of all its MoE layers of a
-forward pass: ``capacity_factor`` times its mean load (the pairs it sends)
-summed over the layers, in bytes of the saved tensors. The pairs a rank sends
-are its own tokens times top-k, known before the routing runs, so no routing
-can move the budget. After each block the rank projects its end-of-forward
-total, what it holds plus the remaining layers at the mean, and when the
-projection is over the budget it copies whole saved tensors of its earliest
-layers, whose backward comes last, to pinned host memory on a side stream,
-until it is not. Acting on the projection rather than on the budget itself
-moves the copies, and the memory they hold while in flight, away from the
-step's peak at the end of forward. The factor may be below 1: the budget is
-then a memory setting every rank enforces every step, not only a guard against
-bad routing.
+Each rank may keep at most ``budget_layers`` mean layers of these tensors,
+where a mean layer is what one MoE layer saves when the rank receives exactly
+the pairs it sends (its own tokens times top-k). The pairs a rank sends are
+known before the routing runs, so no routing can move the budget: whatever the
+routing does, what the MoE layers keep for backward ends the forward pass within
+``budget_layers`` mean layers.
+
+After each MoE layer the rank compares what it holds with a threshold that
+grows with the layers seen so far, and copies whole saved tensors of its
+earliest layers, whose backward comes last, to pinned host memory on a side
+stream until it is back under. With B the budget, L the layers of a pass, i
+the layers done and m a mean layer, the threshold is the larger of
+
+- ``B * i / L``: the budget spread evenly over the layers, and
+- ``B - (L - i) * m``: what may be held now if every remaining layer comes at
+  the mean.
+
+Below one mean layer per layer (B < L m) the first term is the larger: the rank
+has a deficit to move whatever the routing does, and moves it evenly across the
+pass. Above, the second is: the rank moves bytes only when it is on course to
+end the pass over the budget, so a rank that is heavy early and light later
+moves nothing. Both end at B after the last layer.
 
 The copy to host is never waited for; the allocator keeps each evicted block
 until the copy stream is done with it. In backward, a swapped layer comes back
@@ -182,12 +191,12 @@ class _Layer:
 
 
 class EPHostSwap:
-    """One budget for a forward pass's MoE activations, its earliest layers swapped to host."""
+    """A budget in mean layers for a forward pass's MoE activations, its earliest layers swapped to host."""
 
     def __init__(self) -> None:
         """Start disabled; ``configure`` turns it on."""
         self.enabled = False
-        self.capacity_factor = 1.0
+        self.budget_layers = 0.0
         self.min_row_bytes = 1024
         self.output_dir = ""
         self._device = None
@@ -209,13 +218,13 @@ class EPHostSwap:
 
     # -- configuration and steps ---------------------------------------------
 
-    def configure(self, *, enabled: bool, capacity_factor: float, min_row_bytes: int, output_dir: str) -> None:
-        """Set the budget factor, which saved tensors may move and where the per-rank records go."""
-        if capacity_factor <= 0:
-            raise ValueError("ep_host_swap.capacity_factor must be positive")
+    def configure(self, *, enabled: bool, budget_layers: float, min_row_bytes: int, output_dir: str) -> None:
+        """Set the budget in mean layers, which saved tensors may move and where the per-rank records go."""
+        if enabled and budget_layers <= 0:
+            raise ValueError("ep_host_swap.budget_layers must be positive")
         self.enabled = enabled
         self._expected_layers = 0
-        self.capacity_factor = capacity_factor
+        self.budget_layers = budget_layers
         self.min_row_bytes = min_row_bytes
         self.output_dir = output_dir
         if not enabled:
@@ -329,24 +338,23 @@ class EPHostSwap:
         return saved
 
     def _enforce_budget(self, layer: _Layer) -> None:
-        """Swap the earliest layers' tensors while the projected total is over the budget.
+        """Swap the earliest layers' tensors while what the pass holds is over its threshold.
 
-        The budget is ``capacity_factor`` times the pass's mean bytes per layer
-        (sent pairs times the bytes a received pair saves) times its expected
-        number of layers; the projection is what the pass holds on device plus
-        the remaining layers at the mean.
+        A mean layer is the pass's mean sent pairs times the bytes a received
+        pair saves; the pass's number of layers is the longest seen so far, so
+        the first pass budgets only the layers it has reached.
         """
         layer.keys = {}
         if layer.saved:
             self._pair_bytes = sum(saved.row_bytes for saved in layer.saved)
         current = self._layers[self._pass_start:]
         self._expected_layers = max(self._expected_layers, len(current))
-        remaining = self._expected_layers - len(current)
+        done, layers = len(current), self._expected_layers
         mean = self._pair_bytes * sum(item.sent for item in current) / len(current)
-        budget = self.capacity_factor * mean * self._expected_layers
+        budget = self.budget_layers * mean
+        threshold = max(budget * done / layers, budget - (layers - done) * mean)
         held = sum(saved.nbytes for item in current for saved in item.saved if saved.device is not None)
-        projected = held + remaining * mean
-        need = projected - budget
+        need = held - threshold
         if need <= 0:
             return
         evicted = 0
@@ -365,7 +373,8 @@ class EPHostSwap:
             "after_layer": layer.index,
             "expected_layers": self._expected_layers,
             "budget_gib": budget / GIB,
-            "projected_gib": projected / GIB,
+            "threshold_gib": threshold / GIB,
+            "held_gib": held / GIB,
             "need_gib": need / GIB,
             "evicted_gib": evicted / GIB,
         })
@@ -530,7 +539,7 @@ class EPHostSwap:
             path = os.path.join(self.output_dir, f"host_swap_rank{rank}.jsonl")
             self._file = open(path, "w", encoding="utf-8")  # pylint: disable=consider-using-with
             header = {"header": True, "host": socket.gethostname(), "rank": rank,
-                      "capacity_factor": self.capacity_factor, "min_row_bytes": self.min_row_bytes}
+                      "budget_layers": self.budget_layers, "min_row_bytes": self.min_row_bytes}
             self._file.write(json.dumps(header) + "\n")
         self._file.write(json.dumps(record) + "\n")
         self._file.flush()

@@ -33,7 +33,7 @@ class EPHostSwapCallback(Callback):
         self.config = trainer.config.ep_host_swap
         HOST_SWAP.configure(
             enabled=self.config.enabled,
-            capacity_factor=self.config.capacity_factor,
+            budget_layers=self.config.budget_layers,
             min_row_bytes=self.config.min_row_bytes,
             output_dir=self.config.output_dir,
         )
@@ -43,8 +43,8 @@ class EPHostSwapCallback(Callback):
         del state, kwargs
         if self.config.enabled:
             logger.info(
-                "EP host swap: MoE activations of a pass budgeted at %.2f x sent pairs, records in %s",
-                self.config.capacity_factor,
+                "EP host swap: MoE activations of a pass kept within %.2f mean layers, records in %s",
+                self.config.budget_layers,
                 self.config.output_dir,
             )
 
