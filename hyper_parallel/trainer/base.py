@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from abc import ABC
 from collections import defaultdict
 from contextlib import nullcontext
@@ -728,6 +729,9 @@ class BaseTrainer(Stateful, ABC):
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
+        if config.debug.check_nan_inf:
+            self._report_non_finite(total_loss)
+
         # Gradient clipping (reads FSDP/EP groups from current ParallelState)
         grad_norm = clip_grad_norm_(
             self.model,
@@ -743,6 +747,27 @@ class BaseTrainer(Stateful, ABC):
             "loss": total_loss,
             "grad_norm": grad_norm_value,
         }
+
+    def _report_non_finite(self, loss: float) -> None:
+        """Log, on this rank, a non-finite loss and the parameters whose local gradient is not finite.
+
+        One non-finite gradient makes the clipped norm non-finite and every weight with it,
+        so the first step that logs here names where it started. One device sync per step.
+        """
+        names, flags = [], []
+        for name, param in self.model.named_parameters():
+            grad = param.grad
+            if grad is None:
+                continue
+            local = grad.to_local() if hasattr(grad, "to_local") else grad
+            names.append(name)
+            flags.append(torch.isfinite(local).all())
+        bad = [name for name, ok in zip(names, torch.stack(flags).tolist() if flags else []) if not ok]
+        if bad or not math.isfinite(loss):
+            logger.warning(
+                "non-finite at step %d rank %d: loss %s, %d of %d gradients: %s",
+                self.state.global_step, self.global_rank, loss, len(bad), len(names), ", ".join(bad[:8]),
+            )
 
     def destroy_distributed(self) -> None:
         """Synchronize all ranks and tear down the distributed process group."""

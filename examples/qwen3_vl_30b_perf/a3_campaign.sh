@@ -42,6 +42,9 @@
 # and the reports it points to. Environment knobs (defaults in brackets):
 #   OUT_BASE [/home/pl/a3_runs]   RUNS_DIR [/home/pl/runs/qwen3_vl_30b_perf]
 #   INTERVAL [30]   RUN_TIMEOUT [7200]   CLUSTER [cluster], e.g. "cluster -c other.env"
+#   NODE_LOGS [scripts/cluster/logs]: where each node keeps the kit's run logs (LOG_DIR),
+#   relative to the repository there; the summary quotes their first error and, with
+#   debug.check_nan_inf, the first non-finite gradient.
 set -euo pipefail
 
 [[ $# -eq 1 ]] || { echo "usage: $0 <plan.sh>" >&2; exit 2; }
@@ -57,6 +60,13 @@ OUT_BASE="${OUT_BASE:-/home/pl/a3_runs}"
 RUNS_DIR="${RUNS_DIR:-/home/pl/runs/qwen3_vl_30b_perf}"
 INTERVAL="${INTERVAL:-30}"
 RUN_TIMEOUT="${RUN_TIMEOUT:-7200}"
+NODE_LOGS="${NODE_LOGS:-scripts/cluster/logs}"
+
+# The first line of every node's log of a run that matches a pattern, cut short.
+first_log_line() {  # first_log_line <run> <extended regex> <exclude regex>
+  "${CL[@]}" exec -E "grep -h -E '$2' $NODE_LOGS/$1.node*.log 2>/dev/null | grep -v -E '$3' | head -1" 2>/dev/null \
+    | grep -E "$2" | head -1 | cut -c1-200
+}
 
 CAMPAIGN="$(basename "$PLAN" .sh)_$(date +%Y%m%d_%H%M%S)"
 OUT="$OUT_BASE/$CAMPAIGN"
@@ -86,9 +96,15 @@ for entry in "${RUNS[@]}"; do
   if ! "${CL[@]}" status -w -i "$INTERVAL" -t "$RUN_TIMEOUT" "$run"; then
     "${CL[@]}" status "$run" > "$local_dir/status.txt" 2>&1 || true
     "${CL[@]}" kill "$run" > /dev/null 2>&1 || true
-    states+=("$name: FAILED (cluster logs $run; last lines in $local_dir/status.txt)"); continue
+    error="$(first_log_line "$run" '[A-Za-z]+(Error|Exception): ' 'ERR99999' || true)"
+    states+=("$name: FAILED: ${error:-no error line found (cluster logs $run)}")
+    nonfinite="$(first_log_line "$run" 'non-finite at step' '^$' || true)"
+    [[ -n "$nonfinite" ]] && states+=("    first non-finite${nonfinite#*non-finite}")
+    continue
   fi
   states+=("$name: finished")
+  nonfinite="$(first_log_line "$run" 'non-finite at step' '^$' || true)"
+  [[ -n "$nonfinite" ]] && states+=("    first non-finite${nonfinite#*non-finite}")
 
   # Records of every node into one directory per kind.
   "${CL[@]}" gather "$remote/instrument" "$remote/ep_host_swap" "$OUT/raw/$name" > /dev/null 2>&1 || true
