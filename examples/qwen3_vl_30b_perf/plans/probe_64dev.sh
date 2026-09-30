@@ -5,7 +5,7 @@
 # peak memory in its report; the sweep then uses the largest shape that fits.
 # The 8192-token runs read a dataset built once per node (A3_RUNS.md).
 CONFIG=examples/qwen3_vl_30b_perf/train_64dev_a3_ep_host_swap.yaml
-SHORT="--training.train_iters=8"
+SHORT="--training.train_iters=8 --ep_instrument.start_step=1"
 S8K="--dataset.data_path=/home/pl/data/qwen3_vl_30b_perf/cauldron_seq8192_n1280/vlm_conversations.json \
 --dataset.data_transform.max_seq_len=8192"
 RUNS=(
