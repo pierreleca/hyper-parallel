@@ -30,6 +30,7 @@ __all__ = [
     "DataLoaderConfig",
     "DatasetConfig",
     "DebugConfig",
+    "EPHostSwapConfig",
     "FSDP2Config",
     "MixedPrecisionConfig",
     "OptimizerConfig",
@@ -67,6 +68,7 @@ from hyper_parallel.trainer.config.target import Target
 from hyper_parallel.trainer.config.trainer import TrainerConfig, save_configs
 from hyper_parallel.trainer.config.training import (
     DebugConfig,
+    EPHostSwapConfig,
     ProfilingConfig,
     TrainingConfig,
     WandbConfig,

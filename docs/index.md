@@ -17,6 +17,7 @@
 | [PP 流水线并行](./guide/pipeline_parallel.md) | PipelineStage、Schedule、overlap_b_f、PP+FSDP、P2P prefetch、 Mpipe |
 | [CP 上下文并行](./guide/context_parallel.md) | ContextParallel、AsyncContextParallel、DSA 系列 |
 | [EP 专家并行](./guide/expert_parallel.md) | ExpertParallel、MoE 构建模块、负载均衡 |
+| [MoE host swap](./guide/ep_host_swap.md) | ep_host_swap：按 rank 预算限制 MoE 激活显存，超出部分换出到 host（英文） |
 | [Activation Checkpoint / Swap](./guide/activation_checkpoint.md) | checkpoint_wrapper、swap_wrapper、swap_tensor_wrapper、协同配置 |
 | [Optimizer](./guide/optimizer.md) | AdamW、Muon、ChainedOptimizer、学习率调度器 |
 | [Chunk Loss](./guide/chunk_loss.md) | 大词表输出投影与交叉熵分块、Trainer 和 Qwen3-MoE 接入 |

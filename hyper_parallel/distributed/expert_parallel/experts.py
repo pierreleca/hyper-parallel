@@ -48,6 +48,7 @@ from hyper_parallel.distributed._builder.forward_rewriter import (
 from hyper_parallel.distributed.expert_parallel.collectives import (
     ep_all_to_all,
 )
+from hyper_parallel.distributed.expert_parallel.host_swap import HOST_SWAP
 
 
 @dataclass(frozen=True)
@@ -275,7 +276,9 @@ def _run_ep_local_experts(
     received_indices = ep_all_to_all(
         dispatched_indices, send_counts, receive_counts, ep_group
     ).squeeze(-1)
-    local_outputs = module.experts(received_states, received_indices - expert_offset)
+    # Under ep_host_swap, the tensors the experts save beyond the pass's budget go to host.
+    with HOST_SWAP.layer(sum(receive_counts), sum(send_counts)):
+        local_outputs = module.experts(received_states, received_indices - expert_offset)
     return ep_all_to_all(local_outputs.contiguous(), receive_counts, send_counts, ep_group)
 
 

@@ -87,6 +87,7 @@ from hyper_parallel.trainer.runtime.device import (  # pylint: disable=syntax-er
 
 from hyper_parallel.trainer.callbacks import (
     EnvironMeterCallback,
+    EPHostSwapCallback,
     EvaluateCallback,
     GarbageCollectionCallback,
     LoggingCallback,
@@ -443,7 +444,9 @@ class BaseTrainer(Stateful, ABC):
         self.evaluate_callback = EvaluateCallback(self)
         self.garbage_collection_callback = GarbageCollectionCallback(self)
         self.profiling_callback = ProfilingCallback(self)
+        self.ep_host_swap_callback = EPHostSwapCallback(self)
         self._callbacks = [
+            self.ep_host_swap_callback,
             self.environ_meter_callback,
             self.logging_callback,
             self.tqdm_callback,

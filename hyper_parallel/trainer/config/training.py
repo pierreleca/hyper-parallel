@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Training-loop, debug, wandb and profiling configuration sections.
+"""Training-loop, debug, wandb, profiling and EP host-swap configuration sections.
 
 Split from ``auto_models/trainer/config.py`` in stage 7 (05 §15.2.5);
 class names, fields and defaults are unchanged.
@@ -65,6 +65,30 @@ class WandbConfig:
     enabled: bool = False
     project: str = ""
     entity: Optional[str] = None
+
+
+@dataclass
+class EPHostSwapConfig:
+    """A budget in mean layers for a forward pass's MoE activations, the earliest layers swapped to host.
+
+    Read by ``EPHostSwapCallback``; the swap itself lives in
+    ``hyper_parallel.distributed.expert_parallel.host_swap``. A mean layer is
+    what one MoE layer saves for backward when a rank receives exactly the
+    routed pairs it sends. Each rank ends every forward pass holding at most
+    ``budget_layers`` mean layers of these activations, whatever the routing;
+    the rest goes to pinned host memory, earliest layers first, and comes back
+    in backward. Fewer mean layers than MoE layers makes every rank swap every
+    step; more leaves room for routing imbalance before anything moves.
+    """
+
+    enabled: bool = False
+    # Mean layers of MoE activations a rank may keep; required when enabled.
+    budget_layers: float = 0.0
+
+    def __post_init__(self) -> None:
+        """Reject a budget that cannot hold anything."""
+        if self.enabled and self.budget_layers <= 0:
+            raise ValueError("ep_host_swap.budget_layers must be positive when ep_host_swap.enabled")
 
 
 @dataclass
