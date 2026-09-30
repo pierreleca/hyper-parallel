@@ -56,8 +56,11 @@ def enable_full_determinism(seed: int) -> None:
     os.environ["NCCL_DETERMINISTIC"] = "1"
     os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
     if IS_NPU_AVAILABLE:
-        # The environment variable required to enable deterministic mode on Ascend NPUs.
-        os.environ["NCCL_DETERMINISTIC"] = "true"
+        # HCCL reads HCCL_DETERMINISTIC, not NCCL_DETERMINISTIC, when it creates
+        # a communicator; the process group creates them at its first
+        # collective, which comes after this call. A value already exported
+        # (such as "strict") is kept.
+        os.environ.setdefault("HCCL_DETERMINISTIC", "true")
         os.environ["CLOSE_MATMUL_K_SHIFT"] = "1"
 
     random.seed(seed)

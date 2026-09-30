@@ -78,6 +78,7 @@ class _BaseHyperAutoModelClass:
         cls,
         pretrained_model_name_or_path: str,
         *model_args: Any,
+        config: Optional[PretrainedConfig] = None,
         distributed_setup: Optional[DistributedSetup] = None,
         backend: Optional[Any] = None,
         peft_config: Optional[Any] = None,
@@ -93,6 +94,7 @@ class _BaseHyperAutoModelClass:
         swap_inputs: bool = False,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
+        allow_uncovered_params: bool = False,
         **kwargs: Any,
     ) -> PreTrainedModel:
         """HF-compatible from_pretrained entry point.
@@ -103,9 +105,20 @@ class _BaseHyperAutoModelClass:
         ③ AutoConfig.from_pretrained → hf_config
         ④ get_is_hf_model → custom/HF path
         ⑤ _build_model → meta + shard + load
+
+        As in Transformers, a ``config`` passed by the caller replaces step ③
+        and is used as given. Checkpoint tensors that it does not declare,
+        such as the layers beyond a reduced ``num_hidden_layers``, are skipped
+        with a warning.
         """
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
+        if allow_uncovered_params:
+            # Planner coverage escape hatch (read by instantiate_infrastructure):
+            # parameters that no sharding spec declares stay plain FSDP
+            # parameters, and the plan-time coverage check warns instead of
+            # failing.
+            distributed_setup.allow_uncovered_params = True
         mesh = distributed_setup.mesh_context
 
         # ② Instantiate infrastructure
@@ -115,9 +128,12 @@ class _BaseHyperAutoModelClass:
         )
 
         # ③ Get HF config
-        hf_config = get_hf_config(
-            pretrained_model_name_or_path, attn_implementation, torch_dtype, **kwargs
-        )
+        if config is None:
+            hf_config = get_hf_config(
+                pretrained_model_name_or_path, attn_implementation, torch_dtype, **kwargs
+            )
+        else:
+            hf_config = config
 
         # ④ Determine model path
         is_hf_model = get_is_hf_model(hf_config, force_hf)
@@ -169,6 +185,7 @@ class _BaseHyperAutoModelClass:
         swap_inputs: bool = False,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
+        allow_uncovered_params: bool = False,
         **kwargs: Any,
     ) -> PreTrainedModel:
         """Build model from PretrainedConfig (no weight loading).
@@ -177,6 +194,12 @@ class _BaseHyperAutoModelClass:
         """
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
+        if allow_uncovered_params:
+            # Planner coverage escape hatch (read by instantiate_infrastructure):
+            # parameters that no sharding spec declares stay plain FSDP
+            # parameters, and the plan-time coverage check warns instead of
+            # failing.
+            distributed_setup.allow_uncovered_params = True
         mesh = distributed_setup.mesh_context
 
         sharding_planner, fsdp2_manager = instantiate_infrastructure(
