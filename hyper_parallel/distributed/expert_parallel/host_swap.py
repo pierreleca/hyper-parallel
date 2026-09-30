@@ -28,21 +28,16 @@ known before the routing runs, so no routing can move the budget: whatever the
 routing does, what the MoE layers keep for backward ends the forward pass within
 ``budget_layers`` mean layers.
 
-After each MoE layer the rank compares what it holds with a threshold that
-grows with the layers seen so far, and copies whole saved tensors of its
-earliest layers, whose backward comes last, to pinned host memory on a side
-stream until it is back under. With B the budget, L the layers of a pass, i
-the layers done and m a mean layer, the threshold is the larger of
-
-- ``B * i / L``: the budget spread evenly over the layers, and
-- ``B - (L - i) * m``: what may be held now if every remaining layer comes at
-  the mean.
-
-Below one mean layer per layer (B < L m) the first term is the larger: the rank
-has a deficit to move whatever the routing does, and moves it evenly across the
-pass. Above, the second is: the rank moves bytes only when it is on course to
-end the pass over the budget, so a rank that is heavy early and light later
-moves nothing. Both end at B after the last layer.
+After each MoE layer the rank projects its end-of-forward total, what it holds
+plus the remaining layers at one mean layer each, and while the projection is
+over the budget it copies whole saved tensors of its earliest layers, whose
+backward comes last, to pinned host memory on a side stream. Acting on the
+projection rather than on the budget itself settles the evictions early in the
+pass, away from the step's peak at the end of forward, and keeps room for the
+remaining layers so that little is left to evict after the last one. Under one
+mean layer per layer the rank has a deficit to move whatever the routing does;
+over it, a rank moves bytes only when it is on course to end the pass over the
+budget, so a rank that is heavy early but light later moves nothing.
 
 The copy to host is never waited for; the allocator keeps each evicted block
 until the copy stream is done with it. In backward, a swapped layer comes back
@@ -51,10 +46,11 @@ earliest layers does not land at the peak either; the compute stream waits only
 for what has not arrived, and that wait is measured.
 
 The number of layers of a pass is learned from the previous passes; the first
-pass budgets only the layers seen so far. Passes must not interleave (no
-pipeline schedule). Activation recompute runs the block again inside the
-autograd engine; nothing is swapped then, since the recomputed tensors are
-consumed at once.
+pass budgets only the layers seen so far. Passes must not interleave, so no
+pipeline schedule, and the MoE blocks must keep their activations, so no
+activation checkpointing: a checkpointed block keeps none to swap, and this
+module's hooks inside a checkpointed region would keep what checkpointing
+drops. ``EPHostSwapCallback`` refuses both.
 
 Each rank writes one JSON Lines file with, per step, the eviction decisions and,
 per swapped layer, the bytes moved, the device time of both copies and how much
@@ -338,7 +334,7 @@ class EPHostSwap:
         return saved
 
     def _enforce_budget(self, layer: _Layer) -> None:
-        """Swap the earliest layers' tensors while what the pass holds is over its threshold.
+        """Swap the earliest layers' tensors while the projected end-of-forward total is over the budget.
 
         A mean layer is the pass's mean sent pairs times the bytes a received
         pair saves; the pass's number of layers is the longest seen so far, so
@@ -352,7 +348,8 @@ class EPHostSwap:
         done, layers = len(current), self._expected_layers
         mean = self._pair_bytes * sum(item.sent for item in current) / len(current)
         budget = self.budget_layers * mean
-        threshold = max(budget * done / layers, budget - (layers - done) * mean)
+        # What may be held now if every remaining layer comes at the mean.
+        threshold = budget - (layers - done) * mean
         held = sum(saved.nbytes for item in current for saved in item.saved if saved.device is not None)
         need = held - threshold
         if need <= 0:

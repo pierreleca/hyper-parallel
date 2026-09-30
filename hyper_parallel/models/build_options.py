@@ -187,7 +187,7 @@ class FSDP2Config:
 
 
 _MODEL_INIT_DTYPES = ("float16", "bfloat16", "float32")
-_ACTIVATION_CHECKPOINT_MODES = ("off", "full", "selective", "full_except_moe")
+_ACTIVATION_CHECKPOINT_MODES = ("off", "full", "selective")
 _ACTIVATION_SWAP_MODES = ("none", "attention")
 
 
@@ -205,7 +205,7 @@ class ModelBuildOptions:
     # Final floating-point dtype after weights are loaded or initialized
     # from scratch; None preserves the initialization-path dtype.
     model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None
-    activation_checkpoint: Optional[Literal["off", "full", "selective", "full_except_moe"]] = None
+    activation_checkpoint: Optional[Literal["off", "full", "selective"]] = None
     activation_swap: Literal["none", "attention"] = "none"
     swap_inputs: bool = False
     compile: CompileConfig = field(default_factory=CompileConfig)
@@ -234,7 +234,7 @@ class ModelBuildOptions:
             self.activation_checkpoint not in _ACTIVATION_CHECKPOINT_MODES
         ):
             raise ValueError(
-                "activation_checkpoint must be one of off, full, selective, full_except_moe, "
+                "activation_checkpoint must be one of off, full, selective, "
                 f"or null; got {self.activation_checkpoint!r}"
             )
         if self.activation_swap not in _ACTIVATION_SWAP_MODES:

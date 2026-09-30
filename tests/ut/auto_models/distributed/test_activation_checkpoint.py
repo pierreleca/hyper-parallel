@@ -14,11 +14,9 @@
 # ============================================================================
 """Unit tests for model-agnostic activation-checkpoint block discovery."""
 
-import copy
 import unittest
 from unittest.mock import MagicMock, call, patch
 
-import torch
 from torch import Tensor, nn
 
 
@@ -27,11 +25,9 @@ from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
     _find_transformer_block_modules,
     _find_transformer_layer_container_infos,
-    _is_checkpoint_wrapped,
     _wrap_layer_containers,
     apply_submodule_checkpointing,
 )
-from hyper_parallel.models.build_options import ModelBuildOptions
 
 
 _ACTIVATION_CHECKPOINT_MODULE = (
@@ -394,88 +390,3 @@ class TestActivationCheckpointSwapInputs(unittest.TestCase):
                     )
 
                 swap_manager.set_forward_prefetch_layer.assert_not_called()
-
-
-class _MoeMlp(nn.Module):
-    """Stand-in MoE MLP: what marks it is its ``experts`` child."""
-
-    def __init__(self) -> None:
-        """Create the experts child the mode detects."""
-        super().__init__()
-        self.experts = nn.Linear(2, 2)
-
-    def forward(self, inputs: Tensor) -> Tensor:
-        """Apply the stand-in experts."""
-        return self.experts(inputs)
-
-
-class _DecoderLayer(nn.Module):
-    """Pre-norm decoder layer with either an MoE or a dense MLP."""
-
-    def __init__(self, moe: bool) -> None:
-        """Create attention, norms and the MLP."""
-        super().__init__()
-        self.input_layernorm = nn.LayerNorm(2)
-        self.self_attn = nn.Linear(2, 2)
-        self.post_attention_layernorm = nn.LayerNorm(2)
-        self.mlp = _MoeMlp() if moe else nn.Linear(2, 2)
-
-    def forward(self, inputs: Tensor) -> Tensor:
-        """Apply the attention and MLP residual branches."""
-        hidden = inputs + self.self_attn(self.input_layernorm(inputs))
-        return hidden + self.mlp(self.post_attention_layernorm(hidden))
-
-
-class _MixedOwner(nn.Module):
-    """HF-style owner holding one MoE layer and one dense layer."""
-
-    gradient_checkpointing = False
-
-    def __init__(self) -> None:
-        """Create the repeated block container."""
-        super().__init__()
-        self.layers = nn.ModuleList([_DecoderLayer(moe=True), _DecoderLayer(moe=False)])
-
-    def forward(self, inputs: Tensor) -> Tensor:
-        """Apply every layer in order."""
-        for layer in self.layers:
-            inputs = layer(inputs)
-        return inputs
-
-
-class TestFullExceptMoeCheckpointing(unittest.TestCase):
-    """The MoE of a block keeps its activations; everything else is recomputed."""
-
-    def test_wraps_attention_and_norms_of_moe_blocks_only(self):
-        """Dense blocks are wrapped whole; MoE blocks keep their MLP unwrapped."""
-        model = _MixedOwner()
-        _apply_activation_checkpointing(model, "full_except_moe")
-
-        moe_layer, dense_layer = model.layers[0], model.layers[1]
-        self.assertTrue(_is_checkpoint_wrapped(dense_layer), "dense block wrapped whole")
-        self.assertFalse(_is_checkpoint_wrapped(moe_layer), "MoE block not wrapped whole")
-        for name in ("self_attn", "input_layernorm", "post_attention_layernorm"):
-            self.assertTrue(_is_checkpoint_wrapped(getattr(moe_layer, name)), name)
-        self.assertFalse(_is_checkpoint_wrapped(moe_layer.mlp), "the MoE keeps its activations")
-
-    def test_gradients_match_the_unwrapped_model(self):
-        """Recomputing part of the model does not change its gradients."""
-        torch.manual_seed(0)
-        reference = _MixedOwner()
-        wrapped = copy.deepcopy(reference)
-        _apply_activation_checkpointing(wrapped, "full_except_moe")
-
-        inputs = torch.randn(3, 2)
-        reference(inputs).sum().backward()
-        wrapped(inputs).sum().backward()
-        for (name, expected), (_, actual) in zip(
-            reference.named_parameters(), wrapped.named_parameters()
-        ):
-            torch.testing.assert_close(actual.grad, expected.grad, msg=name)
-
-    def test_mode_is_accepted_by_the_build_options(self):
-        """The model-build options validate the new mode name."""
-        options = ModelBuildOptions(activation_checkpoint="full_except_moe")
-        self.assertEqual(options.activation_checkpoint, "full_except_moe")
-        with self.assertRaises(ValueError):
-            ModelBuildOptions(activation_checkpoint="partial")

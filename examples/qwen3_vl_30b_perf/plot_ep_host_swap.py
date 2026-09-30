@@ -87,7 +87,7 @@ class SwapStep:
     """What one swap did on one rank in one step: its budget, bytes swapped per layer and its decisions."""
 
     budget_layers: float
-    rule: str = "combined"
+    rule: str = "projection"
     swapped: dict[int, float] = field(default_factory=dict)
     decisions: list[tuple[int, float]] = field(default_factory=list)  # (layer after which, bytes evicted)
 
@@ -110,7 +110,7 @@ def _save(fig, out: str) -> None:
 def replay(saved: list[float], mean: float, budget_layers: float) -> SwapStep:
     """Apply the swap's rule to one pass of routed bytes per layer (``replay_ep_host_swap.replay_pass``)."""
     pair_bytes = sum(TENSOR_BYTES)
-    run = replay_pass([size / pair_bytes for size in saved], [mean / pair_bytes] * len(saved), "combined",
+    run = replay_pass([size / pair_bytes for size in saved], [mean / pair_bytes] * len(saved), "projection",
                       budget_layers / len(saved))
     return SwapStep(budget_layers=budget_layers, swapped=run.swapped, decisions=run.decisions)
 
@@ -266,8 +266,7 @@ def draw_sweep(out: str) -> None:
         axis.set_xlabel("budget_layers, of 8 MoE layers")
         _style(axis)
     twin.spines[["top"]].set_visible(False)
-    fig.suptitle("Budget sweep (16 A3 dies, 8 text layers, eleven runs that route identically; "
-                 "measured with the earlier projection rule)", fontsize=10)
+    fig.suptitle("Budget sweep (16 A3 dies, 8 text layers, eleven runs that route identically)", fontsize=10)
     fig.tight_layout()
     _save(fig, out)
 
@@ -353,8 +352,8 @@ def main() -> int:
     run.add_argument("noswap", help="the no-swap run's instrument directory (rank*.jsonl)")
     run.add_argument("--swap", action="append", required=True, metavar="LAYERS=DIR",
                      help="a swap run's ep_host_swap directory and its budget_layers; repeat")
-    run.add_argument("--rule", default="combined", choices=["combined", "projection", "angled"],
-                     help="the rule the runs used, for the threshold line (projection for runs before it changed)")
+    run.add_argument("--rule", default="projection", choices=["projection", "combined", "angled"],
+                     help="the rule the runs used, for the threshold line")
     run.add_argument("--step", type=int, default=None, help="step to draw (default: the worst)")
     run.add_argument("--rank", type=int, default=None, help="rank to draw (default: the worst)")
     run.add_argument("--skip", type=int, default=2, help="warm-up records to drop, as the report does")

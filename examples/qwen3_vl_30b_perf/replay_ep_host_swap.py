@@ -22,10 +22,12 @@ exactly as ``host_swap.py`` picks them. With m the rank's mean bytes per layer (
 sent pairs), L layers and f the factor, the budget is B = f·L·m and the threshold
 after layer i (1-based) is:
 
-- ``projection``: B − (L − i)·m, the rule of the first measurements;
+- ``projection``: B − (L − i)·m, what the swap does;
 - ``angled``: f·i·m, the budget spread evenly over the layers;
 - ``combined``: the larger of the two, which is ``angled`` for f ≤ 1 and
-  ``projection`` for f ≥ 1: what the swap does today (``budget_layers`` = f·L).
+  ``projection`` for f ≥ 1 (tried, and set aside: under one mean layer per layer
+  it leaves more to evict after the last layer, while copies still run at the peak).
+``budget_layers`` = f·L.
 
 ``--no-last`` skips the decision after the last layer, so nothing is still being
 copied when forward ends. Per rule and factor the report gives, over every
@@ -51,7 +53,7 @@ from analyze_ep_instrument import call_loads, load_records
 GIB = 1024 ** 3
 # Bytes each saved tensor keeps per received pair, Qwen3-VL-30B-A3B (hidden 2048, expert intermediate 768, bf16).
 TENSOR_BYTES = (4096, 3072, 1536)
-RULES = ("combined", "projection", "angled")
+RULES = ("projection", "combined", "angled")
 
 
 def choose_offload(sizes: list[int], need: int) -> list[int]:
