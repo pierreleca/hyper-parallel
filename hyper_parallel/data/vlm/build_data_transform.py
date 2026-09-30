@@ -26,6 +26,12 @@ from hyper_parallel.data.constants import IGNORE_INDEX
 _SEQ_FIELDS = ("input_ids", "attention_mask", "labels", "mm_token_type_ids")
 
 
+def _template_reads(chat_template: Any, variable: str) -> bool:
+    """Return whether a chat template, or any template of a named set, mentions ``variable``."""
+    templates = chat_template.values() if isinstance(chat_template, dict) else (chat_template,)
+    return any(isinstance(template, str) and variable in template for template in templates)
+
+
 class VLMChatTransform:
     """Encode one multimodal conversation into one padded model sample.
 
@@ -75,13 +81,19 @@ class VLMChatTransform:
         if not chat_template:
             tokenizer = getattr(self.processor, "tokenizer", None)
             chat_template = getattr(tokenizer, "chat_template", None)
+        # Only templates that read enable_thinking (Qwen3 hybrid thinking) get it:
+        # Transformers treats any other extra keyword as a processor argument,
+        # ignores it and logs two warnings per call.
+        template_kwargs = {}
+        if _template_reads(chat_template, "enable_thinking"):
+            template_kwargs["enable_thinking"] = False
         return self.processor.apply_chat_template(
             messages,
             tokenize=True,
             return_dict=True,
             add_generation_prompt=add_generation_prompt,
-            enable_thinking=False,
             chat_template=chat_template,
+            **template_kwargs,
         )
 
     @staticmethod
