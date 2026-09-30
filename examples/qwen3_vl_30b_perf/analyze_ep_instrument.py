@@ -939,6 +939,12 @@ def sweep_row(run_dir: str, skip: int) -> dict[str, Any]:
             walls[step] = max(walls.get(step, 0.0), entry["wall_s"])
     alloc = [statistics.fmean(values) for values in allocated.values()]
     resv = [statistics.fmean(values) for values in reserved.values()]
+    # Routing health: max / mean received pairs per (step, layer); about 16 when one rank per
+    # EP group of 16 gets everything, which is what a router scoring every expert alike does.
+    received: dict[tuple[int, int], list[int]] = {}
+    for item in collected["rows"]:
+        received.setdefault((item["step"], item["layer"]), []).append(item["recv"])
+    ratios = [imbalance(values) for values in received.values() if sum(values)]
     row = {
         "run": os.path.basename(run_dir.rstrip("/")) or run_dir,
         "steps": len(walls),
@@ -948,6 +954,7 @@ def sweep_row(run_dir: str, skip: int) -> dict[str, Any]:
         "reserved_worst": max(resv) if resv else 0.0,
         "step_mean": statistics.fmean(walls.values()) if walls else 0.0,
         "step_median": statistics.median(walls.values()) if walls else 0.0,
+        "routing_max_over_mean": statistics.fmean(ratios) if ratios else 0.0,
     }
     row.update(swap_totals(os.path.join(run_dir, "ep_host_swap"), skip))
     return row
@@ -983,17 +990,23 @@ def report_sweep(run_dirs: list[str], skip: int, out: list[str]) -> list[dict[st
     rows = [sweep_row(run_dir, skip) for run_dir in run_dirs]
     out.append(f"SWEEP ({len(rows)} runs, per-rank means over the steps kept after {skip})")
     out.append("  run                              steps   moved  alloc  alloc  reserved  reserved   step s   step s"
-               "   D2H GB/s   exposed  pinned")
+               "   D2H GB/s   exposed  pinned  routing")
     out.append("                                           GiB/st   mean  worst      mean     worst     mean   median"
-               "    min-max     ms max     GiB")
+               "    min-max     ms max     GiB  max/mean")
     for row in rows:
         rate = "-" if row["d2h_min"] is None else f"{row['d2h_min']:.0f}-{row['d2h_max']:.0f}"
         out.append(
             f"  {row['run']:<32}{row['steps']:5d}{row['moved_gib']:8.2f}{row['alloc_mean']:7.2f}"
             f"{row['alloc_worst']:7.2f}{row['reserved_mean']:10.2f}{row['reserved_worst']:10.2f}"
             f"{row['step_mean']:9.3f}{row['step_median']:9.3f}{rate:>11}{row['exposed_max']:11.1f}"
-            f"{row['pinned_max']:8.2f}"
+            f"{row['pinned_max']:8.2f}{row['routing_max_over_mean']:10.2f}"
         )
+    for row in rows:
+        if row["routing_max_over_mean"] > 4:
+            out.append(f"  WARNING {row['run']}: routing max/mean {row['routing_max_over_mean']:.1f}, the router looks"
+                       " collapsed (every token to the same experts); its memory and time say nothing about the swap")
+    if len(rows) < 2:
+        return rows
     base = rows[0]
     out.append(f"  against {base['run']}: step time and memory as deltas")
     for row in rows[1:]:
