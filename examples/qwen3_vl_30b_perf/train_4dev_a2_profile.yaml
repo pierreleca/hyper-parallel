@@ -1,0 +1,212 @@
+# Qwen3-VL-30B-A3B-Instruct profiling config: 4 Ascend A2 devices, FSDP + EP,
+# text decoder cropped to its first 12 layers, loaded from the checkpoint.
+#
+# Model: the full 48-layer model needs about 61 GB per die at four ranks
+# (8 bytes per parameter for weights, gradients and BF16 AdamW moments), which
+# leaves nothing for activations. The text layer count lives in the nested
+# text_config, which YAML cannot reach, so cropped_qwen3_vl.py keeps the first
+# 12 text layers and loads them, the vision tower, the embeddings and the LM
+# head from the checkpoint; the tensors of layers 12-47 are skipped with one
+# warning. Real weights keep the router's expert load imbalance, which random
+# weights would flatten, so the all-to-all and grouped-GEMM shapes in the trace
+# are the trained model's.
+#
+# Topology (the VLM batch path requires TP = CP = PP = 1):
+# - dense weights (attention, embeddings, vision tower): FSDP over the 4 ranks;
+# - routed experts: EP 4, i.e. 32 of the 128 experts per rank; experts are not
+#   FSDP-sharded (edp_shard 1).
+#
+# Sequence: 16384 tokens per rank, one conversation per sample (the VLM data
+# path has no packing). Peak per die: about 43 GB allocated and 55 GB reserved
+# without expandable segments, of which each text layer adds about 1.25 GB of
+# weights, gradients and moments. Adjust the depth with
+# --model.num_hidden_layers=N.
+#
+# Kernels: plan_overrides select the fused modules of
+# hyper_parallel.components.modules. Every operator they use ships with CANN
+# (npu_rms_norm, npu_fusion_attention, npu_moe_token_permute,
+# npu_grouped_matmul, npu_swiglu), so neither Omni Ops nor the multicore build
+# is required.
+#
+# Profiling: rank 0, steps 6 and 7 (end_step is exclusive), after allocator,
+# HCCL link and kernel warmup; torch_npu level 1, no Python stack. Useful
+# overrides: --profiling.rank=N, --profiling.record_shapes=true,
+# --profiling.profile_memory=true, --profiling.enabled=false for a timing run.
+#
+# Run from the repository root, which puts the examples package on sys.path.
+# Generate the dataset once: 1024-px images, one per 4096 tokens, and answers
+# longer than the sequence, so the transform truncates every sample to exactly
+# max_seq_len tokens (no padding, no text attention mask). 64 samples are 16
+# steps, so the DataLoader does not restart during the run.
+#   python examples/qwen3_vl_30b_perf/prepare_perf_data.py \
+#     --output-dir /home/pl/data/qwen3_vl_30b_perf/seq16384_img4_n64 \
+#     --seq-len 16384 --images-per-sample 4 --num-samples 64 \
+#     --processor-path /home/pl/Qwen3-VL-30B-A3B-Instruct
+#   torchrun --nproc_per_node=4 --master_port=29500 \
+#     scripts/train_vl.py examples/qwen3_vl_30b_perf/train_4dev_a2_profile.yaml
+# Summarize a tee'd log with:
+#   python examples/qwen3_vl_30b_perf/parse_perf_log.py run.log
+#
+# Devices: torchrun assigns LOCAL_RANK 0..3, which bind to dies 0..3. No
+# visible-device variable is needed as long as those four dies are healthy.
+
+model:
+  _target_: examples.qwen3_vl_30b_perf.cropped_qwen3_vl.build_cropped_qwen3_vl
+  # One key: the checkpoint, the HF configuration that the builder crops, and
+  # the processor source that the VLM Trainer reads.
+  pretrained_model_name_or_path: /home/pl/Qwen3-VL-30B-A3B-Instruct
+  num_hidden_layers: 12
+  local_files_only: true
+  torch_dtype: bfloat16
+  # On Ascend, transformers routes flash_attention_2 to torch_npu's
+  # npu_fusion_attention: varlen over per-image cu_seqlens in the vision tower;
+  # the fused text attention below runs the causal sparse mode.
+  attn_implementation: flash_attention_2
+  # Under EP the sharding planner covers the text decoder but, in the vision
+  # tower, only the LayerNorms, and its coverage check fails. This keeps the
+  # undeclared vision parameters as plain FSDP parameters (the correct layout
+  # at TP = CP = 1) and turns the check into a warning.
+  allow_uncovered_params: true
+  validate_placement: false
+
+training:
+  train_iters: 10
+  global_batch_size: 4
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  logging_steps: 1
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 4
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 4
+  edp_shard_size: 1
+  replicate_params: []
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+# Module replacements run before sharding and checkpoint loading.
+# module_type + exact_type keep the vision tower untouched. Replacement targets
+# must not nest, so the per-head q/k norms inside self_attn stay Transformers
+# RMSNorm modules.
+plan_overrides:
+  # torch_npu.npu_rms_norm for the decoder-layer and final text norms.
+  - match:
+      - "*.language_model.layers.*.input_layernorm"
+      - "*.language_model.layers.*.post_attention_layernorm"
+      - "*.language_model.norm"
+    module_type: transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextRMSNorm
+    exact_type: true
+    replace_module:
+      _target_: hyper_parallel.components.modules.RMSNorm
+  # modules.GQAAttention (fused QKV projection, fused RoPE) driven by the
+  # Qwen3 attention interface: mask-free batches run npu_fusion_attention's
+  # causal sparse mode, which skips fully masked blocks.
+  - match: "*.language_model.layers.*.self_attn"
+    module_type: transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextAttention
+    exact_type: true
+    replace_module:
+      _target_: hyper_parallel.models.qwen3_moe.adapter.replacements.replace_qwen3_moe_flash_attention
+  # Grouped-GEMM routed experts (npu_moe_token_permute + npu_grouped_matmul).
+  - match: "*.language_model.layers.*.mlp.experts"
+    module_type: transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextExperts
+    exact_type: true
+    replace_module:
+      _target_: hyper_parallel.components.modules.GroupedExperts
+  # EP all-to-all dispatch/combine around the grouped experts. Scoped to the
+  # text layers: the vision blocks also own "mlp" modules.
+  - match: "*.language_model.layers.*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn
+      use_grouped_gemm: true
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: full
+
+activation_swap: none
+
+compile:
+  enabled: false
+
+dataset:
+  _target_: hyper_parallel.data.vlm.build_vlm_dataset
+  # Generated by prepare_perf_data.py for this sequence length (see the header).
+  data_path: /home/pl/data/qwen3_vl_30b_perf/seq16384_img4_n64/vlm_conversations.json
+  data_config:
+    source_type: online
+  model_assets:
+    chat_template: null
+    tokenizer: null
+  data_transform:
+    _target_: hyper_parallel.data.vlm.build_vlm_data_transform
+    max_seq_len: 16384
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.vlm.build_vlm_collator
+  # get_batch omitted: VLMTrainer defaults to build_vlm_get_batch.
+  dataloader_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  # Image preprocessing and tokenization of long samples run in worker
+  # processes so they stay off the training critical path.
+  num_workers: 4
+  pin_memory: false
+  prefetch_factor: 2
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: /home/pl/runs/qwen3_vl_30b_perf/checkpoints
+
+debug:
+  check_nan_inf: false
+  check_dataset: null
+
+profiling:
+  enabled: true
+  rank: 0
+  start_step: 6
+  end_step: 8
+  trace_dir: /home/pl/runs/qwen3_vl_30b_perf/train_4dev_a2_profile/profiling
+  record_shapes: false
+  profile_memory: false
+  with_stack: false
+  with_modules: false
