@@ -31,6 +31,7 @@ from torch import nn
 from hyper_parallel.distributed.expert_parallel.experts import bind_local_expert_forward, ep_routed_forward
 from hyper_parallel.distributed.expert_parallel.host_swap import HOST_SWAP, EPHostSwap, choose_offload
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
+from hyper_parallel.trainer.config.parser import parse_training_args
 
 HIDDEN, INTER = 16, 8
 
@@ -217,8 +218,8 @@ def test_a_budget_under_the_layers_swaps_balanced_layers_and_keeps_gradients(swa
         assert decision["held_gib"] - decision["evicted_gib"] <= decision["threshold_gib"] + 1e-12
 
 
-def test_a_budget_under_the_layers_spreads_the_evictions(swap):
-    """Once the pass length is known, the deficit starts leaving after the first layer, not at the end."""
+def test_a_budget_under_the_layers_acts_from_the_first_layer(swap):
+    """Once the pass length is known, the projection starts evicting after the first layer, not at the end."""
     _run([8, 8, 8], sent=8, swap_on=True)
     first = swap.end_step(rank=0)["evictions"]
     assert [decision["after_layer"] for decision in first] == [2], "the first pass budgets the layers it has seen"
@@ -226,8 +227,8 @@ def test_a_budget_under_the_layers_spreads_the_evictions(swap):
     _run([8, 8, 8], sent=8, swap_on=True)
     second = swap.end_step(rank=0)["evictions"]
     assert second[0]["after_layer"] == 0 and second[0]["expected_layers"] == 3
-    # 2.7 of 3 mean layers: after the first layer the threshold is 0.9 of it, the budget spread evenly.
-    assert second[0]["threshold_gib"] == pytest.approx(0.9 * second[0]["budget_gib"] / 2.7)
+    # 2.7 of 3 mean layers: after the first layer, room is kept for two more at the mean.
+    assert second[0]["threshold_gib"] == pytest.approx(second[0]["budget_gib"] * (2.7 - 2) / 2.7)
 
 
 def test_a_budget_over_the_layers_lets_an_early_peak_through(swap):
@@ -235,7 +236,7 @@ def test_a_budget_over_the_layers_lets_an_early_peak_through(swap):
     swap.configure(enabled=True, budget_layers=3.3, min_row_bytes=16, output_dir="")
     for step in (1, 2):  # the second pass knows it has three layers
         swap.begin_step(step)
-        # 10 rows first is over 3.3 / 3 of the budget, but not over what it leaves for two mean layers.
+        # 10 rows first is ahead of the mean, but within what the budget leaves after two mean layers.
         _grads, layers = _run([10, 6, 7], sent=8, swap_on=True)  # 23 rows against 3.3 x 8 = 26.4
     assert not layers, "ahead of the mean after the first layer, yet within the budget at the end"
 
@@ -282,3 +283,29 @@ def test_the_replay_script_picks_tensors_as_the_swap_does(monkeypatch):
         sizes = [generator.randint(1, 5000) for _ in range(generator.randint(1, 6))]
         need = generator.randint(-10, sum(sizes) + 10)
         assert replay.choose_offload(sizes, need) == choose_offload(sizes, need), (sizes, need)
+
+
+def _sample_model(width: int) -> None:  # pylint: disable=unused-argument
+    """Model target for the config tests."""
+
+
+def _sample_optimizer(learning_rate: float) -> None:  # pylint: disable=unused-argument
+    """Optimizer target for the config tests."""
+
+
+@pytest.mark.parametrize("override, message", [
+    ("--activation_checkpoint.mode=full", "activation_checkpoint"),
+    ("--activation_checkpoint.mode=selective", "activation_checkpoint"),
+    ("--compile.enabled=true", "compile"),
+    ("--accelerator.pp_size=2", "pipeline"),
+])
+def test_the_trainer_refuses_what_the_swap_cannot_budget(tmp_path, override, message):
+    """The swap needs every MoE block's activations kept in one forward pass at a time."""
+    yaml_path = tmp_path / "train.yaml"
+    yaml_path.write_text(
+        f"model:\n  _target_: {__name__}._sample_model\n  width: 8\n"
+        f"optimizer:\n  _target_: {__name__}._sample_optimizer\n  learning_rate: 0.01\n"
+        "ep_host_swap:\n  enabled: true\n  budget_layers: 4.0\n", encoding="utf-8")
+    assert parse_training_args([str(yaml_path)]).ep_host_swap.enabled
+    with pytest.raises(ValueError, match=message):
+        parse_training_args([str(yaml_path), override])

@@ -30,16 +30,14 @@ worst routing ever seen.
 - **Budget.** `budget_layers` mean layers per rank. A rank's mean layer follows from
   its own tokens times top-k, known before routing, so the budget needs no collective
   and no routing can move it.
-- **Trigger.** After each MoE layer the rank compares what it holds with a threshold
-  (red) and, when over it (circles), evicts down to it. The threshold is the larger
-  of two lines that both end at the budget after the last layer:
-  - the budget spread evenly over the layers, `budget × i / L`: when the budget is
-    under one mean layer per layer (right), a rank has a deficit to move whatever
-    the routing, and moves it evenly across the pass;
-  - what the rank may hold now if the remaining layers come at the mean,
-    `budget − (L − i) × mean layer`: when the budget is over one mean layer per layer
-    (left), a rank moves bytes only when it is on course to end over budget, so a
-    rank that is heavy early and light later moves nothing.
+- **Trigger.** After each MoE layer the rank projects its end-of-forward total: what it
+  holds plus the remaining layers at one mean layer each. While the projection is
+  over the budget, it evicts. On the figure this is a threshold on what the rank
+  holds (red), `budget − (L − i) × mean layer`, rising by one mean layer per layer
+  to the budget at the last one; a circle is what the rank held before an eviction.
+  Keeping room for the remaining layers settles most evictions early in the pass,
+  and leaves little to evict after the last layer, when copies would still run at
+  the step's peak. A rank that is heavy early but light later moves nothing.
 - **What moves.** Whole tensors the experts saved for backward, earliest layers
   first: their backward comes last, so their copies have the most time on both ends.
   Copies run on a side stream during the next attention and are never waited for.
@@ -65,16 +63,18 @@ ep_host_swap:
 Fields can be overridden on the command line (`--ep_host_swap.budget_layers=3`).
 On 16 A3 dies, 1 to 0.3 mean layers per MoE layer was the useful range.
 The swap applies to the trainer's EP path
-(`hyper_parallel/distributed/expert_parallel/experts.py`). On Ascend, set
+(`hyper_parallel/distributed/expert_parallel/experts.py`) and needs the MoE blocks to
+keep their activations: it requires `activation_checkpoint.mode: off`, and is refused
+with compile or pipeline parallelism. On Ascend, set
 `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True`, or fragmentation can undo the bound.
 
 ## Results
 
 ![Budget sweep](../images/ep_host_swap_sweep.png)
 
-These runs used an earlier trigger that evicted as soon as a projection of the
-remaining layers at the mean crossed the budget, which front-loads the evictions
-under one mean layer per layer; the budgets reached are the same.
+These runs recomputed the vision tower and the text attention while keeping the
+MoE activations, a layout this repository does not configure; measurements with
+no recompute, the configuration the swap supports, are pending.
 
 | 16 A3 dies | Worst reserved, GiB | Median step time | Copy back waited |
 | --- | --- | --- | --- |

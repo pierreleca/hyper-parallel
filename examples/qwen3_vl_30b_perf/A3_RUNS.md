@@ -25,7 +25,7 @@ examples/qwen3_vl_30b_perf/a3_campaign.sh examples/qwen3_vl_30b_perf/plans/smoke
 # results in /home/pl/a3_runs/smoke_64dev_<stamp>/
 ```
 
-Plans live in `plans/`: `smoke_64dev.sh` (one 10-step run, does 64 dies work?) and
+Plans live in `plans/`: `probe_64dev.sh` (what fits without recompute), `smoke_64dev.sh` (one 10-step run) and
 `sweep_64dev.sh` (8 text layers: baseline, budgets 8.8 to 1.6, a profiled pair). The sections below are the
 same steps by hand.
 
@@ -212,6 +212,16 @@ cluster sync
 cluster exec -p 'python examples/qwen3_vl_30b_perf/prepare_cauldron_data.py \
   --output-dir /home/pl/data/qwen3_vl_30b_perf/cauldron_seq16384_n1280 \
   --seq-len 16384 --num-samples 1280 --processor-path /home/e00642590/Qwen3-VL-30B-A3B-Instruct \
+  --download-dir /home/pl/data/the_cauldron --offline --passes 4'
+```
+
+Without activation recompute a sample of 16384 tokens may not fit; the probe
+(`plans/probe_64dev.sh`) also tries 8192 tokens, from this dataset:
+
+```bash
+cluster exec -p 'python examples/qwen3_vl_30b_perf/prepare_cauldron_data.py \
+  --output-dir /home/pl/data/qwen3_vl_30b_perf/cauldron_seq8192_n1280 \
+  --seq-len 8192 --num-samples 1280 --processor-path /home/e00642590/Qwen3-VL-30B-A3B-Instruct \
   --download-dir /home/pl/data/the_cauldron --offline --passes 4'
 ```
 

@@ -90,6 +90,16 @@ class TrainerConfig:
         """Validate combinations that span multiple config sections."""
         if self.compile.enabled and self.accelerator.pp_size > 1:
             raise ValueError("compile is not supported together with pipeline parallelism")
+        if self.ep_host_swap.enabled:
+            # The swap budgets the activations the MoE blocks keep over one forward pass:
+            # recompute keeps none, compile bypasses its hooks, and pipeline schedules
+            # interleave the passes it counts layers over.
+            if self.activation_checkpoint.mode not in (None, "off"):
+                raise ValueError("ep_host_swap requires activation_checkpoint.mode='off'")
+            if self.compile.enabled:
+                raise ValueError("ep_host_swap is not supported together with compile")
+            if self.accelerator.pp_size > 1:
+                raise ValueError("ep_host_swap is not supported together with pipeline parallelism")
         reduce_dtype = self.fsdp_config.mix_precision.reduce_dtype
         if self.optimizer.fp32_main_params and reduce_dtype != "float32":
             raise ValueError(

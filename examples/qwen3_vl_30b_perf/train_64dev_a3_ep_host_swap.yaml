@@ -10,9 +10,9 @@
 # the point of the comparison. Global rank = node rank x 16 + local rank, so
 # the EP groups are the nodes.
 #
-# What it measures, as the 4-die A2 runs did (train_4dev_a2_ep_host_swap.yaml):
+# What it measures:
 # - the EP imbalance per layer and per rank, and the MoE memory it causes
-#   (EP instrument on, MoE blocks kept: activation_checkpoint full_except_moe);
+#   (EP instrument on, no activation recompute, so the MoE blocks keep their activations);
 # - the host swap (ep_host_swap, 5.4 mean layers of 6):
 #   which layers are evicted, the bytes moved, the copy bandwidth each way,
 #   how much of the copy back compute hides, and where the allocator's reserve
@@ -22,11 +22,12 @@
 #   the swap's own cost; keep train_iters equal, since the cosine LR schedule
 #   depends on it.
 #
-# Depth: 6 of the 48 text layers, as on one node (the builder crops the
-# checkpoint). One node fits 8 without swap at 59.4 GiB reserved on the worst
-# rank of a 61.3 GiB die; here FSDP over 64 ranks and experts sharded over 4
-# nodes hold less of the weights, gradients and moments per rank, so 6 leaves
-# room for a first run. Expandable segments are needed (see A3_RUNS.md).
+# Depth: the builder crops the 48 text layers of the checkpoint. With activation
+# recompute (MoE kept) 8 layers fitted at 16384 tokens; with none, the vision tower
+# and the text attention keep their activations too, so the depth and sequence
+# length come from the fit probe (plans/probe_64dev.sh) and are set on the command
+# line. Expandable segments are needed (see A3_RUNS.md): without them the cache
+# held 10 GiB it could not hand out as one block.
 #
 # Paths, all outside the repository (the code travels as a zip; data and runs
 # stay put): the checkpoint in /home/e00642590/Qwen3-VL-30B-A3B-Instruct on every A3
@@ -133,10 +134,12 @@ plan_overrides:
 mixed_precision:
   enabled: false
 
-# Recompute the vision blocks and the text attention and norms; keep the MoE
-# activations of every text layer.
+# No recompute: the MoE blocks keep their activations, which is what the swap
+# budgets (ep_host_swap refuses activation checkpointing). Everything else is
+# kept too, the vision tower included, so the depth and sequence length are what
+# fits without it.
 activation_checkpoint:
-  mode: full_except_moe
+  mode: "off"
 
 activation_swap: none
 
