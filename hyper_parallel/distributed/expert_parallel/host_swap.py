@@ -43,7 +43,7 @@ The copy to host is never waited for; the allocator keeps each evicted block
 until the copy stream is done with it. In backward, a swapped layer comes back
 while the layer just above it runs its backward, so the copy back of the
 earliest layers does not land at the peak either; the compute stream waits only
-for what has not arrived.
+for what has not arrived, and that wait is measured.
 
 The number of layers of a pass is learned from the previous passes; the first
 pass budgets only the layers seen so far. Passes must not interleave, so no
@@ -54,11 +54,18 @@ drops. The trainer refuses both.
 
 Only the activations move: floating-point tensors of at least two dimensions, one
 row of features per received pair. The index tensors stay on device.
+
+Each rank writes one JSON Lines file with, per step, the eviction decisions and,
+per swapped layer, the bytes moved, the device time of both copies and how much
+of the copy back the compute stream did not wait for.
 """
 
 from __future__ import annotations
 
 import itertools
+import json
+import os
+import socket
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
@@ -173,8 +180,9 @@ class _Layer:
     keys: dict = field(default_factory=dict)
     swapped: list[_Saved] = field(default_factory=list)
     swapped_bytes: int = 0
-    # Recorded on the copy stream once the layer's copy back is enqueued.
-    loaded: Any = None
+    events: dict = field(default_factory=dict)
+    # (start, end) events of every copy to host; a layer can be swapped in several rounds.
+    d2h_rounds: list = field(default_factory=list)
     loading: bool = False
     waited: bool = False
     prefetch_done: bool = False
@@ -188,6 +196,7 @@ class EPHostSwap:
         """Start disabled; ``configure`` turns it on."""
         self.enabled = False
         self.budget_layers = 0.0
+        self.output_dir = ""
         self._device = None
         self._copy_stream = None
         self._pool: Optional[_PinnedPool] = None
@@ -195,47 +204,83 @@ class EPHostSwap:
         self._swapped: list[_Layer] = []
         self._current: Optional[_Layer] = None
         # Where the current forward pass starts in ``_layers``, whether a backward ran
-        # since (the next layer then starts a pass), the longest pass seen and the last
-        # bytes per pair.
+        # since (the next layer then starts a pass), the longest pass seen, the last
+        # bytes per pair and the step's eviction decisions.
         self._pass_start = 0
         self._backward_seen = False
         self._expected_layers = 0
         self._pair_bytes = 0
+        self._evictions: list[dict] = []
+        self._step = 0
+        self._file = None
 
     # -- configuration and steps ---------------------------------------------
 
-    def configure(self, *, enabled: bool, budget_layers: float) -> None:
-        """Turn the swap on or off and set the budget in mean layers."""
+    def configure(self, *, enabled: bool, budget_layers: float, output_dir: str = "") -> None:
+        """Set the budget in mean layers and where the per-rank records go."""
         if enabled and budget_layers <= 0:
             raise ValueError("ep_host_swap.budget_layers must be positive")
         self.enabled = enabled
         self._expected_layers = 0
         self.budget_layers = budget_layers
+        self.output_dir = output_dir
         if not enabled:
             return
         self._device = None if get_device_type() == "cpu" else get_torch_device()
         self._copy_stream = self._device.Stream() if self._device is not None else None
         self._pool = _PinnedPool(pin=self._device is not None)
 
-    def begin_step(self) -> None:
+    def begin_step(self, step: int) -> None:
         """Forget the previous step's layers."""
+        self._step = step
         self._layers = []
         self._swapped = []
         self._current = None
         self._pass_start = 0
         self._backward_seen = False
+        self._evictions = []
 
-    def end_step(self) -> Optional[dict]:
-        """Return what the step moved: its MoE layers, the layers swapped and the bytes sent to host."""
+    def end_step(self, rank: int) -> Optional[dict]:
+        """Resolve the step's copy timings, append its record and return it."""
         if not self.enabled or not self._layers:
             return None
-        summary = {
+        if self._copy_stream is not None:
+            self._copy_stream.synchronize()
+            self._device.current_stream().synchronize()
+        layers = [self._layer_record(layer) for layer in self._swapped]
+        d2h_bytes = sum(layer["swapped_bytes"] for layer in layers)
+        h2d_bytes = sum(layer["swapped_bytes"] for layer in layers if layer["loaded"])
+        d2h_ms = sum(layer["d2h_ms"] or 0.0 for layer in layers)
+        h2d_ms = sum(layer["h2d_ms"] or 0.0 for layer in layers)
+        stall_ms = sum(layer["stall_ms"] or 0.0 for layer in layers)
+        record = {
+            "step": self._step,
+            "rank": rank,
             "moe_layers": len(self._layers),
-            "swapped_layers": len(self._swapped),
-            "d2h_gib": sum(layer.swapped_bytes for layer in self._swapped) / GIB,
+            "swapped_layers": len(layers),
+            "d2h_gib": d2h_bytes / GIB,
+            "h2d_gib": h2d_bytes / GIB,
+            "d2h_gbps": d2h_bytes / d2h_ms / 1e6 if d2h_ms else None,
+            "h2d_gbps": h2d_bytes / h2d_ms / 1e6 if h2d_ms else None,
+            "d2h_ms": d2h_ms,
+            "h2d_ms": h2d_ms,
+            # The copy back: the part the compute stream waited for, and the rest, which ran under compute.
+            "stall_ms": stall_ms,
+            "h2d_hidden_ms": max(h2d_ms - stall_ms, 0.0),
+            "pinned_gib": self._pool.allocated_bytes / GIB if self._pool else 0.0,
+            "layers": layers,
+            # One entry per decision that swapped something.
+            "evictions": self._evictions,
         }
-        self._layers, self._swapped = [], []
-        return summary
+        self._write(record, rank)
+        self._layers, self._swapped, self._evictions = [], [], []
+        return record
+
+    def close(self) -> None:
+        """Close this rank's file."""
+        if self._file is not None:
+            self._file.close()
+            self._file = None
 
     # -- forward ---------------------------------------------------------------
 
@@ -322,6 +367,15 @@ class EPHostSwap:
             self._evict(item, chosen)
             if evicted >= need:
                 break
+        self._evictions.append({
+            "after_layer": layer.index,
+            "expected_layers": self._expected_layers,
+            "budget_gib": budget / GIB,
+            "threshold_gib": threshold / GIB,
+            "held_gib": held / GIB,
+            "need_gib": need / GIB,
+            "evicted_gib": evicted / GIB,
+        })
 
     def _evict(self, layer: _Layer, chosen: list[_Saved]) -> None:
         """Copy whole saved tensors of one layer to host and release their device memory."""
@@ -337,10 +391,12 @@ class EPHostSwap:
         else:
             self._copy_stream.wait_stream(self._device.current_stream())
             with self._device.stream(self._copy_stream):
+                start = self._event()
                 for saved in chosen:
                     self._to_host(saved)
                     # The allocator keeps the block until the copy stream is done with it.
                     saved.device.record_stream(self._copy_stream)
+                layer.d2h_rounds.append((start, self._event()))
         for saved in chosen:
             saved.device = None
         if layer not in self._swapped:
@@ -386,10 +442,10 @@ class EPHostSwap:
         # the compute stream's earlier work on those blocks.
         self._copy_stream.wait_stream(self._device.current_stream())
         with self._device.stream(self._copy_stream):
+            layer.events["h2d_start"] = self._event()
             for saved in layer.swapped:
                 self._from_host(saved)
-            layer.loaded = self._device.Event()
-            layer.loaded.record()
+            layer.events["loaded"] = self._event()
 
     def _from_host(self, saved: _Saved) -> None:
         """Copy a tensor back from host and return the pinned buffer to the pool.
@@ -403,12 +459,16 @@ class EPHostSwap:
         saved.host = None
 
     def _wait(self, layer: _Layer) -> None:
-        """Make the compute stream wait for a layer's copy back, once."""
+        """Make the compute stream wait for a layer's copy back, once, timing the wait."""
         if layer.waited:
             return
         layer.waited = True
-        if self._copy_stream is not None:
-            self._device.current_stream().wait_event(layer.loaded)
+        if self._copy_stream is None:
+            return
+        compute = self._device.current_stream()
+        layer.events["stall_start"] = self._event(compute)
+        compute.wait_event(layer.events["loaded"])
+        layer.events["stall_end"] = self._event(compute)
 
     def _prefetch_below(self, layer: _Layer) -> None:
         """Start copying back the layer just below this one, if it was swapped.
@@ -431,6 +491,58 @@ class EPHostSwap:
     def _device_name(self) -> str:
         """The device new tensors go to."""
         return "cpu" if self._device is None else f"{get_device_type()}:{self._device.current_device()}"
+
+    def _event(self, stream: Any = None) -> Any:
+        """Record a timing event on ``stream``, or on the current stream."""
+        event = self._device.Event(enable_timing=True)
+        event.record(stream) if stream is not None else event.record()  # pylint: disable=expression-not-assigned
+        return event
+
+    @staticmethod
+    def _elapsed(events: dict, start: str, end: str) -> Optional[float]:
+        """Milliseconds between two recorded events, or None when either is missing."""
+        if start not in events or end not in events:
+            return None
+        return events[start].elapsed_time(events[end])
+
+    @staticmethod
+    def _d2h_ms(layer: _Layer) -> Optional[float]:
+        """Milliseconds of every copy of the layer to host, or None when none was timed."""
+        if not layer.d2h_rounds:
+            return None
+        return sum(start.elapsed_time(end) for start, end in layer.d2h_rounds)
+
+    def _layer_record(self, layer: _Layer) -> dict:
+        """The JSON-friendly summary of one swapped layer."""
+        h2d_ms = self._elapsed(layer.events, "h2d_start", "loaded")
+        stall_ms = self._elapsed(layer.events, "stall_start", "stall_end")
+        return {
+            "index": layer.index,
+            "rows": layer.rows,
+            "saved": [[list(saved.shape), str(saved.dtype), saved.nbytes] for saved in layer.saved],
+            "moved": [list(saved.shape) for saved in layer.swapped],
+            "swapped_bytes": layer.swapped_bytes,
+            "d2h_ms": self._d2h_ms(layer),
+            "h2d_ms": h2d_ms,
+            "stall_ms": stall_ms,
+            "h2d_hidden_ms": None if h2d_ms is None or stall_ms is None else max(h2d_ms - stall_ms, 0.0),
+            "loaded": layer.loading,
+            "prefetched": layer.prefetched,
+        }
+
+    def _write(self, record: dict, rank: int) -> None:
+        """Append one record to this rank's file, which a run starts afresh, as the EP instrument does."""
+        if not self.output_dir:
+            return
+        if self._file is None:
+            os.makedirs(self.output_dir, exist_ok=True)
+            path = os.path.join(self.output_dir, f"host_swap_rank{rank}.jsonl")
+            self._file = open(path, "w", encoding="utf-8")  # pylint: disable=consider-using-with
+            header = {"header": True, "host": socket.gethostname(), "rank": rank,
+                      "budget_layers": self.budget_layers}
+            self._file.write(json.dumps(header) + "\n")
+        self._file.write(json.dumps(record) + "\n")
+        self._file.flush()
 
 
 HOST_SWAP = EPHostSwap()

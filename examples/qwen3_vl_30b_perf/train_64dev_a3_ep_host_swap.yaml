@@ -235,6 +235,4 @@ ep_host_swap:
   # layers first. 5.4 of 6 layers is 0.9 per layer; 1.0 to 0.3 per layer was
   # the useful range on 16 A3 dies.
   budget_layers: 5.4
-  # Index tensors (8 bytes per pair) stay on device.
-  min_row_bytes: 1024
   output_dir: /home/pl/runs/qwen3_vl_30b_perf/a3_64dev_swap/ep_host_swap

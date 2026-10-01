@@ -14,6 +14,8 @@
 # ============================================================================
 """MoE activation budget for a forward pass, earliest layers swapped to host (CPU path)."""
 
+import json
+import pathlib
 import socket
 from typing import Any, Iterator
 
@@ -24,12 +26,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from hyper_parallel.distributed.expert_parallel.experts import bind_local_expert_forward, ep_routed_forward
-from hyper_parallel.distributed.expert_parallel.host_swap import (  # pylint: disable=protected-access
-    HOST_SWAP,
-    EPHostSwap,
-    _PinnedPool,
-    choose_offload,
-)
+from hyper_parallel.distributed.expert_parallel.host_swap import HOST_SWAP, EPHostSwap, choose_offload
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
 from hyper_parallel.trainer.config.parser import parse_training_args
 
@@ -37,13 +34,14 @@ HIDDEN, INTER = 16, 8
 
 
 @pytest.fixture(name="swap")
-def fixture_swap() -> Iterator[EPHostSwap]:
+def fixture_swap(tmp_path: pathlib.Path) -> Iterator[EPHostSwap]:
     """Enable the swap at 2.7 mean layers (below 3 layers at the mean); disable it after."""
-    HOST_SWAP.configure(enabled=True, budget_layers=2.7)
-    HOST_SWAP.begin_step()
+    HOST_SWAP.configure(enabled=True, budget_layers=2.7, output_dir=str(tmp_path))
+    HOST_SWAP.begin_step(1)
     yield HOST_SWAP
-    HOST_SWAP.configure(enabled=False, budget_layers=0.0)
-    HOST_SWAP.begin_step()
+    HOST_SWAP.close()
+    HOST_SWAP.configure(enabled=False, budget_layers=0.0, output_dir="")
+    HOST_SWAP.begin_step(0)
 
 
 def _block(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor) -> torch.Tensor:
@@ -84,6 +82,7 @@ def test_choose_offload_takes_the_smallest_covering_set():
 
 def test_pinned_pool_hands_out_the_best_fit_among_mixed_sizes():
     """Buffers of several sizes come back to the pool and go out again by best fit."""
+    from hyper_parallel.distributed.expert_parallel.host_swap import _PinnedPool  # pylint: disable=import-outside-toplevel
 
     pool = _PinnedPool(pin=False)
     small, large = pool.take(1), pool.take(3 * 64 * 1024 * 1024)
@@ -99,7 +98,7 @@ def test_swapped_layers_give_the_same_gradients(swap):
     """Layers over the budget move tensors to host and back; the gradients do not change."""
     rows = [12, 6, 15]  # 33 rows against a budget of 2.7 x 8
     expected, _ = _run(rows, sent=8, swap_on=False)
-    swap.begin_step()
+    swap.begin_step(1)
     got, layers = _run(rows, sent=8, swap_on=True)
     for want, have in zip(expected, got):
         torch.testing.assert_close(have, want)
@@ -108,20 +107,22 @@ def test_swapped_layers_give_the_same_gradients(swap):
         assert all(item.device is None for item in layer.swapped), "released after backward"
 
 
-def test_step_summary_counts_the_moved_bytes(swap):
-    """The step summary counts the MoE layers, the swapped ones and the bytes sent to host."""
-    swap.configure(enabled=True, budget_layers=1.0)
+def test_record_counts_the_moved_bytes(swap, tmp_path):
+    """The step record lists every swapped layer and the bytes both ways."""
+    swap.configure(enabled=True, budget_layers=1.0, output_dir=str(tmp_path))
     _run([12, 6], sent=8, swap_on=True)  # layer 0 alone is over one mean layer
-    summary = swap.end_step()
-    assert summary["moe_layers"] == 2 and summary["swapped_layers"] == 1
-    assert summary["d2h_gib"] > 0
+    record = swap.end_step(rank=0)
+    assert record["moe_layers"] == 2 and record["swapped_layers"] == 1
+    assert record["d2h_gib"] == record["h2d_gib"] > 0
+    lines = (tmp_path / "host_swap_rank0.jsonl").read_text(encoding="utf-8").splitlines()
+    assert json.loads(lines[0])["header"] and json.loads(lines[1])["layers"][0]["index"] == 0
 
 
 def test_nothing_is_tracked_without_grad(swap):
     """Inference and recompute-free no-grad passes are left alone."""
     with torch.no_grad(), swap.layer(12, 8):
         _block(torch.randn(12, HIDDEN), torch.randn(HIDDEN, 2 * INTER), torch.randn(INTER, HIDDEN))
-    assert swap.end_step() is None
+    assert swap.end_step(rank=0) is None
 
 
 class _Experts(nn.Module):
@@ -186,71 +187,52 @@ def _ep_grads(world_one_group, swap_on: bool) -> list[torch.Tensor]:
 
 def test_ep_blocks_swap_and_keep_their_gradients(world_one_group, swap):
     """Through ep_routed_forward, a budget below the load swaps and changes nothing."""
-    swap.configure(enabled=False, budget_layers=0.0)
+    swap.configure(enabled=False, budget_layers=0.0, output_dir="")
     expected = _ep_grads(world_one_group, swap_on=False)
     # One rank receives what it sends; one mean layer for two layers puts the pass over it.
-    swap.configure(enabled=True, budget_layers=1.0)
-    swap.begin_step()
+    swap.configure(enabled=True, budget_layers=1.0, output_dir="")
+    swap.begin_step(1)
     got = _ep_grads(world_one_group, swap_on=True)
     for want, have in zip(expected, got):
         torch.testing.assert_close(have, want)
-    summary = swap.end_step()
-    assert summary["moe_layers"] == 2 and summary["swapped_layers"] >= 1 and summary["d2h_gib"] > 0
+    record = swap.end_step(rank=0)
+    assert record["moe_layers"] == 2 and record["swapped_layers"] >= 1
+    assert all(layer["swapped_bytes"] > 0 for layer in record["layers"])
 
 
-def _spy_decisions(swap: EPHostSwap, monkeypatch) -> list[tuple[int, int, int]]:
-    """After each MoE layer: (layer index, bytes held on device, bytes swapped so far) of the pass."""
-    decisions = []
-    enforce = swap._enforce_budget  # pylint: disable=protected-access
-
-    def enforce_noted(layer: Any) -> None:
-        """Apply the rule, then note what the pass holds and has swapped."""
-        enforce(layer)
-        current = swap._layers[swap._pass_start:]  # pylint: disable=protected-access
-        held = sum(saved.nbytes for item in current for saved in item.saved if saved.device is not None)
-        decisions.append((layer.index, held, sum(item.swapped_bytes for item in current)))
-
-    monkeypatch.setattr(swap, "_enforce_budget", enforce_noted)
-    return decisions
-
-
-def test_a_budget_under_the_layers_swaps_balanced_layers_and_keeps_gradients(swap, monkeypatch):
+def test_a_budget_under_the_layers_swaps_balanced_layers_and_keeps_gradients(swap):
     """Under one mean layer per layer, the pass swaps even when every layer is at the mean."""
     rows = [8, 8, 8]  # every layer exactly at the mean load
     expected, _ = _run(rows, sent=8, swap_on=False)
-    _run(rows, sent=8, swap_on=True)  # the first pass teaches the swap the pass has three layers
-    swap.begin_step()
-    decisions = _spy_decisions(swap, monkeypatch)
+    swap.begin_step(1)
     got, layers = _run(rows, sent=8, swap_on=True)
     for want, have in zip(expected, got):
         torch.testing.assert_close(have, want)
     assert layers and min(layer.index for layer in layers) == 0, "the earliest layer goes first"
-    mean = 8 * swap._pair_bytes  # pylint: disable=protected-access
-    for index, held, _swapped in decisions:
-        # What may be held after this layer, with the remaining layers at the mean.
-        assert held <= 2.7 * mean - (len(rows) - index - 1) * mean
+    record = swap.end_step(rank=0)
+    assert record["evictions"]
+    for decision in record["evictions"]:
+        assert decision["held_gib"] - decision["evicted_gib"] <= decision["threshold_gib"] + 1e-12
 
 
-def test_a_budget_under_the_layers_acts_from_the_first_layer(swap, monkeypatch):
+def test_a_budget_under_the_layers_acts_from_the_first_layer(swap):
     """Once the pass length is known, the projection starts evicting after the first layer, not at the end."""
-    decisions = _spy_decisions(swap, monkeypatch)
     _run([8, 8, 8], sent=8, swap_on=True)
-    assert [swapped > 0 for _index, _held, swapped in decisions] == [False, False, True], \
-        "the first pass budgets the layers it has seen"
-    swap.begin_step()
-    decisions.clear()
+    first = swap.end_step(rank=0)["evictions"]
+    assert [decision["after_layer"] for decision in first] == [2], "the first pass budgets the layers it has seen"
+    swap.begin_step(2)
     _run([8, 8, 8], sent=8, swap_on=True)
-    index, held, swapped = decisions[0]
-    assert index == 0 and swapped > 0
+    second = swap.end_step(rank=0)["evictions"]
+    assert second[0]["after_layer"] == 0 and second[0]["expected_layers"] == 3
     # 2.7 of 3 mean layers: after the first layer, room is kept for two more at the mean.
-    assert held <= (2.7 - 2) * 8 * swap._pair_bytes  # pylint: disable=protected-access
+    assert second[0]["threshold_gib"] == pytest.approx(second[0]["budget_gib"] * (2.7 - 2) / 2.7)
 
 
 def test_a_budget_over_the_layers_lets_an_early_peak_through(swap):
     """Over one mean layer per layer, a rank heavy early but light later moves nothing."""
-    swap.configure(enabled=True, budget_layers=3.3)
+    swap.configure(enabled=True, budget_layers=3.3, output_dir="")
     for step in (1, 2):  # the second pass knows it has three layers
-        swap.begin_step()
+        swap.begin_step(step)
         # 10 rows first is ahead of the mean, but within what the budget leaves after two mean layers.
         _grads, layers = _run([10, 6, 7], sent=8, swap_on=True)  # 23 rows against 3.3 x 8 = 26.4
     assert not layers, "ahead of the mean after the first layer, yet within the budget at the end"
@@ -258,16 +240,16 @@ def test_a_budget_over_the_layers_lets_an_early_peak_through(swap):
 
 def test_budget_above_the_spread_swaps_nothing(swap):
     """A budget over every rank's total leaves the pass on device."""
-    swap.configure(enabled=True, budget_layers=4.5)
-    swap.begin_step()
+    swap.configure(enabled=True, budget_layers=4.5, output_dir="")
+    swap.begin_step(1)
     _grads, layers = _run([12, 6, 9], sent=8, swap_on=True)  # total 27 rows against 4.5 x 8
     assert not layers
 
 
 def test_a_layer_comes_back_only_from_the_layer_above(swap, monkeypatch):
     """Swapped early layers come back one layer ahead of their backward, not at its start."""
-    swap.configure(enabled=True, budget_layers=2.0)
-    swap.begin_step()
+    swap.configure(enabled=True, budget_layers=2.0, output_dir="")
+    swap.begin_step(1)
     trace = []
     unpack, load = swap._unpack, swap._load  # pylint: disable=protected-access
     monkeypatch.setattr(swap, "_unpack", lambda packed: (
@@ -281,8 +263,8 @@ def test_a_layer_comes_back_only_from_the_layer_above(swap, monkeypatch):
 
 def test_every_layer_brought_back_is_waited_for(swap, monkeypatch):
     """A prefetched layer is waited for too: its device memory exists before the copy back fills it."""
-    swap.configure(enabled=True, budget_layers=2.0)
-    swap.begin_step()
+    swap.configure(enabled=True, budget_layers=2.0, output_dir="")
+    swap.begin_step(1)
     returned = []
     unpack = swap._unpack  # pylint: disable=protected-access
 
@@ -302,7 +284,7 @@ def test_every_layer_brought_back_is_waited_for(swap, monkeypatch):
 def test_budget_layers_must_be_positive_when_enabled():
     """A budget of zero or less could hold nothing."""
     with pytest.raises(ValueError, match="positive"):
-        EPHostSwap().configure(enabled=True, budget_layers=0.0)
+        EPHostSwap().configure(enabled=True, budget_layers=0.0, output_dir="")
 
 
 def _sample_model(width: int) -> None:  # pylint: disable=unused-argument

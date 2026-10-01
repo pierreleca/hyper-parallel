@@ -110,6 +110,8 @@ class EPHostSwapConfig:
     enabled: bool = False
     # Mean layers of MoE activations a rank may keep; required when enabled.
     budget_layers: float = 0.0
+    # When set, one JSON Lines file per rank: evictions, bytes moved, copy times and waits per step.
+    output_dir: str = ""
 
     def __post_init__(self) -> None:
         """Reject a budget that cannot hold anything."""
