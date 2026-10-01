@@ -1,12 +1,13 @@
-# 64 dies, 8 text layers: a no-swap baseline, the budget from 1.1 down to 0.2 mean
-# layers per layer (8.8 down to 1.6 of 8), and a profiled pair. At 8 layers a
-# no-swap run sits near the die's limit, so the budget decides the headroom; the
-# budgets match the one-node sweep. Every run routes like the baseline (full
-# determinism), so the reports compare step by step.
-# Reads the 1280-sample dataset, built once per node (A3_RUNS.md, "64 dies, four nodes").
+# 64 dies, 8 text layers, 8192 tokens, no activation recompute (what the probe found
+# to fit; 16384 tokens runs out of memory without recompute): a no-swap baseline, the
+# budget from 1.1 down to 0.2 mean layers per layer (8.8 down to 1.6 of 8), and a
+# profiled pair. Every run routes like the baseline (full determinism), so the
+# reports compare step by step. Reads the 8192-token dataset built once per node.
 CONFIG=examples/qwen3_vl_30b_perf/train_64dev_a3_ep_host_swap.yaml
 BASELINE=noswap
-LAYERS="--model.num_hidden_layers=8"
+LAYERS="--model.num_hidden_layers=8 \
+--dataset.data_path=/home/pl/data/qwen3_vl_30b_perf/cauldron_seq8192_n1280/vlm_conversations.json \
+--dataset.data_transform.max_seq_len=8192"
 PROFILE="--training.train_iters=10 --ep_instrument.enabled=false --profiling.enabled=true --profiling.rank=-1 \
 --profiling.start_step=6 --profiling.end_step=10"
 RUNS=(
