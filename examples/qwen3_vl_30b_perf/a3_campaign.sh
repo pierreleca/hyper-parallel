@@ -17,6 +17,10 @@
 # control node, and analyse every run.
 #
 #   examples/qwen3_vl_30b_perf/a3_campaign.sh <plan.sh>
+#   examples/qwen3_vl_30b_perf/a3_campaign.sh --summarize <campaign dir>
+#
+# --summarize redoes steps 3 and 4 below for a campaign that was stopped before its
+# end, from the runs it analysed (a run with records or a trace report counts as finished).
 #
 # Before it: select the nodes (cluster select), deploy the code to them and to the
 # control node, and build the dataset CONFIG reads on every node (A3_RUNS.md); run
@@ -48,7 +52,12 @@
 #   quotes their first error and, with debug.check_nan_inf, the first non-finite gradient.
 set -euo pipefail
 
-[[ $# -eq 1 ]] || { echo "usage: $0 <plan.sh>" >&2; exit 2; }
+SUMMARIZE=""
+if [[ $# -eq 2 && "$1" == "--summarize" ]]; then
+  SUMMARIZE="$(realpath "$2")"
+  set -- "$SUMMARIZE/plan.sh"
+fi
+[[ $# -eq 1 ]] || { echo "usage: $0 <plan.sh> | --summarize <campaign dir>" >&2; exit 2; }
 PLAN="$(realpath "$1")"
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # this checkout's analysis scripts
 # shellcheck source=/dev/null
@@ -72,17 +81,35 @@ first_line() {  # first_line <dir> <extended regex>
   grep -h -m1 -E "$2" "$1/log.txt" 2>/dev/null | grep -v ERR99999 | cut -c1-220
 }
 
-CAMPAIGN="$(basename "$PLAN" .sh)_$(date +%Y%m%d_%H%M%S)"
-OUT="$OUT_BASE/$CAMPAIGN"
+if [[ -n "$SUMMARIZE" ]]; then
+  OUT="$SUMMARIZE"
+  CAMPAIGN="$(basename "$OUT")"
+else
+  CAMPAIGN="$(basename "$PLAN" .sh)_$(date +%Y%m%d_%H%M%S)"
+  OUT="$OUT_BASE/$CAMPAIGN"
+fi
 mkdir -p "$OUT/raw"
 exec > >(tee -a "$OUT/campaign.log") 2>&1
 read -r -a CL <<< "${CLUSTER:-cluster}"
+states=()
+if [[ -n "$SUMMARIZE" ]]; then
+  for entry in "${RUNS[@]}"; do
+    name="${entry%% *}"
+    if [[ -d "$OUT/$name/instrument" || -f "$OUT/$name/trace.txt" ]]; then
+      states+=("$name: finished")
+    elif [[ -f "$OUT/$name/log.txt" ]]; then
+      error="$(first_line "$OUT/$name" 'OutOfMemoryError|[A-Za-z]+(Error|Exception): ' || true)"
+      states+=("$name: FAILED: ${error:-no error line in $OUT/$name/log.txt}")
+    else
+      states+=("$name: not run (no records)")
+    fi
+  done
+else
 echo "campaign $CAMPAIGN: ${#RUNS[@]} run(s), $CONFIG; output in $OUT"
 echo "code: $(git -C "$TOOLS" rev-parse --short HEAD 2>/dev/null || echo "not a git checkout") at $TOOLS"
 cp "$PLAN" "$OUT/plan.sh"
 
 # 1 and 2. The runs, each analysed before the next starts.
-states=()
 for entry in "${RUNS[@]}"; do
   read -r -a words <<< "$entry"
   name="${words[0]}"
@@ -147,6 +174,8 @@ for entry in "${RUNS[@]}"; do
     done
   fi
 done
+
+fi
 
 # 3. The summary.
 {
