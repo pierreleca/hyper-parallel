@@ -112,6 +112,8 @@ class EPHostSwapConfig:
     budget_layers: float = 0.0
     # When set, one JSON Lines file per rank: evictions, bytes moved, copy times and waits per step.
     output_dir: str = ""
+    # Time the copies (one sync per step); off, the swap runs as shipped and records bytes only.
+    timed: bool = True
 
     def __post_init__(self) -> None:
         """Reject a budget that cannot hold anything."""

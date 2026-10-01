@@ -197,6 +197,7 @@ class EPHostSwap:
         self.enabled = False
         self.budget_layers = 0.0
         self.output_dir = ""
+        self.timed = True
         self._device = None
         self._copy_stream = None
         self._pool: Optional[_PinnedPool] = None
@@ -216,14 +217,15 @@ class EPHostSwap:
 
     # -- configuration and steps ---------------------------------------------
 
-    def configure(self, *, enabled: bool, budget_layers: float, output_dir: str = "") -> None:
-        """Set the budget in mean layers and where the per-rank records go."""
+    def configure(self, *, enabled: bool, budget_layers: float, output_dir: str = "", timed: bool = True) -> None:
+        """Set the budget in mean layers, where the per-rank records go and whether copies are timed."""
         if enabled and budget_layers <= 0:
             raise ValueError("ep_host_swap.budget_layers must be positive")
         self.enabled = enabled
         self._expected_layers = 0
         self.budget_layers = budget_layers
         self.output_dir = output_dir
+        self.timed = timed
         if not enabled:
             return
         self._device = None if get_device_type() == "cpu" else get_torch_device()
@@ -241,10 +243,14 @@ class EPHostSwap:
         self._evictions = []
 
     def end_step(self, rank: int) -> Optional[dict]:
-        """Resolve the step's copy timings, append its record and return it."""
+        """Resolve the step's copy timings, append its record and return it.
+
+        Untimed (``timed=False``), nothing is synchronized, as in the shipped swap;
+        the record then carries no times.
+        """
         if not self.enabled or not self._layers:
             return None
-        if self._copy_stream is not None:
+        if self._copy_stream is not None and self.timed:
             self._copy_stream.synchronize()
             self._device.current_stream().synchronize()
         layers = [self._layer_record(layer) for layer in self._swapped]
@@ -391,12 +397,13 @@ class EPHostSwap:
         else:
             self._copy_stream.wait_stream(self._device.current_stream())
             with self._device.stream(self._copy_stream):
-                start = self._event()
+                start = self._event() if self.timed else None
                 for saved in chosen:
                     self._to_host(saved)
                     # The allocator keeps the block until the copy stream is done with it.
                     saved.device.record_stream(self._copy_stream)
-                layer.d2h_rounds.append((start, self._event()))
+                if self.timed:
+                    layer.d2h_rounds.append((start, self._event()))
         for saved in chosen:
             saved.device = None
         if layer not in self._swapped:
@@ -442,7 +449,8 @@ class EPHostSwap:
         # the compute stream's earlier work on those blocks.
         self._copy_stream.wait_stream(self._device.current_stream())
         with self._device.stream(self._copy_stream):
-            layer.events["h2d_start"] = self._event()
+            if self.timed:
+                layer.events["h2d_start"] = self._event()
             for saved in layer.swapped:
                 self._from_host(saved)
             layer.events["loaded"] = self._event()
@@ -466,6 +474,9 @@ class EPHostSwap:
         if self._copy_stream is None:
             return
         compute = self._device.current_stream()
+        if not self.timed:
+            compute.wait_event(layer.events["loaded"])
+            return
         layer.events["stall_start"] = self._event(compute)
         compute.wait_event(layer.events["loaded"])
         layer.events["stall_end"] = self._event(compute)
@@ -494,7 +505,8 @@ class EPHostSwap:
 
     def _event(self, stream: Any = None) -> Any:
         """Record a timing event on ``stream``, or on the current stream."""
-        event = self._device.Event(enable_timing=True)
+        # Untimed, as in the shipped swap: one plain event per layer brought back.
+        event = self._device.Event(enable_timing=self.timed)
         event.record(stream) if stream is not None else event.record()  # pylint: disable=expression-not-assigned
         return event
 

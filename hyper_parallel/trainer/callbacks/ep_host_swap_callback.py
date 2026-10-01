@@ -35,6 +35,7 @@ class EPHostSwapCallback(Callback):
             enabled=self.config.enabled,
             budget_layers=self.config.budget_layers,
             output_dir=self.config.output_dir,
+            timed=self.config.timed,
         )
 
     def on_train_begin(self, state: TrainerState, **kwargs: Any) -> None:
