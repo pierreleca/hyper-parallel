@@ -1,8 +1,8 @@
 # 64 dies, 8 text layers, 8192 tokens, no activation recompute (what the probe found
 # to fit; 16384 tokens runs out of memory without recompute): a no-swap baseline, the
-# budget from 1.1 down to 0.2 mean layers per layer (8.8 down to 1.6 of 8); the
-# profiled pair is plans/profile_64dev.sh. Every run routes like the baseline (full
-# determinism), so the reports compare step by step. Reads the 8192-token dataset built once per node.
+# budget from 1.1 down to 0.2 mean layers per layer (8.8 down to 1.6 of 8). Every
+# run routes like the baseline (full determinism), so the reports compare step by
+# step. Reads the 8192-token dataset built once per node.
 CONFIG=examples/qwen3_vl_30b_perf/train_64dev_a3_ep_host_swap.yaml
 BASELINE=noswap
 LAYERS="--model.num_hidden_layers=8 \
