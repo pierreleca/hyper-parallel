@@ -256,7 +256,7 @@ def draw_sweep(results: dict, out: str) -> None:
     for x, (_budget, row) in zip(xs[1:], rows):
         if row["exposed_max"] >= 1.0:
             twin.annotate(f"{row['exposed_max']:.0f} ms\nwaited", (x, times[x]), textcoords="offset points",
-                          xytext=(-12, 4), ha="right", fontsize=7, color=RED)
+                          xytext=(0, 8), ha="center", fontsize=7, color=RED)
     right.set_title("What the copies cost", fontsize=9)
     handles = right.get_legend_handles_labels()[0] + twin.get_legend_handles_labels()[0]
     names = right.get_legend_handles_labels()[1] + twin.get_legend_handles_labels()[1]

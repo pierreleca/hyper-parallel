@@ -17,8 +17,9 @@
 A campaign directory (``a3_campaign.sh``) is too large to copy off the cluster;
 this keeps, rounded, what the results and the figures are drawn from:
 
-* ``runs``: per run its state, overrides, budget and text layers, and its sweep row
-  (memory peaks, step time, bytes moved, copy back waited for, pinned memory, routing);
+* ``runs``: per run its state, overrides, budget and text layers, its sweep row
+  (memory peaks, step time, bytes moved, copy back waited for, pinned memory, routing)
+  and its routing comparison with the baseline;
 * ``baseline_tables``: from the no-swap run, received pairs and memory peaks per
   (step, rank); at the step and rank that received the most, every rank's pairs and
   retained MoE memory per layer;
@@ -183,6 +184,12 @@ def export(campaign: str, skip: int) -> dict[str, Any]:
         }
         if os.path.isdir(os.path.join(run_dir, "instrument")):
             entry["sweep"] = sweep_row(run_dir, skip)
+        compare = os.path.join(run_dir, "compare.txt")
+        if os.path.exists(compare):
+            with open(compare, encoding="utf-8") as stream:
+                # The routing verdict against the baseline: how many records differ, and where first.
+                entry["compare"] = " ".join(line.strip() for line in stream
+                                            if "differ" in line or "route identically" in line)[:300]
         result["runs"][name] = entry
         profile = profile_summary(run_dir)
         if profile:
