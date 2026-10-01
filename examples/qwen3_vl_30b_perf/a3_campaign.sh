@@ -36,7 +36,8 @@
 #      into one directory, and runs the reports: the EP instrument report (with
 #      the swap activity), the routing comparison with BASELINE, the rule replay
 #      on no-swap runs, the trace report on the nodes for profiled runs;
-#   3. writes SUMMARY.txt with each run's state and, over all runs, the sweep.
+#   3. writes SUMMARY.txt with each run's state and, over all runs, the sweep;
+#   4. distils the campaign into results.json (export_results.py), the one file to send.
 #
 # Everything lands in $OUT_BASE/<campaign>/ on the control node; paste SUMMARY.txt
 # and the reports it points to. Environment knobs (defaults in brackets):
@@ -136,6 +137,14 @@ for entry in "${RUNS[@]}"; do
   if [[ " ${overrides[*]} " == *" --profiling.enabled=true "* ]]; then
     "${CL[@]}" exec -p "python examples/qwen3_vl_30b_perf/analyze_npu_trace.py $remote/profile --ranks" \
       > "$local_dir/trace.txt" 2>&1 || states+=("$name: trace report failed")
+    # Each node's per-rank summary, small enough to keep: <run>/profile/node<N>.json.
+    "${CL[@]}" gather "$remote/profile/analysis_ranks" "$OUT/raw/$name" > /dev/null 2>&1 || true
+    mkdir -p "$local_dir/profile"
+    for summary in "$OUT/raw/$name"/node*/analysis_ranks/ranks.json; do
+      [[ -f "$summary" ]] || continue
+      node="${summary#"$OUT/raw/$name/"}"
+      cp "$summary" "$local_dir/profile/${node%%/*}.json"
+    done
   fi
 done
 
@@ -156,3 +165,5 @@ done
   echo
   echo "reports: $OUT/<run>/{report,compare,replay,trace}.txt"
 } | tee "$OUT/SUMMARY.txt"
+# 4. The figures' and the results' data, small enough to send: results.json.
+python3 "$TOOLS/export_results.py" "$OUT" 2>&1 | tee -a "$OUT/SUMMARY.txt" || true
