@@ -316,7 +316,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("results", help="the sweep campaign's results.json")
     parser.add_argument("--depth", default=None, help="the depth campaign's results.json")
-    parser.add_argument("--budgets", default="8,3.2", help="budget_layers of the two mechanism panels")
+    parser.add_argument("--budgets", default="8.8,3.2", help="budget_layers of the two mechanism panels")
     parser.add_argument("--out-dir", default="docs/images", help="where the PNGs go")
     args = parser.parse_args()
     with open(args.results, encoding="utf-8") as stream:
