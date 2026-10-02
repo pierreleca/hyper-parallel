@@ -356,13 +356,15 @@ def convert(args: argparse.Namespace) -> ConversionStats:
         while True:
             urls = [f"images/{sample_id}_{index}.jpg" for index in range(len(payloads))]
             cost = predict_cost(processor, build_messages(conversation, urls), payloads)
-            if cost.total_tokens <= args.max_seq_len:
+            # The margin absorbs small prediction error: the transform raises on
+            # an over-long sample, so a borderline keep would fail in training.
+            if cost.total_tokens <= args.max_seq_len - args.length_margin:
                 break
             if not payloads or not args.trim_images:
                 break
             payloads.pop()
             stats.images_dropped += 1
-        if cost.total_tokens > args.max_seq_len:
+        if cost.total_tokens > args.max_seq_len - args.length_margin:
             stats.dropped_oversize += 1
             continue
 
@@ -417,16 +419,23 @@ def convert(args: argparse.Namespace) -> ConversionStats:
 
 
 def verify(args: argparse.Namespace, count: int) -> None:
-    """Re-encode the first samples through the real transform and compare costs.
+    """Re-encode samples through the real transform and compare the prediction.
+
+    Mismatches are reported with the text/image split on both sides, because
+    which side is wrong is what identifies the cause, and all of them are
+    checked before failing so the rate and pattern are visible at once.
 
     Args:
         args: Parsed command-line arguments.
         count: Number of samples to re-encode.
 
     Raises:
-        SystemExit: If a predicted length does not match the encoded length.
+        SystemExit: If any predicted length does not match the encoded length.
     """
     # Imported here so a conversion-only run does not pay for the transform.
+    from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (  # pylint: disable=C0415
+        TEXT,
+    )
     from hyper_parallel.models.deepseek_v41.adapter.data.transform_fn import (  # pylint: disable=C0415
         build_deepseek_v41_omni_transform,
     )
@@ -436,7 +445,11 @@ def verify(args: argparse.Namespace, count: int) -> None:
     processor = build_deepseek_v41_processor(config_path=args.model_dir)
     transform = build_deepseek_v41_omni_transform(processor=processor, max_seq_len=args.max_seq_len)
     with (output_dir / "cost_manifest.csv").open(encoding="utf-8", newline="") as manifest_file:
-        costs = {row["id"]: int(row["total_tokens"]) for row in csv.DictReader(manifest_file)}
+        predicted_rows = {
+            row["id"]: (int(row["text_tokens"]), int(row["image_tokens"]), int(row["num_images"]))
+            for row in csv.DictReader(manifest_file)
+        }
+    mismatches = []
     with jsonl_path.open(encoding="utf-8") as jsonl_file:
         for line_index, line in enumerate(jsonl_file):
             if line_index >= count:
@@ -444,13 +457,26 @@ def verify(args: argparse.Namespace, count: int) -> None:
             record = json.loads(line)
             record["__online_source_path__"] = str(jsonl_path)
             encoded = transform.encode_sample(record)
-            actual = int(encoded["input_ids"].shape[-1])
-            predicted = costs[record["id"]]
-            if actual != predicted:
-                raise SystemExit(
-                    f"cost prediction mismatch for {record['id']}: predicted {predicted}, encoded {actual}"
-                )
-            print(f"verified {record['id']}: {actual} tokens")
+            token_types = encoded["token_types"]
+            actual_image = int((token_types != TEXT).sum())
+            actual_text = int((token_types == TEXT).sum())
+            text_tokens, image_tokens, num_images = predicted_rows[record["id"]]
+            if (actual_text, actual_image) == (text_tokens, image_tokens):
+                print(f"verified {record['id']}: {actual_text + actual_image} tokens")
+                continue
+            mismatches.append(record["id"])
+            print(
+                f"MISMATCH {record['id']} ({num_images} images): "
+                f"text predicted {text_tokens} vs encoded {actual_text} "
+                f"(delta {actual_text - text_tokens}); "
+                f"image predicted {image_tokens} vs encoded {actual_image} "
+                f"(delta {actual_image - image_tokens})"
+            )
+    if mismatches:
+        raise SystemExit(
+            f"cost prediction mismatched on {len(mismatches)} of {min(count, line_index + 1)} samples: "
+            + ", ".join(mismatches[:10])
+        )
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -468,6 +494,17 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="0 keeps every converted sample — the whole corpus, which takes a while; cap it for a first run",
     )
     parser.add_argument("--progress-every", type=int, default=500, help="rows between progress lines; 0 silences")
+    parser.add_argument(
+        "--length-margin",
+        type=int,
+        default=8,
+        help="tokens of slack kept below --max-seq-len, absorbing prediction error",
+    )
+    parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="check an existing output directory without reconverting",
+    )
     parser.add_argument("--num-valid-samples", type=int, default=0)
     parser.add_argument("--max-images-per-sample", type=int, default=8)
     parser.add_argument(
@@ -484,9 +521,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> None:
     """Convert the corpus and optionally verify the cost prediction."""
     args = _parse_args(argv)
-    convert(args)
-    if args.verify:
-        verify(args, args.verify)
+    if not args.verify_only:
+        convert(args)
+    if args.verify or args.verify_only:
+        verify(args, args.verify or 20)
 
 
 if __name__ == "__main__":
