@@ -116,12 +116,17 @@ def _plain(text: str) -> str:
     return text.strip().replace("<image>", "[image]").replace("<video>", "[video]")
 
 
-def read_conversations(parquet_dir: Path, subsets: Sequence[str]) -> Iterator[Conversation]:
+def read_conversations(parquet_dir: Path, subsets: Sequence[str], batch_size: int = 64) -> Iterator[Conversation]:
     """Stream conversations from the configured Parquet subsets.
+
+    Rows are read in batches rather than whole-column, because these files
+    carry image bytes inline: materialising a whole 292 MB subset as Python
+    objects costs multiple gigabytes, while a batch costs megabytes.
 
     Args:
         parquet_dir: Directory holding the downloaded Parquet files.
         subsets: Subset names to read, in order.
+        batch_size: Rows materialised at a time.
 
     Yields:
         One `Conversation` per corpus row that carries usable turns.
@@ -140,19 +145,22 @@ def read_conversations(parquet_dir: Path, subsets: Sequence[str]) -> Iterator[Co
             raise SystemExit(
                 f"missing Parquet file for subset {subset!r}: {path}\n"
                 + (f"the directory holds: {held}" if held is not None else "the directory does not exist")
-                + "\ncopy it there from a machine with internet access (name as above)"
+                + "\ncopy it there from a machine with internet access (name as above),"
+                + " or select the subsets you do have with --subsets"
             )
-        table = pq.read_table(path, columns=["images", "texts"])
-        images_column = table.column("images").to_pylist()
-        texts_column = table.column("texts").to_pylist()
-        for row, (images, texts) in enumerate(zip(images_column, texts_column)):
-            turns = [
-                (_plain(turn["user"]), _plain(turn["assistant"]))
-                for turn in texts or []
-                if turn.get("user") and turn.get("assistant")
-            ]
-            payloads = [image["bytes"] for image in images or [] if image and image.get("bytes")]
-            yield Conversation(subset=subset, row=row, images=payloads, turns=turns)
+        row = 0
+        for batch in pq.ParquetFile(path).iter_batches(batch_size=batch_size, columns=["images", "texts"]):
+            images_column = batch.column("images").to_pylist()
+            texts_column = batch.column("texts").to_pylist()
+            for images, texts in zip(images_column, texts_column):
+                turns = [
+                    (_plain(turn["user"]), _plain(turn["assistant"]))
+                    for turn in texts or []
+                    if turn.get("user") and turn.get("assistant")
+                ]
+                payloads = [image["bytes"] for image in images or [] if image and image.get("bytes")]
+                yield Conversation(subset=subset, row=row, images=payloads, turns=turns)
+                row += 1
 
 
 def build_messages(conversation: Conversation, image_urls: Sequence[str]) -> list[dict[str, Any]]:
@@ -328,6 +336,10 @@ def convert(args: argparse.Namespace) -> ConversionStats:
         stats.rows_read += 1
         if wanted and len(records) >= wanted:
             break
+        if args.progress_every and stats.rows_read % args.progress_every == 0:
+            # Converting a whole subset takes a while, and the JSONL is only
+            # written at the end; without this there is no sign of life.
+            print(f"read {stats.rows_read} rows, kept {stats.kept} ({conversation.subset})", flush=True)
         if not conversation.turns:
             stats.dropped_no_turns += 1
             continue
@@ -444,7 +456,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model-dir", required=True, help="DeepSeek-V4.1-Flash assets (config + tokenizer)")
     parser.add_argument("--subsets", nargs="+", default=sorted(_SUBSET_FILES), choices=sorted(_SUBSET_FILES))
     parser.add_argument("--max-seq-len", type=int, default=4096)
-    parser.add_argument("--num-train-samples", type=int, default=0, help="0 keeps every converted sample")
+    parser.add_argument(
+        "--num-train-samples",
+        type=int,
+        default=0,
+        help="0 keeps every converted sample — the whole corpus, which takes a while; cap it for a first run",
+    )
+    parser.add_argument("--progress-every", type=int, default=500, help="rows between progress lines; 0 silences")
     parser.add_argument("--num-valid-samples", type=int, default=0)
     parser.add_argument("--max-images-per-sample", type=int, default=8)
     parser.add_argument(
