@@ -450,23 +450,42 @@ def verify(args: argparse.Namespace, count: int) -> None:
     jsonl_path = output_dir / "train.jsonl"
     processor = build_deepseek_v41_processor(config_path=args.model_dir)
     transform = build_deepseek_v41_omni_transform(processor=processor, max_seq_len=args.max_seq_len)
-    with (output_dir / "cost_manifest.csv").open(encoding="utf-8", newline="") as manifest_file:
-        predicted_rows = {
-            row["id"]: (int(row["text_tokens"]), int(row["image_tokens"]), int(row["num_images"]))
-            for row in csv.DictReader(manifest_file)
-        }
+    # Read the manifest only to flag staleness. The prediction itself is
+    # recomputed from the record, so this checks the predictor rather than
+    # whatever a previous run happened to write.
+    manifest_path = output_dir / "cost_manifest.csv"
+    manifest_rows: dict[str, int] = {}
+    if manifest_path.is_file():
+        with manifest_path.open(encoding="utf-8", newline="") as manifest_file:
+            manifest_rows = {row["id"]: int(row["total_tokens"]) for row in csv.DictReader(manifest_file)}
     mismatches = []
+    stale = []
     with jsonl_path.open(encoding="utf-8") as jsonl_file:
         for line_index, line in enumerate(jsonl_file):
             if line_index >= count:
                 break
             record = json.loads(line)
             record["__online_source_path__"] = str(jsonl_path)
+            payloads = [
+                (jsonl_path.parent / block["image_url"]["url"]).read_bytes()
+                for message in record["messages"]
+                if isinstance(message.get("content"), list)
+                for block in message["content"]
+                if block.get("type") == "image_url"
+            ]
+            predicted = predict_cost(processor, record["messages"], payloads)
+            text_tokens, image_tokens, num_images = (
+                predicted.text_tokens,
+                predicted.image_tokens,
+                len(payloads),
+            )
             encoded = transform.encode_sample(record)
             token_types = encoded["token_types"]
             actual_image = int((token_types != TEXT).sum())
             actual_text = int((token_types == TEXT).sum())
-            text_tokens, image_tokens, num_images = predicted_rows[record["id"]]
+            stored = manifest_rows.get(record["id"])
+            if stored is not None and stored != predicted.total_tokens:
+                stale.append(record["id"])
             if (actual_text, actual_image) == (text_tokens, image_tokens):
                 print(f"verified {record['id']}: {actual_text + actual_image} tokens")
                 continue
@@ -478,6 +497,11 @@ def verify(args: argparse.Namespace, count: int) -> None:
                 f"image predicted {image_tokens} vs encoded {actual_image} "
                 f"(delta {actual_image - image_tokens})"
             )
+    if stale:
+        print(
+            f"NOTE: cost_manifest.csv disagrees with the current predictor on {len(stale)} samples; "
+            "it was written by an older run — reconvert to refresh it (the prediction below is live)"
+        )
     if mismatches:
         raise SystemExit(
             f"cost prediction mismatched on {len(mismatches)} of {min(count, line_index + 1)} samples: "
