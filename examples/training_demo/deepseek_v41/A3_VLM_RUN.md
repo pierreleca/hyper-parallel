@@ -118,6 +118,43 @@ the question/answer templates, or hand-write JSONL to the same contract: one
 `image_url` content block per sample, last message from `assistant` (only the
 final assistant text is supervised; every vision token is masked).
 
+### Heterogeneous data from the_cauldron
+
+The generator above is deliberately uniform — two cycled images and fixed short
+answers, so every sample encodes to the same cost. That makes it a correctness
+smoke and a **useless performance baseline**: a packing or balancing change has
+no imbalance to recover, so a before/after comparison measures scheduler noise.
+
+For that work, convert the_cauldron Parquet subsets instead. The converter keeps
+image bytes unmodified and every conversation turn, so sample cost varies as the
+corpus does:
+
+```bash
+cluster exec 'python -m examples.training_demo.deepseek_v41.prepare_deepseek_v41_cauldron_data \
+    --parquet-dir /home/pl/data/the_cauldron \
+    --output-dir /home/pl/data/deepseek_v41_cauldron \
+    --model-dir /home/pl/ds41-assets/DeepSeek-V4.1-Flash \
+    --max-seq-len 4096 --num-valid-samples 128 --trim-images --verify 3'
+```
+
+It also writes `cost_manifest.csv` (per-sample text tokens, image tokens, total
+tokens, ViT patches) and `cost_summary.json`. The summary's
+`imbalance_ceiling` is `E[max over W] / E[mean] - 1` for each world size — the
+fraction a perfect balancer could remove at one sample per rank per step. Read
+it **before** running: it bounds any speedup the data can show, under two cost
+models, because `FirstFitPackingSelector.get_sample_cost()` prices samples by
+token length while vision cost scales with ViT patches. `--verify N` re-encodes
+N samples through the real transform and fails if a predicted length disagrees,
+so the manifest can be trusted as a cost model.
+
+Two caveats for experiment design. `vision_min_pixels` (295936) upscales small
+images, so per-image tokens span roughly 170→1024 — there are no cheap tiny
+images, and heterogeneity comes from large images, image count and text length.
+And the committed YAML's `token_budget: 128` with `min_buffered_samples: 1`
+hands the packing selector a one-element candidate list every step: raise both
+(budget toward `max_seq_len`, buffer into the tens) before expecting packing to
+do anything.
+
 ## 4. Launch
 
 `cluster torchrun` builds the `torchrun` line itself: the world size is
