@@ -162,9 +162,14 @@ token length while vision cost scales with ViT patches. `--verify N` re-encodes
 N samples through the real transform and fails if a predicted length disagrees,
 so the manifest can be trusted as a cost model.
 
-Two caveats for experiment design. `vision_min_pixels` (295936) upscales small
+Three caveats for experiment design. `vision_min_pixels` (295936) upscales small
 images, so per-image tokens span roughly 170→1024 — there are no cheap tiny
 images, and heterogeneity comes from large images, image count and text length.
+**Encoded lengths are always even**: `encode_sample` appends one `TEXT`-typed
+pad token to an odd-length sample so packed boundaries align with the ratio-two
+KV compressor. A cost model that prices a sample at its unpadded length
+systematically under-counts, and the padding is itself a small source of
+packing waste worth accounting for.
 And the committed YAML's `token_budget: 128` with `min_buffered_samples: 1`
 hands the packing selector a one-element candidate list every step: raise both
 (budget toward `max_seq_len`, buffer into the tens) before expecting packing to
