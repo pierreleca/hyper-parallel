@@ -87,9 +87,12 @@ ERROR_LINE='OutOfMemoryError|[A-Za-z]+(Error|Exception): '
 capture_log() {  # capture_log <run id> <dir>
   timeout "$LOG_WAIT" "${CL[@]}" logs "$1" 2>/dev/null | sed -u 's/\x1b\[[0-9;]*m//g' > "$2/log.txt" || true
 }
-# The first line of a captured log that matches a pattern, cut short.
+# The first line of a captured log that matches a pattern, cut short. The SIGTERM a
+# failed run's other ranks get is quoted only when nothing else matches.
 first_line() {  # first_line <dir> <extended regex>
-  grep -h -m1 -E "$2" "$1/log.txt" 2>/dev/null | grep -v ERR99999 | cut -c1-220
+  local lines
+  lines="$(grep -h -E "$2" "$1/log.txt" 2>/dev/null | grep -v ERR99999 || true)"
+  { grep -v -m1 SignalException <<< "$lines" || head -n1 <<< "$lines"; } | cut -c1-220
 }
 # The state a run left: finished, FAILED: <first error>, or nothing yet. Campaigns from
 # before state files count a run with records as finished, one with a log as failed.
