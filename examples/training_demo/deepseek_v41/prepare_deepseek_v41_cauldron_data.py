@@ -339,7 +339,12 @@ def convert(args: argparse.Namespace) -> ConversionStats:
         if args.progress_every and stats.rows_read % args.progress_every == 0:
             # Converting a whole subset takes a while, and the JSONL is only
             # written at the end; without this there is no sign of life.
-            print(f"read {stats.rows_read} rows, kept {stats.kept} ({conversation.subset})", flush=True)
+            print(
+                f"read {stats.rows_read} rows, kept {stats.kept}, "
+                f"dropped {stats.dropped_oversize} oversize / {stats.dropped_no_turns} empty "
+                f"({conversation.subset})",
+                flush=True,
+            )
         if not conversation.turns:
             stats.dropped_no_turns += 1
             continue
