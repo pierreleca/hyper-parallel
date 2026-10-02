@@ -23,14 +23,17 @@ The node has no internet, so two things travel with the deploy:
 Transformers needs nothing installed: the `hp` env on the A3 node already has
 **5.17.0**, which satisfies §2.
 
-`ds41-assets/` contains exactly what the run reads — no weights:
+`ds41-assets/` contains exactly what the run reads — no weights. **The tree
+matters**: there are two different `config.json` files, and a non-recursive copy
+that flattens `inference/` fails with
+`DeepSeek-V4.1 inference config is missing: …/inference/config.json`.
 
 ```text
 DeepSeek-V4.1-Flash/config.json                 # nested official config, read by the crop builder
-DeepSeek-V4.1-Flash/inference/config.json       # vision params, read by build_deepseek_v41_processor
 DeepSeek-V4.1-Flash/tokenizer.json              # 6.4 MB
 DeepSeek-V4.1-Flash/tokenizer_config.json
 DeepSeek-V4.1-Flash/chat_template.jinja
+DeepSeek-V4.1-Flash/inference/config.json       # vision params, read by build_deepseek_v41_processor
 DeepSeek-V4.1-Flash/inference/examples/images/{carrots,corn}.jpeg
 engram_depth_preserving_d4.json                 # divisor 4 — matches the committed VLM yaml
 engram_depth_preserving_d8.json                 # divisor 8 — for the OOM fallback in §5
@@ -41,7 +44,19 @@ from the tokenizer on the node. **The asset file must match the divisor**: `d4`
 with `text_parameter_divisor=4`, `d8` with `8`.
 
 Keep the assets *outside* the repo directory — `cluster deploy` wipes the remote
-repo dir. `/home/pl/ds41-assets` on the node is assumed below.
+repo dir. `/home/pl/ds41-assets` is assumed below. Fan them out with the kit
+rather than by hand: `cluster sync <abs-dir>` does `mkdir -p` then `rsync -a` to
+the *same absolute path* on every node, so the nesting cannot be lost.
+
+```bash
+cluster sync /home/pl/ds41-assets
+cluster verify /home/pl/ds41-assets/DeepSeek-V4.1-Flash/inference/config.json
+cluster exec -E 'find /home/pl/ds41-assets -maxdepth 3 | sort'   # if something still disagrees
+```
+
+Adding `/home/pl/ds41-assets` to `SYNC_DIRS` in `cluster.env` makes it ride
+along with every later `cluster sync` and `cluster torchrun -s`; rsync is
+incremental, so after the first push it costs nothing.
 
 ## 2. Node environment
 
