@@ -233,8 +233,14 @@ def predict_cost(
         grid_h, grid_w, resized_h, resized_w = plan_image_grid(width, height, processor)
         image_tokens += num_image_tokens(grid_h, grid_w)
         vit_patches += (resized_h // patch_size) * (resized_w // patch_size)
+    # Each placeholder token is replaced by its image span, and the transform
+    # then pads an odd-length sample by one TEXT token so packed boundaries
+    # align with the ratio-two KV compressor. Encoded lengths are always even.
+    text_tokens = prompt_tokens - len(payloads)
+    if (text_tokens + image_tokens) % 2:
+        text_tokens += 1
     return SampleCost(
-        text_tokens=prompt_tokens - len(payloads),
+        text_tokens=text_tokens,
         image_tokens=image_tokens,
         vit_patches=vit_patches,
     )
