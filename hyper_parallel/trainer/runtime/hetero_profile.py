@@ -47,6 +47,7 @@ inactive the hooks cost one attribute read per module call.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -59,6 +60,9 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.models.build_options import get_device_type, get_torch_device
+from hyper_parallel.trainer.runtime.logging import create_logger
+
+logger = create_logger(__name__)
 
 FWD = "fwd"
 RECOMPUTE = "recompute"
@@ -190,6 +194,23 @@ def batch_workload(batch: Mapping[str, Any], spatial_merge_size: int = 2, max_gr
     return result
 
 
+def _guarded(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Run a recorder method; if it raises, switch the recorder off instead of failing the training step."""
+
+    @functools.wraps(method)
+    def wrapper(self: "HeteroProfiler", *args: Any, **kwargs: Any) -> Any:
+        """Call the method unless the recorder already failed."""
+        if self._failed:  # pylint: disable=protected-access
+            return None
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            self._fail(method.__name__, exc)  # pylint: disable=protected-access
+            return None
+
+    return wrapper
+
+
 class _DeviceClock:
     """Device events and allocator readings, with a host-clock fallback."""
 
@@ -271,6 +292,7 @@ class HeteroProfiler:
                 paths; the first matching pair names a module's role.
         """
         self.enabled = False
+        self._failed = False
         self.output_dir = ""
         self.vision_blocks = True
         self.sublayers = True
@@ -350,6 +372,7 @@ class HeteroProfiler:
             return self.routing_by_modality
         return True
 
+    @_guarded
     def attach(self, model: torch.nn.Module) -> dict[str, int]:
         """Hook the model's modules; return how many of each role were found.
 
@@ -407,6 +430,7 @@ class HeteroProfiler:
 
     # -- step lifecycle ------------------------------------------------------
 
+    @_guarded
     def begin_step(self, step: int, micro_batches: Optional[Sequence[Mapping[str, Any]]] = None) -> None:
         """Start recording one optimizer step.
 
@@ -434,6 +458,7 @@ class HeteroProfiler:
         self._start_stamp = self._clock.stamp()
         self._active = True
 
+    @_guarded
     def end_step(self, **extras: Any) -> Optional[dict[str, Any]]:
         """Close the step, resolve the stamps and write one record."""
         if not self._active:
@@ -481,6 +506,7 @@ class HeteroProfiler:
 
     # -- recording -----------------------------------------------------------
 
+    @_guarded
     def mark(self, module_id: int, pass_name: str, occurrence: int, kind: str) -> None:
         """Record one boundary: a time stamp and the allocator's allocated bytes."""
         if not self._active:
@@ -495,6 +521,28 @@ class HeteroProfiler:
         occurrence = self._occurrences.get(key, 0)
         self._occurrences[key] = occurrence + 1
         return occurrence
+
+    def _protect(self, hook: Callable[..., Any]) -> Callable[..., Any]:
+        """Wrap a module hook so that a failure of the recorder switches it off and leaves the model alone."""
+
+        @functools.wraps(hook)
+        def protected(*args: Any, **kwargs: Any) -> Any:
+            """Call the hook unless the recorder already failed."""
+            if self._failed:
+                return None
+            try:
+                return hook(*args, **kwargs)
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                self._fail("module hook", exc)
+                return None
+
+        return protected
+
+    def _fail(self, where: str, exc: BaseException) -> None:
+        """Switch the recorder off after an error in it, and say so once."""
+        self._failed = True
+        self._active = False
+        logger.warning("hetero profile switched off after an error in %s: %r; training goes on without it", where, exc)
 
     @staticmethod
     def _wrap_tensor(tensor: Any, profiler: "HeteroProfiler", module_id: int, occurrence: int, kind: str) -> Any:
@@ -527,7 +575,7 @@ class HeteroProfiler:
                 return args, kwargs
             return None
 
-        return hook
+        return self._protect(hook)
 
     def _post_hook(self, module_id: int) -> Callable[..., Any]:
         """Return the forward hook of one module."""
@@ -553,7 +601,7 @@ class HeteroProfiler:
                         return output[:position] + (wrapped,) + output[position + 1:]
             return None
 
-        return hook
+        return self._protect(hook)
 
     def _root_pre_hook(self, module_id: int) -> Callable[..., Any]:
         """Return the pre-hook of the model: one call per micro-batch."""
@@ -568,7 +616,7 @@ class HeteroProfiler:
             media = kwargs.get("mm_token_type_ids")
             self._visual_mask = (media > 0).reshape(-1) if isinstance(media, torch.Tensor) else None
 
-        return hook
+        return self._protect(hook)
 
     def _root_post_hook(self, module_id: int) -> Callable[..., Any]:
         """Return the hook that closes a micro-batch's forward pass."""
@@ -580,7 +628,7 @@ class HeteroProfiler:
             occurrence = self._occurrences.get((module_id, FWD), 1) - 1
             self.mark(module_id, FWD, occurrence, EXIT)
 
-        return hook
+        return self._protect(hook)
 
     def _router_hook(self, module_id: int, layer: Optional[int]) -> Callable[..., Any]:
         """Return the hook that splits a router's expert choices by token modality."""
@@ -608,7 +656,7 @@ class HeteroProfiler:
                     0, flat, torch.ones_like(weight))
             self._routing.append((int(layer if layer is not None else -1), occurrence, visual, total - visual))
 
-        return hook
+        return self._protect(hook)
 
     # -- output --------------------------------------------------------------
 

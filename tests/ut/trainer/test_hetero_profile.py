@@ -349,3 +349,33 @@ def test_records_feed_the_report(tmp_path):
     assert summary["model"]["vision"]["total"] > 0 and summary["model"]["text_layer"]["total"] > 0
     assert "ROUTING by modality" in joined and summary["routing"]["layers"]
     assert summary["imbalance"]["busiest_over_mean"] == 1.0 or summary["imbalance"]["busiest_over_mean"] >= 1.0
+
+
+def test_an_error_in_the_recorder_switches_it_off_and_not_the_training(tmp_path, monkeypatch):
+    """A failure inside a hook must not reach the model: the run goes on, the recorder says why it stopped."""
+    torch.manual_seed(0)
+    model = _Model()
+    patches = torch.randn(TOKENS, HIDDEN)
+    expected = model(patches)
+    profiler = _profiler(tmp_path)
+    profiler.attach(model)
+    media = torch.tensor([[1, 1, 1, 0, 0, 0]])
+    profiler.begin_step(1, [{"input_ids": torch.zeros(1, TOKENS, dtype=torch.long)}])
+
+    def broken() -> None:
+        """Stand in for a clock that fails."""
+        raise RuntimeError("the clock broke")
+
+    monkeypatch.setattr(profiler._clock, "stamp", broken)  # pylint: disable=protected-access
+    out = model(patches, mm_token_type_ids=media)
+    out.sum().backward()
+    assert torch.equal(out, expected)
+    assert profiler.end_step() is None
+    profiler.begin_step(2, [])
+    assert profiler.end_step() is None          # stays off
+
+
+def test_attach_to_nothing_is_harmless(tmp_path):
+    """A recorder that is off, or given no model, hooks nothing."""
+    assert not HeteroProfiler().attach(_Model())
+    assert not _profiler(tmp_path).attach(None)

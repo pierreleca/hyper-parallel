@@ -60,7 +60,7 @@ class HeteroProfileCallback(Callback):
         del state, kwargs
         if not self.config.enabled:
             return
-        counts = self.profiler.attach(self.trainer.model)
+        counts = self.profiler.attach(self.trainer.model) or {}
         logger.info(
             "Hetero profile: hooked %s; writing per-rank records to %s",
             ", ".join(f"{count} {role}" for role, count in sorted(counts.items())) or "no module",
