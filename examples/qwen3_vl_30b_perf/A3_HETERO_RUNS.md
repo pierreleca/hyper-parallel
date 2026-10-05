@@ -20,6 +20,72 @@ a model of it.
 | How much could an idea gain at most? | any run with module hooks | `CEILINGS`, `ASSIGNMENT` |
 | Did the idea deliver 20%, and did the loss hold? | `hetero_ab` | `compare_*.txt`: verdict, numerics, components |
 
+## Quick start: the commands, in order
+
+From the control node, in the root of its checkout of this branch (`hetero-profile-32dev`); two nodes of 16 dies.
+Each campaign blocks until its runs end (run it in `tmux`) and writes to `/home/pl/a3_runs/<plan>_<stamp>/`.
+
+```bash
+# 0. nodes, devices, raw data, environment
+cluster select -a 2                                  # leave the selection alone until the campaigns end
+cluster npu                                          # every die free?
+cluster exec -E 'ls /home/pl/data/the_cauldron | wc -l'    # 4 parquet files on each node
+cluster exec 'env | grep -E "PYTORCH_NPU_ALLOC_CONF|TASK_QUEUE_ENABLE|CPU_AFFINITY_CONF|HCCL_CONNECT_TIMEOUT"'
+
+# 1. the code on both nodes and on the control node (the campaign runs its analysis scripts from the control node)
+git archive --format=zip --prefix=hyper-parallel/ -o ~/hetero-profile-32dev.zip hetero-profile-32dev   # dev machine
+cluster deploy --dry-run ~/hetero-profile-32dev.zip /mnt/data/pl/hyper-parallel hyper_parallel
+cluster deploy ~/hetero-profile-32dev.zip /mnt/data/pl/hyper-parallel hyper_parallel
+
+# 2. datasets on every node (offline, deterministic, skipped if present); fixed and both first
+build() {
+  cluster exec "python examples/qwen3_vl_30b_perf/prepare_hetero_data.py \
+    --output-dir /home/pl/data/qwen3_vl_30b_perf/hetero_$1_n640 --scenario $1 --num-samples 640 \
+    --processor-path /home/e00642590/Qwen3-VL-30B-A3B-Instruct \
+    --download-dir /home/pl/data/the_cauldron --offline"
+}
+for S in both fixed; do build $S; done
+for S in text vision longtail natural; do build $S; done
+cluster verify /home/pl/data/qwen3_vl_30b_perf/hetero_both_n640/samples.json     # same bytes on every node
+cluster exec 'du -sh /home/pl/data/qwen3_vl_30b_perf/hetero_*; df -h /home/pl | tail -1'
+
+# 3. smoke: does the whole model train, and do the recorders see what they should?
+examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_smoke_32dev.sh
+C=$(ls -dt /home/pl/a3_runs/hetero_smoke_32dev_* | head -1)
+cat $C/SUMMARY.txt
+grep -E "^RUN|text_experts|ep_exchange|note:|^ROUTING|^MEMORY" $C/smoke/report.txt
+# expect: a RUN line for 32 ranks, a text_experts row, no "note: no text.experts spans", ROUTING and MEMORY present
+
+# 4. baseline and noise floor (twin runs; what the recorders cost)
+examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_baseline_32dev.sh
+C=$(ls -dt /home/pl/a3_runs/hetero_baseline_32dev_* | head -1); sed -n '/^A\/B/,$p' $C/SUMMARY.txt
+
+# 5. data ladder: size the imbalance, read the ceilings
+examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_data_32dev.sh
+C=$(ls -dt /home/pl/a3_runs/hetero_data_32dev_* | head -1)
+sed -n '/^SWEEP/,/^$/p' $C/SUMMARY.txt
+sed -n '/^CEILINGS/,/data loading/p' $C/both/report.txt $C/fixed/report.txt
+
+# 6. optional: balanced order measured; kernel-level check (then delete the traces)
+examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_balance_32dev.sh
+examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_profile_32dev.sh
+cluster exec 'rm -rf /home/pl/runs/qwen3_vl_30b_perf/hetero_profile_32dev_*/profile'
+
+# 7. certify an idea: the flags that switch it on, and the dataset where it should win
+IDEA="<flags of the data idea>"  DATASET=both  examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_ab_32dev.sh
+IDEA="<flags of the model idea>" DATASET=fixed examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_ab_32dev.sh
+C=$(ls -dt /home/pl/a3_runs/hetero_ab_32dev_* | head -1)
+grep -E '^A/B|end to end|work per second|paired steps|verdict|numerics|memory' $C/compare_*.txt
+
+# interrupted, failed, or one run to redo
+examples/qwen3_vl_30b_perf/hetero_campaign_status.sh $C
+examples/qwen3_vl_30b_perf/hetero_campaign.sh --resume $C [--rerun <run>]
+cluster status; cluster logs; cluster kill
+```
+
+If the smoke run runs out of memory, `plans/hetero_probe_32dev.sh` tries the recompute modes and depths; crop with
+`--model.num_hidden_layers=N` in the plan's `RUNS`.
+
 ## Parallelism and memory
 
 Two nodes of 16 dies: FSDP 32 over the dense weights, EP 16 inside each node (8 of the 128 experts per
