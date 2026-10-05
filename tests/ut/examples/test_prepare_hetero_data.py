@@ -38,7 +38,8 @@ def _load(name: str) -> ModuleType:
     return module
 
 
-_load("prepare_cauldron_data")  # the sibling that prepare_hetero_data imports by name
+_load("prepare_cauldron_data")  # the siblings that prepare_hetero_data imports by name
+_load("hetero_sampling")
 data = _load("prepare_hetero_data")
 
 

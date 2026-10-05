@@ -31,7 +31,12 @@ Reads the per-rank files of ``hyper_parallel.trainer.runtime.hetero_profile``
 - **what-ifs:** the step time if the samples were grouped by cost, and how evenly
   the model's components can be cut into pipeline stages;
 - **routing:** per MoE layer, whether the image tokens and the text tokens choose
-  the same experts, and which of them overloads an expert-parallel rank.
+  the same experts, and which of them overloads an expert-parallel rank;
+- **ceilings:** what each kind of improvement could gain at most (balancing the data,
+  balancing one component, removing the vision tower, the exposed gathers, the
+  recompute, the all-to-alls, the host gap), against the 16.7% of a step that a
+  20% speedup has to remove, and what reassigning samples inside a global batch
+  could gain at 1, 2, 4 and 8 micro-batches per rank.
 
 It needs nothing but the Python standard library, so it runs on a control node.
 
@@ -48,9 +53,11 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+import importlib.util
 import json
 import math
 import os
+import random
 import statistics
 from typing import Any, Optional, Sequence
 
@@ -61,11 +68,18 @@ GROUPS: dict[str, tuple[str, ...]] = {
     "text_layer": ("text.layer",),
     "text_attn": ("text.attn",),
     "text_moe": ("text.moe",),
+    "text_experts": ("text.experts",),
     "embed": ("text.embed",),
     "head": ("lm_head",),
 }
-# What adds up to a micro-batch's work: no component here contains another.
-WORK_PARTS = ("vision", "text_layer", "embed", "head", "loss")
+# What adds up to a micro-batch's work: no component here contains another. "custom" is every module or
+# region a design adds beyond the stock roles (hetero_profile.extra_roles, HETERO_PROFILE.region).
+WORK_PARTS = ("vision", "text_layer", "embed", "head", "loss", "custom")
+KNOWN_ROLES = frozenset(role for roles in GROUPS.values() for role in roles)
+# Modules that only frame others, or are read for something else than their time.
+IGNORED_ROLES = frozenset({"root", "vision.root", "text.root", "text.router", "text.norm"})
+# One step that a 20% speedup must shorten by 1 - 1 / 1.2 of its time.
+TARGET_SPEEDUP = 0.20
 FEATURES_VISION = ("patches", "vision_attn_pairs")
 FEATURES_TEXT = ("real_tokens",)
 MS_PER_TOKEN_UNIT = 1e3
@@ -91,8 +105,16 @@ class Run:
                 raise SystemExit(f"{path}: the first line is not a header")
             rank = int(lines[0]["rank"])
             self.headers[rank] = lines[0]
-            self.steps[rank] = [line for line in lines[1:] if line.get("kind") == "step"][skip:]
+            steps = [line for line in lines[1:] if line.get("kind") == "step"]
+            known = {module["id"] for module in lines[0]["modules"]}
+            for record in steps:                                 # modules a region added after the header
+                for module in record.get("modules_added", []):
+                    if module["id"] not in known:
+                        lines[0]["modules"].append(module)
+                        known.add(module["id"])
+            self.steps[rank] = steps[skip:]
         self.ranks = sorted(self.headers)
+        self.synthetic = any(header.get("time_source") == "synthetic" for header in self.headers.values())
 
     @property
     def name(self) -> str:
@@ -145,9 +167,11 @@ def build_rows(run: Run) -> list[dict[str, Any]]:
         for role_modules in by_role.values():
             role_modules.sort(key=lambda m: (m["index"] is None, m["index"] or 0, m["id"]))
         root = (by_role.get("root") or [None])[0]
+        custom_modules = [m for m in modules.values() if m["role"] not in KNOWN_ROLES | IGNORED_ROLES]
         for record in run.steps[rank]:
             spans = spans_of(record)
             tail_start = max((mark[4] for mark in record["marks"]), default=0.0)
+            custom = _custom_times(spans, custom_modules, len(record["micro_batches"]))
             for occurrence, batch in enumerate(record["micro_batches"]):
                 row: dict[str, Any] = {
                     "rank": rank, "step": record["step"], "mb": occurrence, "step_ms": record["device_ms"],
@@ -161,7 +185,11 @@ def build_rows(run: Run) -> list[dict[str, Any]]:
                     "vision": _gaps(spans, by_role.get("vision.block", []), occurrence),
                     "text": _gaps(spans, by_role.get("text.layer", []), occurrence),
                 }
+                _separate_exchange(row, bool(by_role.get("text.experts")))
                 row["t"]["loss"] = {"fwd": 0.0, "recompute": 0.0, "bwd": _loss_ms(spans, root, by_role, occurrence)}
+                row["t"]["custom"] = {phase: sum(per_name[occurrence][phase] for per_name in custom.values())
+                                      for phase in PHASES}
+                row["custom_by_name"] = {name: dict(per_name[occurrence]) for name, per_name in custom.items()}
                 row["wall_fwd"] = _root_span(spans, by_role, "vision.root", occurrence), _root_span(
                     spans, by_role, "text.root", occurrence)
                 if root is not None:
@@ -169,6 +197,53 @@ def build_rows(run: Run) -> list[dict[str, Any]]:
                 row["act"] = _activation_bytes(record, by_role, occurrence)
                 rows.append(row)
     return rows
+
+
+def _separate_exchange(row: dict, has_experts: bool) -> None:
+    """Split the MoE block's all-to-alls and waits from the decoder layer's own work.
+
+    The block's span holds the router, the dispatch and combine all-to-alls (which wait for the slowest rank of
+    the expert-parallel group) and the expert GEMMs; the experts' span holds the GEMMs alone. The difference is
+    ``ep_exchange``, and it is taken out of ``text_layer``, which then is compute only. Without the experts'
+    spans nothing can be separated and ``text_layer`` keeps the waits.
+    """
+    t = row["t"]
+    exchange = {phase: 0.0 for phase in PHASES}
+    if has_experts:
+        for phase in PHASES:
+            exchange[phase] = max(t["text_moe"][phase] - t["text_experts"][phase], 0.0)
+        layer = t["text_layer"]
+        if layer["recompute"] > 0:                       # the layer's hook is inside the checkpoint
+            for phase in PHASES:
+                layer[phase] = max(layer[phase] - exchange[phase], 0.0)
+        else:                                            # outside it: the backward span holds the recompute
+            layer["fwd"] = max(layer["fwd"] - exchange["fwd"], 0.0)
+            layer["bwd"] = max(layer["bwd"] - exchange["bwd"] - exchange["recompute"], 0.0)
+    t["ep_exchange"] = exchange
+    row["has_experts"] = has_experts
+
+
+def _custom_times(spans: dict, modules: list[dict], micro_batches: int) -> dict[str, list[dict[str, float]]]:
+    """Return {name: [per micro-batch {phase: ms}]} for the modules and regions a design adds.
+
+    A region called once per micro-batch is split by micro-batch; one called any other number of times is
+    charged whole to the first, which keeps the rank's work right if not the split.
+    """
+    result: dict[str, list[dict[str, float]]] = {}
+    for module in modules:
+        per_phase: dict[str, dict[int, float]] = {}
+        for (module_id, pass_name, occurrence), span in spans.items():
+            if module_id == module["id"] and pass_name in PHASES and "in" in span and "out" in span:
+                per_phase.setdefault(pass_name, {})[occurrence] = span["out"] - span["in"]
+        table = [{phase: 0.0 for phase in PHASES} for _ in range(max(micro_batches, 1))]
+        for phase, by_occurrence in per_phase.items():
+            if set(by_occurrence) == set(range(micro_batches)):
+                for occurrence, value in by_occurrence.items():
+                    table[occurrence][phase] += value
+            else:
+                table[0][phase] += sum(by_occurrence.values())
+        result.setdefault(module["name"], table)
+    return result
 
 
 def _sum_spans(spans: dict, by_role: dict, roles: Sequence[str], phase: str, occurrence: int) -> float:
@@ -193,7 +268,9 @@ def _gaps(spans: dict, blocks: list[dict], occurrence: int) -> dict[str, float]:
         first = spans.get((later["id"], "bwd", occurrence), {})   # the later block's backward runs first
         second = spans.get((earlier["id"], "bwd", occurrence), {})
         if "out" in first and "in" in second:
-            backward += max(second["in"] - first["out"], 0.0)
+            # A checkpointed block is recomputed between the two: that time has a span of its own.
+            recompute = _span_ms(spans, earlier["id"], "recompute", occurrence) or 0.0
+            backward += max(second["in"] - first["out"] - recompute, 0.0)
     return {"fwd": forward, "bwd": backward}
 
 
@@ -343,13 +420,52 @@ def feature_vector(row: dict, component: str) -> list[float]:
     """Return the features a component's time is fitted on: patches for the vision tower, tokens for the rest.
 
     Tokens and patches are in thousands; the quadratic terms are in millions, which keeps the fit well conditioned.
+    The experts' time follows the pairs the rank *receives* (its group's choices for its experts), not the sample
+    it holds, when the routing was recorded.
     """
     tokens = row.get("real_tokens", 0) / 1e3
     if component == "vision":
         return [row.get("patches", 0) / 1e3, row.get("vision_attn_pairs", 0) / 1e6]
     if component in ("text_layer", "text_attn"):
         return [tokens, tokens * tokens]
+    if component == "text_experts" and row.get("recv_pairs") is not None:
+        return [row["recv_pairs"] / 1e6]
     return [tokens]
+
+
+def attach_received_pairs(run: Run, rows: list[dict], ep_size: int) -> int:
+    """Add ``recv_pairs`` to the rows: the routed pairs the rank's experts receive, summed over the MoE layers.
+
+    A rank's experts receive the choices of every rank of its expert-parallel group (consecutive ranks), so the
+    figure needs the routing records of the whole group. Returns how many rows got it.
+    """
+    cells: dict[tuple[int, int, int], dict[int, list[int]]] = {}
+    for rank in run.ranks:
+        for record in run.steps[rank]:
+            for entry in record.get("routing", []):
+                counts = [v + t for v, t in zip(entry["visual"], entry["text"])]
+                cells.setdefault((record["step"], entry["mb"], entry["layer"]), {})[rank] = counts
+    if not cells:
+        return 0
+    received: dict[tuple[int, int, int], float] = {}
+    for (step, mb, _layer), per_rank in cells.items():
+        experts = len(next(iter(per_rank.values())))
+        local = max(experts // ep_size, 1)
+        for start in range(0, len(run.ranks), ep_size):
+            members = [rank for rank in run.ranks[start:start + ep_size] if rank in per_rank]
+            if len(members) < min(ep_size, len(run.ranks) - start):
+                continue
+            totals = [sum(per_rank[rank][expert] for rank in members) for expert in range(experts)]
+            for position, rank in enumerate(run.ranks[start:start + ep_size]):
+                key = (step, mb, rank)
+                received[key] = received.get(key, 0.0) + sum(totals[position * local:(position + 1) * local])
+    attached = 0
+    for row in rows:
+        value = received.get((row["step"], row["mb"], row["rank"]))
+        if value is not None:
+            row["recv_pairs"] = value
+            attached += 1
+    return attached
 
 
 def component_time(row: dict, component: str) -> float:
@@ -360,7 +476,8 @@ def component_time(row: dict, component: str) -> float:
 def fit_components(rows: list[dict]) -> dict[str, dict[str, Any]]:
     """Fit each component's time on the features of the micro-batch."""
     models = {}
-    for component in ("vision", "text_layer", "text_attn", "text_moe", "embed", "head", "loss"):
+    for component in ("vision", "text_layer", "text_attn", "text_experts", "text_moe", "embed", "head", "loss",
+                      "custom"):
         times = [component_time(row, component) for row in rows]
         if not any(times):
             continue
@@ -381,13 +498,22 @@ def _by_step(rows: list[dict]) -> dict[int, dict[int, dict[str, Any]]]:
     for row in rows:
         entry = grouped.setdefault(row["step"], {}).setdefault(row["rank"], {
             "work": 0.0, "parts": {part: 0.0 for part in WORK_PARTS}, "step_ms": row["step_ms"], "rows": [],
-            "inter_step_ms": row["inter_step_ms"], "mb_ms": 0.0,
+            "inter_step_ms": row["inter_step_ms"], "mb_ms": 0.0, "gap_vision": 0.0, "gap_text": 0.0,
+            "recompute": 0.0, "tail_ms": row["tail_ms"], "wall_ms": row["wall_ms"], "exchange": 0.0,
         })
         for part in WORK_PARTS:
             value = component_time(row, part)
             entry["parts"][part] += value
             entry["work"] += value
         entry["mb_ms"] += row.get("mb_ms", 0.0)
+        entry["exchange"] += sum(row["t"]["ep_exchange"].values())
+        entry["gap_vision"] += row["gap"]["vision"]["fwd"] + row["gap"]["vision"]["bwd"]
+        entry["gap_text"] += row["gap"]["text"]["fwd"] + row["gap"]["text"]["bwd"]
+        # The recompute is a pass of its own wherever the hook sits inside the checkpoint; the layer's span
+        # holds all of it, its attention and MoE spans only part of it.
+        t = row["t"]
+        entry["recompute"] += t["vision"]["recompute"] + max(
+            t["text_layer"]["recompute"], t["text_attn"]["recompute"] + t["text_moe"]["recompute"])
         entry["rows"].append(row)
     return grouped
 
@@ -452,13 +578,17 @@ def report_components(rows: list[dict], out: list[str]) -> dict[str, Any]:
     out.append("  component        forward  recompute  backward    total   share  "
                "per 1k tokens (vision: per 1k patches)")
     summary: dict[str, Any] = {"mb_ms": total_mb}
-    for component in ("vision", "text_layer", "text_attn", "text_moe", "embed", "head", "loss"):
+    notes = {"text_layer": "  (own work: attention, experts, norms)", "text_attn": "  (part of text_layer)",
+             "text_experts": "  (part of text_layer)", "text_moe": "  (experts + ep_exchange)",
+             "ep_exchange": "  (router, all-to-alls, waits for the EP group; not in text_layer)"}
+    for component in ("vision", "text_layer", "text_attn", "text_experts", "text_moe", "ep_exchange", "embed", "head",
+                      "loss", "custom"):
         phase_means = {phase: mean([row["t"][component][phase] for row in rows]) for phase in PHASES}
         total = sum(phase_means.values())
         if total == 0:
             continue
         unit = patches if component == "vision" else tokens
-        nested = "  (inside text_layer)" if component in ("text_attn", "text_moe") else ""
+        nested = notes.get(component, "")
         out.append(f"  {component:14s} {phase_means['fwd']:9.1f} {phase_means['recompute']:10.1f} "
                    f"{phase_means['bwd']:9.1f} {total:9.1f} {total / (total_mb or 1.0):6.1%}  "
                    f"{total / unit * 1e3:9.2f}{nested}")
@@ -468,9 +598,12 @@ def report_components(rows: list[dict], out: list[str]) -> dict[str, Any]:
     out.append("  idle between consecutive modules (the wait for weights, exposed communication, launch gaps): "
                + ", ".join(f"{name} {value:.1f}" for name, value in gaps.items()))
     summary["gaps"] = gaps
-    accounted = sum(summary[c]["total"] for c in WORK_PARTS if c in summary) + sum(gaps.values())
-    out.append(f"  components + gaps account for {accounted:.1f} ms of {total_mb:.1f} ms; the rest is glue between "
-               "the towers, the loss inputs and the optimizer-free parts of the step")
+    accounted = sum(summary[c]["total"] for c in (*WORK_PARTS, "ep_exchange") if c in summary) + sum(gaps.values())
+    out.append(f"  components + exchange + gaps account for {accounted:.1f} ms of {total_mb:.1f} ms; the rest is glue "
+               "between the towers and the loss inputs")
+    if not any(row.get("has_experts") for row in rows):
+        out.append("  note: no text.experts spans, so the MoE exchange could not be told from the layer's work: "
+                   "text_layer holds the all-to-all waits, and the rank totals below understate the imbalance")
     wall = [row["wall_fwd"] for row in rows if row["wall_fwd"][0] is not None]
     if wall:
         out.append(f"  forward wall of the vision tower {mean([w[0] for w in wall]):.1f} ms and of the decoder "
@@ -482,7 +615,7 @@ def report_layers(run: Run, rows: list[dict], out: list[str], top: int) -> dict[
     """Per decoder layer and per vision block: forward, recompute and backward time, the slowest indices first."""
     del rows
     summary: dict[str, Any] = {}
-    for title, roles in (("decoder layer", ("text.layer", "text.attn", "text.moe")),
+    for title, roles in (("decoder layer", ("text.layer", "text.attn", "text.moe", "text.experts")),
                          ("vision block", ("vision.block",))):
         table = layer_table(run, roles)
         present = [role for role in roles if any(role in entry for entry in table.values())]
@@ -531,7 +664,8 @@ def report_fit(rows: list[dict], out: list[str]) -> dict[str, dict]:
     models = fit_components(rows)
     out.append("")
     out.append("COST MODEL: component time (ms) = c0 + c1 * x1 + c2 * x2, fitted over all micro-batches. vision: x1 = "
-               "patches (1k), x2 = vision attention pairs (1M); text parts: x1 = tokens (1k), x2 = tokens^2 (1M)")
+               "patches (1k), x2 = vision attention pairs (1M); text parts: x1 = tokens (1k), x2 = tokens^2 (1M); "
+               "text_experts: x1 = pairs received (1M) when the routing was recorded")
     out.append("  component            c0       c1       c2     R^2   rmse ms")
     for component, model in models.items():
         c = model["coefficients"] + [0.0] * (3 - len(model["coefficients"]))
@@ -548,7 +682,7 @@ def report_fit(rows: list[dict], out: list[str]) -> dict[str, dict]:
 def report_imbalance(rows: list[dict], models: dict[str, dict], out: list[str]) -> dict[str, Any]:
     """Per step: how far the busiest rank is above the mean, from which component, and what the data predicts."""
     steps = _by_step(rows)
-    factors, excess_share, idle_share, predictable = [], [], [], []
+    factors, excess_share, idle_share, predictable, waiting_share = [], [], [], [], []
     parts_excess = {part: 0.0 for part in WORK_PARTS}
     straggler_hits: dict[int, int] = {}
     excess_total = step_total = 0.0
@@ -561,6 +695,8 @@ def report_imbalance(rows: list[dict], models: dict[str, dict], out: list[str]) 
         excess_total += excess
         step_total += step_ms
         excess_share.append(excess / step_ms if step_ms else 0.0)
+        waits = [entry["gap_vision"] + entry["gap_text"] + entry["exchange"] for entry in ranks.values()]
+        waiting_share.append((mean(waits) - min(waits)) / step_ms if step_ms else 0.0)
         idle_share.append(1.0 - mean_work / work[top_rank] if work[top_rank] else 0.0)
         straggler_hits[top_rank] = straggler_hits.get(top_rank, 0) + 1
         for part in WORK_PARTS:
@@ -574,9 +710,12 @@ def report_imbalance(rows: list[dict], models: dict[str, dict], out: list[str]) 
     out.append(f"  busiest rank / mean rank: {mean(factors):.3f} on average over the steps (worst step "
                f"{max(factors):.3f}); its excess is {mean(excess_share):.1%} of the step, i.e. "
                f"{mean(idle_share):.1%} of the ranks' compute time is spent waiting for it")
+    out.append(f"  measured directly: a rank waits {mean(waiting_share):.1%} of the step in weight gathers and MoE "
+               "exchange above the rank that waits least")
     total_excess = sum(parts_excess.values()) or 1.0
+    active = [part for part in WORK_PARTS if any(component_time(row, part) for row in rows)]
     out.append("  where the busiest rank's excess comes from: "
-               + ", ".join(f"{part} {parts_excess[part] / total_excess:.0%}" for part in WORK_PARTS))
+               + ", ".join(f"{part} {parts_excess[part] / total_excess:.0%}" for part in active))
     if predictable:
         out.append(f"  the data predicts who is busiest: rank correlation of modeled and measured work within a step "
                    f"{mean(predictable):+.2f} (1 = the samples explain the whole order)")
@@ -585,6 +724,7 @@ def report_imbalance(rows: list[dict], models: dict[str, dict], out: list[str]) 
                + ", ".join(f"rank {rank} x{count}" for rank, count in busiest))
     return {"busiest_over_mean": mean(factors), "busiest_over_mean_worst": max(factors),
             "excess_share_of_step": mean(excess_share), "idle_share": mean(idle_share),
+            "waiting_share_of_step": mean(waiting_share),
             "excess_by_part": {part: parts_excess[part] / total_excess for part in WORK_PARTS},
             "predictability": mean(predictable) if predictable else None,
             "excess_ms_total": excess_total, "step_ms_total": step_total}
@@ -823,19 +963,292 @@ def report_routing(run: Run, ep_size: int, out: list[str], top: int) -> dict[str
             "mean_js_bits": mean([r["js_bits"] for r in rows_out])}
 
 
+# -- ceilings and assignment what-ifs -----------------------------------------------------------------------
+
+A2A_KEYS = tuple(f"{pass_name}:{label}" for pass_name in ("fwd", "recompute")
+                 for label in ("dispatch a2a", "combine a2a")) + ("bwd:combine a2a bwd", "bwd:dispatch a2a bwd")
+EXPERT_KEYS = ("fwd:experts", "recompute:experts", "bwd:experts bwd")
+
+
+def speedup_if_removed(removed: float, base: float) -> float:
+    """Return the speedup of a step of ``base`` ms that loses ``removed`` ms: base / (base - removed) - 1."""
+    if base <= 0:
+        return 0.0
+    left = base - removed
+    return math.inf if left <= 0 else base / left - 1.0
+
+
+def _load_ep_module() -> Any:
+    """Import analyze_ep_instrument.py, which sits beside this script."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "analyze_ep_instrument.py")
+    spec = importlib.util.spec_from_file_location("analyze_ep_instrument", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def ep_ceilings(ep_dir: str, skip: int) -> dict[str, float]:
+    """Read the EP instrument's records: the all-to-all time per rank and step, and what balancing the experts saves.
+
+    ``a2a_ms`` is the mean over ranks and steps of the dispatch and combine all-to-alls (forward, recompute,
+    backward) summed over the MoE layers; ``imbalance_ms`` is, per step, the sum over layers and passes of the
+    slowest rank's expert time over the mean one, averaged over the steps: the time every other rank waits.
+    """
+    ep = _load_ep_module()
+    headers, steps = ep.load_records(ep_dir, skip)
+    table = ep.collect(headers, steps)
+    ranks = table["ranks"]
+    a2a: dict[tuple[int, int], float] = {}
+    by_layer: dict[tuple[int, int], dict[int, dict]] = {}
+    for row in table["rows"]:
+        key = (row["step"], row["rank"])
+        a2a[key] = a2a.get(key, 0.0) + sum(row.get(name) or 0.0 for name in A2A_KEYS)
+        by_layer.setdefault((row["step"], row["layer"]), {})[row["rank"]] = row
+    waiting: dict[int, float] = {}
+    for (step, _layer), per_rank in by_layer.items():
+        if len(per_rank) < len(ranks):
+            continue
+        for name in EXPERT_KEYS:
+            values = [per_rank[rank].get(name) for rank in ranks]
+            if all(value is not None for value in values):
+                waiting[step] = waiting.get(step, 0.0) + max(values) - mean(values)
+    return {"a2a_ms": mean(list(a2a.values())), "imbalance_ms": mean(list(waiting.values())),
+            "steps": len({step for step, _rank in a2a})}
+
+
+LEAF_GROUPS: dict[str, tuple[str, ...]] = {
+    "vision": ("vision.patch_embed", "vision.block", "vision.deepstack", "vision.merger"),
+    "attention": ("text.attn",),
+    "experts": ("text.experts",),
+    "head": ("lm_head",),
+    "embed": ("text.embed",),
+}
+
+
+def leaf_excess(run: Run, rows: list[dict]) -> dict[int, dict[str, float]]:
+    """Per step and group, the sum over leaf modules of the slowest rank's span over the mean one.
+
+    Every decoder layer and vision block starts with a collective that all ranks must join (the gather of its
+    weights), so the ranks resynchronize about once per module and the step is paced by the slowest rank *of
+    each module*, not by the slowest rank over the whole step. This sum is what the step would shed if every
+    module's work were the same on every rank. Spans of modules that not every rank has are left out.
+    """
+    role_group = {role: group for group, roles in LEAF_GROUPS.items() for role in roles}
+    per_step: dict[int, dict[tuple, dict[int, float]]] = {}
+    for rank in run.ranks:
+        modules = {m["id"]: m for m in run.headers[rank]["modules"]}
+        for record in run.steps[rank]:
+            table = per_step.setdefault(record["step"], {})
+            for (module_id, pass_name, occurrence), span in spans_of(record).items():
+                module = modules.get(module_id)
+                if module is None or pass_name not in PHASES or "in" not in span or "out" not in span:
+                    continue
+                role = module["role"]
+                if role in role_group:
+                    group = role_group[role]
+                elif role not in KNOWN_ROLES | IGNORED_ROLES:
+                    group = "custom"
+                else:
+                    continue
+                table.setdefault((group, module["name"], pass_name, occurrence), {})[rank] = span["out"] - span["in"]
+    result: dict[int, dict[str, float]] = {}
+    for step, table in per_step.items():
+        totals: dict[str, float] = {}
+        for (group, _name, _pass, _occurrence), by_rank in table.items():
+            if len(by_rank) == len(run.ranks):
+                values = list(by_rank.values())
+                totals[group] = totals.get(group, 0.0) + max(values) - mean(values)
+        result[step] = totals
+    losses: dict[tuple[int, int], list[float]] = {}
+    for row in rows:
+        losses.setdefault((row["step"], row["mb"]), []).append(row["t"]["loss"]["bwd"])
+    for (step, _mb), values in losses.items():
+        if step in result and len(values) == len(run.ranks):
+            result[step]["head"] = result[step].get("head", 0.0) + max(values) - mean(values)
+    return result
+
+
+def report_bounds(run: Run, rows: list[dict], ep: Optional[dict[str, float]], out: list[str]) -> dict[str, Any]:
+    """The most each kind of change could gain, with the busiest rank's time as the critical path.
+
+    Every row is a ceiling: the change costs nothing and moves nothing elsewhere. The rows overlap (balancing the
+    data and removing the vision tower both count the vision tower's imbalance), so they do not add up. The
+    exposed communication is read from the rank that waits least, which waits for nobody: what it still waits for
+    is the collectives themselves.
+    """
+    steps = _by_step(rows)
+    leaf = leaf_excess(run, rows)
+    totals: dict[str, float] = {}
+    step_ms_sum = host_sum = waiting_sum = 0.0
+
+    def add(name: str, value: float) -> None:
+        """Accumulate one ceiling over the steps."""
+        totals[name] = totals.get(name, 0.0) + value
+
+    for step, ranks in steps.items():
+        step_ms_sum += mean([entry["step_ms"] for entry in ranks.values()])
+        host_sum += mean([entry["inter_step_ms"] for entry in ranks.values() if entry["inter_step_ms"] is not None])
+        work = {rank: entry["work"] for rank, entry in ranks.items()}
+        top = max(work, key=work.get)
+        add("balance_all", work[top] - mean(list(work.values())))
+        for group, value in leaf.get(step, {}).items():
+            add(f"leaf:{group}", value)
+            add("leaf_all", value)
+        critical = ranks[top]
+        add("vision", critical["parts"]["vision"])
+        add("head_loss", critical["parts"]["head"] + critical["parts"]["loss"])
+        add("recompute", critical["recompute"])
+        add("tail", critical["tail_ms"])
+        add("custom", critical["parts"]["custom"])
+        add("vision_gaps", min(entry["gap_vision"] for entry in ranks.values()))
+        add("decoder_gaps", min(entry["gap_text"] for entry in ranks.values()))
+        add("exchange", min(entry["exchange"] for entry in ranks.values()))
+        waiting = [entry["gap_vision"] + entry["gap_text"] + entry["exchange"] for entry in ranks.values()]
+        waiting_sum += mean(waiting) - min(waiting)
+    count = max(len(steps), 1)
+    base, host = step_ms_sum / count, host_sum / count
+    entries = [("balance the data: every rank carries the mean total work", totals["balance_all"] / count, base),
+               ("balance every module's work across ranks (each layer is a barrier)",
+                totals.get("leaf_all", 0.0) / count, base)]
+    for group, label in (("experts", "MoE experts (tokens and routing)"), ("attention", "attention (quadratic)"),
+                         ("vision", "vision tower (images and their size)"), ("head", "head and loss"),
+                         ("custom", "custom components")):
+        if totals.get(f"leaf:{group}", 0.0) > 0:
+            entries.append((f"    ... only the {label}", totals[f"leaf:{group}"] / count, base))
+    entries += [
+        ("vision tower free (compute on the busiest rank)", totals["vision"] / count, base),
+        ("vision tower free, and its weight gathers hidden",
+         (totals["vision"] + totals["vision_gaps"]) / count, base),
+        ("decoder weight gathers and launch gaps hidden", totals["decoder_gaps"] / count, base),
+        ("MoE router, all-to-alls and syncs free (no waiting)", totals["exchange"] / count, base),
+        ("head and loss free (chunked loss, fused head)", totals["head_loss"] / count, base),
+        ("recompute free (lower bound: its attention and MoE spans)", totals["recompute"] / count, base),
+        ("gradient clip, optimizer and final sync free", totals["tail"] / count, base),
+        ("data loading hidden (gap between steps, end to end)", host, base + host),
+    ]
+    if totals["custom"]:
+        entries.append(("custom components free (what the new design adds)", totals["custom"] / count, base))
+    if ep:
+        entries += [("MoE all-to-alls free, from the EP instrument", ep["a2a_ms"], base),
+                    ("MoE experts balanced, from the EP instrument", ep["imbalance_ms"], base)]
+    needed = 1.0 - 1.0 / (1.0 + TARGET_SPEEDUP)
+    out.append("")
+    out.append(f"CEILINGS: the most each change could gain, if it cost nothing and moved nothing elsewhere. A "
+               f"{TARGET_SPEEDUP:.0%} speedup needs a change that removes {needed:.1%} of the step; rows overlap, "
+               "they do not add up")
+    out.append(f"  step {base:.1f} ms (device), {host:.1f} ms more between steps on the host; on average a rank "
+               f"waits {waiting_sum / count:.1f} ms ({waiting_sum / count / base:.1%} of the step) in weight gathers "
+               "and MoE exchange above the rank that waits least")
+    out.append("  change                                                            ms/step  of step   ceiling  "
+               "reaches target")
+    summary: dict[str, Any] = {"step_ms": base, "host_gap_ms": host, "needed_share": needed,
+                               "waiting_ms": waiting_sum / count}
+    for label, removed, reference in entries:
+        ceiling = speedup_if_removed(removed, reference)
+        out.append(f"  {label:62s} {removed:9.1f} {removed / reference:7.1%} {ceiling:+9.1%}  "
+                   f"{'yes' if ceiling >= TARGET_SPEEDUP else 'no'}")
+        summary[label.strip()] = {"ms": removed, "share": removed / reference, "ceiling": ceiling}
+    return summary
+
+
+def lpt_busiest(costs: Sequence[float], ranks: int) -> float:
+    """Return the load of the busiest rank when the costs are dealt biggest first to the least loaded rank."""
+    loads = [0.0] * ranks
+    for cost in sorted(costs, reverse=True):
+        loads[loads.index(min(loads))] += cost
+    return max(loads)
+
+
+def round_robin_busiest(costs: Sequence[float], ranks: int) -> float:
+    """Return the load of the busiest rank when sample j goes to rank j modulo ``ranks``, as the sampler deals them."""
+    loads = [0.0] * ranks
+    for index, cost in enumerate(costs):
+        loads[index % ranks] += cost
+    return max(loads)
+
+
+def report_assignment(rows: list[dict], models: dict[str, dict], out: list[str], trials: int = 60) -> dict[str, Any]:
+    """What dealing the samples of a global batch out by cost could gain, at 1, 2, 4 and 8 micro-batches per rank.
+
+    The pool is the run's own samples, priced by the cost model and dealt in random orders. With one micro-batch
+    per rank no assignment helps (every rank gets one sample, so the costliest sample sets the step); with more,
+    dealing biggest-first beats dealing in arrival order.
+    """
+    if not models:
+        return {}
+    ranks_per_step = max(len(ranks) for ranks in _by_step(rows).values())
+    pool = [modeled_cost(models, row) for row in rows]
+    rng = random.Random(0)
+    out.append("")
+    out.append(f"ASSIGNMENT what-if: the pool is this run's {len(pool)} samples priced by the cost model, dealt to "
+               f"{ranks_per_step} ranks in global batches of {ranks_per_step} x A samples")
+    out.append("  A (micro-batches per rank)   busiest/mean in arrival order   busiest/mean dealt by cost   "
+               "work saved on the busiest rank")
+    summary: dict[str, Any] = {}
+    for accumulation in (1, 2, 4, 8):
+        size = ranks_per_step * accumulation
+        if len(pool) < size:
+            continue
+        naive = lpt = ideal = 0.0
+        batches = 0
+        for _ in range(trials):
+            shuffled = pool[:]
+            rng.shuffle(shuffled)
+            for start in range(0, len(shuffled) - size + 1, size):
+                batch = shuffled[start:start + size]
+                naive += round_robin_busiest(batch, ranks_per_step)
+                lpt += lpt_busiest(batch, ranks_per_step)
+                ideal += sum(batch) / ranks_per_step
+                batches += 1
+        saved = 1.0 - lpt / naive if naive else 0.0
+        out.append(f"  {accumulation:>2d}                          {naive / ideal:>14.3f}              "
+                   f"{lpt / ideal:>14.3f}                   {saved:>8.1%}")
+        summary[str(accumulation)] = {"arrival": naive / ideal, "by_cost": lpt / ideal, "saved": saved}
+    out.append("  With one micro-batch per rank the costliest sample of the step is the floor; only regrouping the "
+               "steps (WHAT IF above) or splitting a sample's work across ranks goes below it.")
+    return summary
+
+
+def report_groups(run: Run, rows: list[dict], out: list[str]) -> dict[str, Any]:
+    """If the ranks do not all hold the same modules (a design that places the towers apart), report each group."""
+    groups: dict[frozenset, list[int]] = {}
+    for rank in run.ranks:
+        groups.setdefault(frozenset(m["role"] for m in run.headers[rank]["modules"]), []).append(rank)
+    if len(groups) < 2:
+        return {}
+    steps = _by_step(rows)
+    out.append("")
+    out.append(f"RANK GROUPS: {len(groups)} kinds of rank (by the modules they hold); utilisation is the group's "
+               "mean work over the step time")
+    summary: dict[str, Any] = {}
+    common = frozenset.intersection(*groups)
+    for roles, ranks in sorted(groups.items(), key=lambda item: item[1][0]):
+        entries = [per_rank[rank] for per_rank in steps.values() for rank in ranks if rank in per_rank]
+        work = mean([entry["work"] for entry in entries])
+        step_ms = mean([entry["step_ms"] for entry in entries])
+        label = ", ".join(sorted(roles - common)) or "(the common modules only)"
+        utilisation = work / step_ms if step_ms else 0.0
+        out.append(f"  ranks {ranks[0]}..{ranks[-1]} ({len(ranks)}): extra {label}; mean work {work:.1f} ms of a "
+                   f"{step_ms:.1f} ms step, utilisation {utilisation:.1%}")
+        summary[f"{ranks[0]}-{ranks[-1]}"] = {"ranks": len(ranks), "work_ms": work, "utilisation": utilisation}
+    return summary
+
+
 # -- outputs ----------------------------------------------------------------------------------------------
 
 def write_csv(path: str, rows: list[dict], models: dict[str, dict]) -> None:
     """Write one line per micro-batch: workload, component times, modeled work."""
     columns = ["rank", "step", "mb", "real_tokens", "visual_tokens", "images", "patches", "vision_attn_pairs",
-               "label_tokens", "step_ms", "mb_ms"] + [f"{c}_ms" for c in (*WORK_PARTS, "text_attn", "text_moe")] \
+               "label_tokens", "step_ms", "mb_ms", "fingerprint"] \
+        + [f"{c}_ms" for c in (*WORK_PARTS, "text_attn", "text_moe", "text_experts", "ep_exchange")] \
         + ["gap_vision_fwd", "gap_text_fwd", "gap_vision_bwd", "gap_text_bwd", "modeled_ms"]
     with open(path, "w", encoding="utf-8", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow(columns)
         for row in rows:
-            cells = [row.get(c, "") for c in columns[:11]]
-            cells += [round(component_time(row, c), 3) for c in (*WORK_PARTS, "text_attn", "text_moe")]
+            cells = [row.get(c, "") for c in columns[:12]]
+            cells += [round(component_time(row, c), 3)
+                      for c in (*WORK_PARTS, "text_attn", "text_moe", "text_experts", "ep_exchange")]
             cells += [round(row["gap"]["vision"]["fwd"], 3), round(row["gap"]["text"]["fwd"], 3),
                       round(row["gap"]["vision"]["bwd"], 3), round(row["gap"]["text"]["bwd"], 3),
                       round(modeled_cost(models, row), 3)]
@@ -843,23 +1256,36 @@ def write_csv(path: str, rows: list[dict], models: dict[str, dict]) -> None:
 
 
 def analyse(directory: str, skip: int, ep_size: int, stages: Sequence[int], top: int,
-            out_dir: Optional[str]) -> tuple[list[str], dict[str, Any]]:
-    """Run every report on one run; return the text lines and the JSON-friendly summary."""
+            out_dir: Optional[str], ep_dir: Optional[str] = None) -> tuple[list[str], dict[str, Any]]:
+    """Run every report on one run; return the text lines and the JSON-friendly summary.
+
+    ``ep_dir`` is the EP instrument's record directory; it adds the all-to-all and expert-balance ceilings.
+    """
     run = Run(directory, skip)
     rows = build_rows(run)
     if not rows:
         raise SystemExit(f"{directory}: no micro-batch record after skipping {skip} steps")
     out: list[str] = []
-    summary: dict[str, Any] = {"run": run.name}
+    if run.synthetic:
+        out += ["*" * 100,
+                "* SYNTHETIC RECORDS, generated by synthetic_hetero_records.py from assumed costs. The structure of",
+                "* this report is real; every number in it is made up. Do not read a result from it.",
+                "*" * 100, ""]
+    summary: dict[str, Any] = {"run": run.name, "synthetic": run.synthetic}
     summary["overview"] = report_overview(run, rows, out)
+    summary["groups"] = report_groups(run, rows, out)
     summary["data"] = report_data(rows, out)
     summary["model"] = report_components(rows, out)
     summary["layers"] = report_layers(run, rows, out, top)
+    attach_received_pairs(run, rows, ep_size)
     models = report_fit(rows, out)
     summary["fit"] = {name: {"coefficients": m["coefficients"], "r2": m["r2"], "rmse": m["rmse"]}
                       for name, m in models.items()}
     summary["imbalance"] = report_imbalance(rows, models, out)
     summary["balancing"] = report_whatif_balancing(rows, models, summary["imbalance"], out)
+    summary["assignment"] = report_assignment(rows, models, out)
+    ep = ep_ceilings(ep_dir, skip) if ep_dir and glob.glob(os.path.join(ep_dir, "rank*.jsonl")) else None
+    summary["ceilings"] = report_bounds(run, rows, ep, out)
     summary["pipeline"] = report_pipeline(run, rows, stages, out)
     summary["memory"] = report_memory(rows, out)
     summary["routing"] = report_routing(run, ep_size, out, top)
@@ -905,6 +1331,13 @@ def default_out_dir(records: str) -> str:
     return os.path.join(base, "analysis_hetero")
 
 
+def default_ep_dir(records: str) -> str:
+    """Return where the EP instrument's records of this run are expected: ``instrument`` beside ``hetero``."""
+    records = os.path.abspath(records)
+    base = os.path.dirname(records) if os.path.basename(records) == "hetero" else records
+    return os.path.join(base, "instrument")
+
+
 def _resolve(path: str) -> str:
     """Return the directory of the per-rank files: the path itself, or its ``hetero`` subdirectory."""
     return path if glob.glob(os.path.join(path, "rank*.jsonl")) else os.path.join(path, "hetero")
@@ -922,21 +1355,27 @@ def main() -> int:
     parser.add_argument("--top", type=int, default=8, help="rows listed in the layer and routing tables")
     parser.add_argument("--out-dir", default=None, help="where to write microbatches.csv and hetero_report.*")
     parser.add_argument("--sweep", action="store_true", help="compare several runs, one row each")
+    parser.add_argument("--ep-dir", default=None,
+                        help="the EP instrument's records (default: instrument/ beside hetero/, when it exists)")
     args = parser.parse_args()
     if not args.run:
         parser.error("give at least one run directory")
     if args.sweep:
         summaries = []
         for directory in args.run:
-            _, summary = analyse(_resolve(directory), args.skip, args.ep_size, args.pp_stages, args.top, None)
+            records = _resolve(directory)
+            _, summary = analyse(records, args.skip, args.ep_size, args.pp_stages, args.top, None,
+                                 args.ep_dir or default_ep_dir(records))
             summaries.append(summary)
         lines: list[str] = []
         report_sweep(summaries, lines)
         print("\n".join(lines))
         return 0
     for directory in args.run:
-        out_dir = args.out_dir or default_out_dir(_resolve(directory))
-        lines, _ = analyse(_resolve(directory), args.skip, args.ep_size, args.pp_stages, args.top, out_dir)
+        records = _resolve(directory)
+        out_dir = args.out_dir or default_out_dir(records)
+        lines, _ = analyse(records, args.skip, args.ep_size, args.pp_stages, args.top, out_dir,
+                           args.ep_dir or default_ep_dir(records))
         print("\n".join(lines))
     return 0
 
