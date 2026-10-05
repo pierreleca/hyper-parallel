@@ -71,8 +71,10 @@ sed -n '/^CEILINGS/,/data loading/p' $C/both/report.txt $C/fixed/report.txt
 examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_balance_32dev.sh
 examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_profile_32dev.sh
 C=$(ls -dt /home/pl/a3_runs/hetero_profile_32dev_* | head -1)
-grep -E "rank [0-9]+:|starts at|lanes against|AGREE|DISAGREE|UNCERTAIN" $C/both/components.txt | cut -c1-200   # kernels vs labels
-ls $C/both/components/                      # <node>_components.json: open in https://ui.perfetto.dev (How each component is detected)
+grep -E "rank [0-9]+:|EP wait|last to arrive|starts at|lanes against|AGREE|DISAGREE|UNCERTAIN" $C/profile_both/components.txt | cut -c1-200
+ls $C/profile_both/components/              # <node>_components.json: open in https://ui.perfetto.dev (How each component is detected)
+R=/home/pl/runs/qwen3_vl_30b_perf/$(cat $C/profile_both/run_id)                        # the run on the nodes
+cluster gather $R/profile/components_full /home/pl/a3_runs/components_full             # optional: the lanes over the real events
 cluster exec 'rm -rf /home/pl/runs/qwen3_vl_30b_perf/hetero_profile_32dev_*/profile'
 
 # 7. certify an idea: the flags that switch it on, and the dataset where it should win
@@ -407,7 +409,7 @@ it against the kernels. The campaign runs it by itself for the profiled plan (on
 idlest rank of each); by hand:
 
 ```bash
-R=/home/pl/runs/qwen3_vl_30b_perf/hetero_profile_32dev_<stamp>_both       # holds hetero/ and profile/, on each node
+R=/home/pl/runs/qwen3_vl_30b_perf/$(cat $C/profile_both/run_id)    # the run on the nodes: hetero/ and profile/
 cluster exec -p "python examples/qwen3_vl_30b_perf/component_trace.py $R"  # --rank N ... to choose, --no-original for the small files only
 cluster gather $R/profile/components_full /home/pl/a3_runs/components      # the lanes over the real events (tens of MB per rank)
 ```
