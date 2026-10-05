@@ -379,3 +379,86 @@ def test_attach_to_nothing_is_harmless(tmp_path):
     """A recorder that is off, or given no model, hooks nothing."""
     assert not HeteroProfiler().attach(_Model())
     assert not _profiler(tmp_path).attach(None)
+
+
+def test_light_mode_writes_step_records_without_hooking_anything(tmp_path):
+    """hooks=false: no module is hooked, the step record still has the time, the workload and the fingerprint."""
+    profiler = _profiler(tmp_path, hooks=False)
+    model = _Model()
+    assert not profiler.attach(model)
+    assert not profiler.modules
+    media = torch.tensor([[1, 1, 1, 0, 0, 0]])
+    batch = {"input_ids": torch.arange(TOKENS).reshape(1, TOKENS), "mm_token_type_ids": media}
+    profiler.begin_step(1, [batch])
+    model(torch.randn(TOKENS, HIDDEN), mm_token_type_ids=media).sum().backward()
+    record = profiler.end_step(loss=2.5)
+    assert record["marks"] == [] and record["routing"] == []
+    assert record["device_ms"] >= 0 and record["wall_ms"] >= 0 and record["loss"] == 2.5
+    assert record["micro_batches"][0]["tokens"] == TOKENS and record["micro_batches"][0]["fingerprint"] > 0
+    profiler.begin_step(2, [batch])
+    second = profiler.end_step()
+    assert second["inter_step_ms"] is not None
+
+
+def test_fingerprint_tells_samples_apart():
+    """The same ids give the same fingerprint; a different order or one different id does not."""
+    ids = torch.tensor([[5, 9, 2, 7, 7, 1]])
+    same = batch_workload({"input_ids": ids.clone()})["fingerprint"]
+    assert same == batch_workload({"input_ids": ids})["fingerprint"]
+    assert same != batch_workload({"input_ids": ids.flip(-1)})["fingerprint"]
+    changed = ids.clone()
+    changed[0, 3] = 8
+    assert same != batch_workload({"input_ids": changed})["fingerprint"]
+
+
+def test_region_times_code_that_is_not_a_module(tmp_path):
+    """A region adds a custom component to the record, once per call, and registers it for the header."""
+    profiler = _profiler(tmp_path)
+    model = _Model()
+    profiler.attach(model)
+    with profiler.region("outside a step"):
+        pass                                          # inactive: nothing recorded, nothing raised
+    profiler.begin_step(1, [{"input_ids": torch.zeros(1, TOKENS, dtype=torch.long)}])
+    media = torch.tensor([[1, 1, 0, 0, 0, 0]])
+    with profiler.region("balance"):
+        out = model(torch.randn(TOKENS, HIDDEN), mm_token_type_ids=media)
+    with profiler.region("balance"):
+        pass
+    out.sum().backward()
+    record = profiler.end_step()
+    custom = [m for m in record["modules_added"] if m["role"] == "custom"]
+    assert [m["name"] for m in custom] == ["balance"]
+    marks = [mark for mark in record["marks"] if mark[0] == custom[0]["id"]]
+    assert [(mark[1], mark[2], mark[3]) for mark in marks] == [
+        (FWD, 0, ENTER), (FWD, 0, EXIT), (FWD, 1, ENTER), (FWD, 1, EXIT)]
+    assert all(later[4] >= earlier[4] for earlier, later in zip(marks, marks[1:]))
+
+
+def test_region_does_not_hide_an_exception_of_the_timed_code(tmp_path):
+    """The recorder times the code and lets its error through."""
+    profiler = _profiler(tmp_path)
+    profiler.attach(_Model())
+    profiler.begin_step(1, [])
+    with pytest.raises(KeyError):
+        with profiler.region("boom"):
+            raise KeyError("boom")
+    assert profiler.end_step() is not None
+
+
+def test_extra_roles_hook_further_modules(tmp_path):
+    """A role named in the configuration is matched after the stock ones and hooked like them."""
+    profiler = HeteroProfiler()
+    pattern = r"(?:^|\.)visual\.blocks\.(\d+)\.attn$"
+    profiler.configure(enabled=True, output_dir=str(tmp_path), extra_roles=[f"balancer={pattern}"])
+    model = _Model()
+    model.visual.blocks[1].attn = nn.Linear(HIDDEN, HIDDEN)
+    assert profiler.match_role("model.visual.blocks.1.attn") == ("balancer", 1)
+    assert profiler.match_role("model.visual.blocks.1") == ("vision.block", 1)
+    counts = profiler.attach(model)
+    assert counts.get("balancer") == 1
+
+
+def test_extra_roles_must_be_role_equals_regex(tmp_path):
+    """A malformed entry is refused when the recorder is configured, not in the middle of a run."""
+    with pytest.raises(ValueError):
+        HeteroProfiler().configure(enabled=True, output_dir=str(tmp_path), extra_roles=["no-equals-sign"])

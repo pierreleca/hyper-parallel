@@ -43,6 +43,18 @@ Each rank writes one JSON Lines file, a header and then one record per step.
 
 Everything is off unless ``hetero_profile.enabled`` is set. With the recorder
 inactive the hooks cost one attribute read per module call.
+
+Three more uses beyond the stock Qwen3-VL roles:
+
+- ``hooks: false`` keeps only the step record (wall and device time, the gap since
+  the previous step, the workload and fingerprint of every micro-batch, loss and
+  gradient norm): two device events and one synchronization per step, cheap enough
+  to time a baseline and a candidate with the recorder on;
+- :meth:`HeteroProfiler.region` times a stretch of code that is not a module (a
+  redistribution all-to-all, a scheduling decision, a new kernel), so an
+  optimization's own cost shows up in the report next to the components it moves;
+- ``extra_roles`` names modules of a new design (``"my_role=regex"``): they are
+  hooked like the stock ones and summed into the report's ``custom`` component.
 """
 
 from __future__ import annotations
@@ -80,7 +92,7 @@ _WRAPPER_SEGMENTS = frozenset(
 )
 # Roles that need the finer module levels, switched by ``vision_blocks`` and ``sublayers``.
 VISION_DETAIL_ROLES = frozenset({"vision.patch_embed", "vision.block", "vision.deepstack", "vision.merger"})
-TEXT_DETAIL_ROLES = frozenset({"text.attn", "text.moe"})
+TEXT_DETAIL_ROLES = frozenset({"text.attn", "text.moe", "text.experts"})
 # The router is only read for its routing decisions, never timed.
 ROUTER_ROLE = "text.router"
 ROOT_ROLE = "root"
@@ -99,6 +111,9 @@ DEFAULT_ROLES: tuple[tuple[str, str], ...] = (
     ("text.layer", r"(?:^|\.)language_model\.layers\.(\d+)$"),
     ("text.attn", r"(?:^|\.)language_model\.layers\.(\d+)\.self_attn$"),
     ("text.moe", r"(?:^|\.)language_model\.layers\.(\d+)\.mlp$"),
+    # The grouped expert GEMMs alone: no collective runs inside this span, so it is the MoE block's own work.
+    # The block's span minus this one holds the router, the all-to-alls and the wait for the EP group.
+    ("text.experts", r"(?:^|\.)language_model\.layers\.(\d+)\.mlp\.experts$"),
     (ROUTER_ROLE, r"(?:^|\.)language_model\.layers\.(\d+)\.mlp\.gate$"),
     ("text.norm", r"(?:^|\.)language_model\.norm$"),
     ("lm_head", r"(?:^|\.)lm_head$"),
@@ -121,6 +136,17 @@ def _in_backward() -> bool:
     if current_graph_task_id is None:
         return False
     return current_graph_task_id() != -1
+
+
+def _fingerprint(input_ids: torch.Tensor) -> int:
+    """Return a number that identifies a sequence of token ids, so the same sample can be found in another run.
+
+    The ids weighted by their position (modulo a prime), summed: cheap on the device, and two samples of the
+    same length share it only by accident.
+    """
+    flat = input_ids.reshape(-1).to(torch.int64)
+    weights = torch.arange(flat.numel(), device=flat.device, dtype=torch.int64) % 9973 + 1
+    return int((flat * weights).sum().item())
 
 
 def _scalar(value: Any) -> int:
@@ -153,6 +179,7 @@ def batch_workload(batch: Mapping[str, Any], spatial_merge_size: int = 2, max_gr
     if isinstance(input_ids, torch.Tensor):
         result["batch_size"] = int(input_ids.shape[0]) if input_ids.dim() > 1 else 1
         result["tokens"] = int(input_ids.numel())
+        result["fingerprint"] = _fingerprint(input_ids)
     attention_mask = batch.get("attention_mask")
     result["real_tokens"] = (
         _scalar(attention_mask.sum()) if isinstance(attention_mask, torch.Tensor) else result.get("tokens", 0)
@@ -205,10 +232,58 @@ def _guarded(method: Callable[..., Any]) -> Callable[..., Any]:
         try:
             return method(self, *args, **kwargs)
         except Exception as exc:  # pylint: disable=broad-exception-caught
-            self._fail(method.__name__, exc)  # pylint: disable=protected-access
+            self.fail(method.__name__, exc)
             return None
 
     return wrapper
+
+
+class _NullRegion:
+    """The region of a recorder that is off: does nothing, costs nothing."""
+
+    def __enter__(self) -> "_NullRegion":
+        """Enter without recording."""
+        return self
+
+    def __exit__(self, *exc_info: Any) -> bool:
+        """Leave without recording; never hides an exception."""
+        return False
+
+
+_NULL_REGION = _NullRegion()
+
+
+class _Region:
+    """Times one stretch of code as a pseudo-module named ``name``."""
+
+    def __init__(self, profiler: "HeteroProfiler", name: str, phase: Optional[str]) -> None:
+        """Remember what to time; nothing is recorded before ``__enter__``."""
+        self.profiler = profiler
+        self.name = name
+        self.phase = phase
+        self.module_id = -1
+        self.pass_name = FWD
+        self.occurrence = 0
+        self.opened = False
+
+    def __enter__(self) -> "_Region":
+        """Record the entry; a failure of the recorder never reaches the timed code."""
+        profiler = self.profiler
+        try:
+            self.module_id = profiler.custom_module(self.name)
+            self.pass_name = self.phase or (BWD if _in_backward() else FWD)
+            self.occurrence = profiler.next_occurrence(self.module_id, self.pass_name)
+            profiler.mark(self.module_id, self.pass_name, self.occurrence, ENTER)
+            self.opened = True
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            profiler.fail("region", exc)
+        return self
+
+    def __exit__(self, *exc_info: Any) -> bool:
+        """Record the exit; never hides an exception of the timed code."""
+        if self.opened:
+            self.profiler.mark(self.module_id, self.pass_name, self.occurrence, EXIT)
+        return False
 
 
 class _DeviceClock:
@@ -294,6 +369,7 @@ class HeteroProfiler:
         self.enabled = False
         self._failed = False
         self.output_dir = ""
+        self.hooks = True
         self.vision_blocks = True
         self.sublayers = True
         self.routing_by_modality = True
@@ -301,9 +377,12 @@ class HeteroProfiler:
         self.step_peaks = True
         self.spatial_merge_size = 2
         self._run_peaks = [0, 0]
+        self._base_roles = tuple(roles)
         self._roles = [(role, re.compile(pattern)) for role, pattern in roles]
         self._clock: Optional[_DeviceClock] = None
         self._modules: list[dict[str, Any]] = []
+        self._custom_ids: dict[str, int] = {}
+        self._pending_modules: list[dict[str, Any]] = []
         self._handles: list[Any] = []
         self._root_id: Optional[int] = None
         self._stream = None
@@ -335,10 +414,37 @@ class HeteroProfiler:
             memory: bool = True,
             step_peaks: bool = True,
             spatial_merge_size: int = 2,
+            hooks: bool = True,
+            extra_roles: Sequence[str] = (),
     ) -> None:
-        """Enable recording and choose where the per-rank files are written."""
+        """Enable recording and choose where the per-rank files are written.
+
+        Args:
+            enabled: Record at all.
+            output_dir: Directory of the per-rank files.
+            vision_blocks: Hook each vision block, merger and patch embedding.
+            sublayers: Hook the attention and the MoE block of each decoder layer.
+            routing_by_modality: Count the experts the image and the text tokens choose.
+            memory: Read the allocated bytes at every boundary.
+            step_peaks: Read and reset the allocator's peak counters at every step.
+            spatial_merge_size: Side of the vision tower's patch merge.
+            hooks: Hook the modules at all; off, only the step record is written.
+            extra_roles: ``"role=regex"`` entries naming further modules to hook; the regex is matched against
+                module paths with wrapper segments removed, its first group (if any) is the block index.
+
+        Raises:
+            ValueError: If an extra role is not of the form ``role=regex``.
+        """
         self.enabled = enabled
         self.output_dir = output_dir
+        self.hooks = hooks
+        extras = []
+        for entry in extra_roles:
+            role, separator, pattern = str(entry).partition("=")
+            if not separator or not role.strip() or not pattern:
+                raise ValueError(f"hetero_profile.extra_roles entries must read 'role=regex', got {entry!r}")
+            extras.append((role.strip(), pattern))
+        self._roles = [(role, re.compile(pattern)) for role, pattern in (*self._base_roles, *extras)]
         self.vision_blocks = vision_blocks
         self.sublayers = sublayers
         self.routing_by_modality = routing_by_modality
@@ -380,7 +486,7 @@ class HeteroProfiler:
         applied, so the hooks sit outside the sharding hooks. A module behind
         a wrapper is hooked once, at the outermost module of that path.
         """
-        if not self.enabled or model is None:
+        if not self.enabled or model is None or not self.hooks:
             return {}
         self.detach()
         seen: set[str] = set()
@@ -426,6 +532,8 @@ class HeteroProfiler:
             handle.remove()
         self._handles = []
         self._modules = []
+        self._custom_ids = {}
+        self._pending_modules = []
         self._root_id = None
 
     # -- step lifecycle ------------------------------------------------------
@@ -438,7 +546,7 @@ class HeteroProfiler:
         device, which is idle between steps), then the step's start stamp is
         taken.
         """
-        if not self.enabled or not self._modules:
+        if not self.enabled:
             return
         workloads = [batch_workload(batch, self.spatial_merge_size) for batch in micro_batches or []]
         self._clock.synchronize()
@@ -483,6 +591,9 @@ class HeteroProfiler:
             "peak_allocated": peak_allocated,
             "peak_reserved": peak_reserved,
         }
+        if self._pending_modules:
+            record["modules_added"] = self._pending_modules
+            self._pending_modules = []
         record.update(extras)
         self._write(record)
         return record
@@ -515,7 +626,37 @@ class HeteroProfiler:
         allocated = self._clock.allocated() if self.memory else None
         self._marks.append((module_id, pass_name, occurrence, kind, stamp, allocated))
 
-    def _next_occurrence(self, module_id: int, pass_name: str) -> int:
+    def region(self, name: str, phase: Optional[str] = None) -> Any:
+        """Return a context manager that times a stretch of code as the component ``name``.
+
+        The code need not be a module: a redistribution all-to-all, a scheduling step, a new kernel. The
+        component appears in the report as ``custom``, by name, and counts as the rank's work. Outside a
+        recorded step it costs a method call.
+
+        Args:
+            name: The component's name, the same on every call and every rank.
+            phase: ``"fwd"``, ``"recompute"`` or ``"bwd"``; by default ``"bwd"`` inside the autograd engine
+                (recompute included) and ``"fwd"`` elsewhere.
+
+        Returns:
+            A context manager.
+        """
+        if not self._active or self._failed:
+            return _NULL_REGION
+        return _Region(self, name, phase)
+
+    def custom_module(self, name: str) -> int:
+        """Return the id of the pseudo-module that stands for a region, creating it on first use."""
+        module_id = self._custom_ids.get(name)
+        if module_id is None:
+            module_id = len(self._modules)
+            module = {"id": module_id, "name": name, "role": "custom", "index": None}
+            self._modules.append(module)
+            self._pending_modules.append(module)
+            self._custom_ids[name] = module_id
+        return module_id
+
+    def next_occurrence(self, module_id: int, pass_name: str) -> int:
         """Count the calls of one module in one pass during this step."""
         key = (module_id, pass_name)
         occurrence = self._occurrences.get(key, 0)
@@ -533,12 +674,12 @@ class HeteroProfiler:
             try:
                 return hook(*args, **kwargs)
             except Exception as exc:  # pylint: disable=broad-exception-caught
-                self._fail("module hook", exc)
+                self.fail("module hook", exc)
                 return None
 
         return protected
 
-    def _fail(self, where: str, exc: BaseException) -> None:
+    def fail(self, where: str, exc: BaseException) -> None:
         """Switch the recorder off after an error in it, and say so once."""
         self._failed = True
         self._active = False
@@ -559,7 +700,7 @@ class HeteroProfiler:
             if not self._active:
                 return None
             pass_name = RECOMPUTE if _in_backward() else FWD
-            occurrence = self._next_occurrence(module_id, pass_name)
+            occurrence = self.next_occurrence(module_id, pass_name)
             self._open.setdefault(module_id, []).append((pass_name, occurrence))
             self.mark(module_id, pass_name, occurrence, ENTER)
             if not torch.is_grad_enabled():
@@ -611,7 +752,7 @@ class HeteroProfiler:
             if not self._active:
                 return
             pass_name = RECOMPUTE if _in_backward() else FWD
-            occurrence = self._next_occurrence(module_id, pass_name)
+            occurrence = self.next_occurrence(module_id, pass_name)
             self.mark(module_id, pass_name, occurrence, ENTER)
             media = kwargs.get("mm_token_type_ids")
             self._visual_mask = (media > 0).reshape(-1) if isinstance(media, torch.Tensor) else None
@@ -693,6 +834,7 @@ class HeteroProfiler:
             "device_type": get_device_type(),
             "time_source": "device" if self._clock.uses_events else "host",
             "spatial_merge_size": self.spatial_merge_size,
+            "hooks": self.hooks,
             "modules": self._modules,
         }
 

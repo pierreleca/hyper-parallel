@@ -19,7 +19,7 @@ class names, fields and defaults are unchanged.
 """
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 from hyper_parallel.components.quantization.config import LowPrecisionConfig
 
@@ -108,6 +108,13 @@ class HeteroProfileConfig:
     output_dir: str = "./outputs/hetero_profile"
     start_step: int = 1
     end_step: int = 0
+    # Hook the model's modules. Off, only the step record is written (wall and device time of the step,
+    # the gap since the previous one, the workload and fingerprint of each micro-batch, loss and gradient
+    # norm): cheap enough to time a baseline and a candidate with the recorder on.
+    hooks: bool = True
+    # Further modules to hook, as "role=regex" (matched against module paths without wrapper segments; the
+    # first group of the regex is the block index). Unknown roles are summed into the report's "custom" part.
+    extra_roles: List[str] = field(default_factory=list)
     # Time each vision block, merger and patch embedding, not only the vision tower.
     vision_blocks: bool = True
     # Time the attention and the MoE block of each decoder layer, not only the layer.

@@ -46,6 +46,8 @@ class HeteroProfileCallback(Callback):
             routing_by_modality=self.config.routing_by_modality,
             memory=self.config.memory,
             step_peaks=self.config.step_peaks,
+            hooks=self.config.hooks,
+            extra_roles=self.config.extra_roles,
         )
 
     def _records(self, state: TrainerState) -> bool:
@@ -62,8 +64,9 @@ class HeteroProfileCallback(Callback):
             return
         counts = self.profiler.attach(self.trainer.model) or {}
         logger.info(
-            "Hetero profile: hooked %s; writing per-rank records to %s",
-            ", ".join(f"{count} {role}" for role, count in sorted(counts.items())) or "no module",
+            "Hetero profile: %s; writing per-rank records to %s",
+            ("hooked " + ", ".join(f"{count} {role}" for role, count in sorted(counts.items())))
+            if self.config.hooks else "step records only (hooks off)",
             self.config.output_dir,
         )
 
