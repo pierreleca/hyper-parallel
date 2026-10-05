@@ -321,7 +321,11 @@ def compare(baseline: Arm, candidate: Arm, target: float = TARGET, skip: int = 0
     summary: dict[str, Any] = {"baseline": baseline.name, "candidate": candidate.name, "target": target}
     out.append(f"A/B: baseline {baseline.name} ({len(baseline.runs)} run(s), {len(baseline.steps)} steps) against "
                f"candidate {candidate.name} ({len(candidate.runs)} run(s), {len(candidate.steps)} steps)")
-    rows = [("step time (slowest rank)", "step_ms"), ("end to end (+ gap before the step)", "e2e_ms")]
+    logged = not (baseline.has_tokens and candidate.has_tokens)
+    # A trainer log has the step time only (no gap before the step): compare like with like.
+    rows = [("step time (slowest rank)", "step_ms")]
+    if not logged:
+        rows.append(("end to end (+ gap before the step)", "e2e_ms"))
     out.append("                                     baseline      candidate      speedup (95% interval)")
     for label, key in rows:
         base, cand = mean([s[key] for s in baseline.steps]), mean([s[key] for s in candidate.steps])
@@ -331,7 +335,7 @@ def compare(baseline: Arm, candidate: Arm, target: float = TARGET, skip: int = 0
         out.append(f"  {label:34s} {base:9.1f} ms   {cand:9.1f} ms   {point:+7.1%}  [{low:+.1%}, {high:+.1%}]")
         summary[key] = {"baseline": base, "candidate": cand, "speedup": point, "low": low, "high": high}
     primary = None
-    if baseline.has_tokens and candidate.has_tokens:
+    if not logged:
         for label, quantity in (("samples per second", "samples"), ("tokens per second", "tokens"),
                                 (f"work per second (tokens + {COST_VISUAL} visual)", "work")):
             base, cand = throughput(baseline.steps, quantity), throughput(candidate.steps, quantity)
@@ -339,10 +343,18 @@ def compare(baseline: Arm, candidate: Arm, target: float = TARGET, skip: int = 0
             out.append(f"  {label:34s} {base:9.1f}      {cand:9.1f}      {point:+7.1%}  [{low:+.1%}, {high:+.1%}]")
             summary[quantity] = {"baseline": base, "candidate": cand, "speedup": point, "low": low, "high": high}
         primary = summary["work"]
+        # Work per second depends on how much a visual token weighs; show how much the verdict does.
+        weighed = []
+        for weight in (0.0, 1.5):
+            speedup = bootstrap_speedup(
+                [{**s, "work": s["tokens"] + weight * s["visual"]} for s in baseline.steps],
+                [{**s, "work": s["tokens"] + weight * s["visual"]} for s in candidate.steps], "work", draws)[0]
+            weighed.append(f"{speedup:+.1%} at weight {weight}")
+        out.append(f"  (work per second with another weight of a visual token: {', '.join(weighed)})")
     else:
         out.append("  (a trainer log carries no token counts: only the step time is compared)")
     pairs = pair_steps(baseline.steps, candidate.steps)
-    decisive = primary or summary["e2e_ms"]
+    decisive = primary or summary["step_ms"]
     label = "work per second, unpaired"
     if len(pairs) >= 5:
         point, low, high = bootstrap_paired(pairs, draws)

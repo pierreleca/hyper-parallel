@@ -16,6 +16,9 @@ a model of it.
 | Where does the model's own heterogeneity bite (per layer, vision, head)? | any | `MODEL`, `DECODER LAYERS`, `VISION BLOCKS`, `PIPELINE` |
 | Do image and text tokens load the experts differently? | any | `ROUTING by modality` |
 | What do the spans not show (kernels, stream waits, collectives)? | `hetero_profile` | `trace.txt` |
+| How noisy is the baseline, and what do the recorders cost? | `hetero_baseline` | `compare_*.txt` of twin runs |
+| How much could an idea gain at most? | any run with module hooks | `CEILINGS`, `ASSIGNMENT` |
+| Did the idea deliver 20%, and did the loss hold? | `hetero_ab` | `compare_*.txt`: verdict, numerics, components |
 
 ## Parallelism and memory
 
@@ -99,10 +102,13 @@ examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/h
 | `hetero_data_32dev.sh` | the six datasets, 14 steps each | all six |
 | `hetero_balance_32dev.sh` | `both` and `longtail` in random and balanced order, and with two micro-batches per rank | `both`, `longtail` |
 | `hetero_profile_32dev.sh` | the Ascend profiler on every rank for two steps, on `fixed` and `both` | `fixed`, `both` |
+| `hetero_baseline_32dev.sh` | twin runs of `fixed` and `both` (the noise floor), with module hooks on, and with the recorder off | `fixed`, `both` |
+| `hetero_ab_32dev.sh` | base, candidate, base, candidate with the light recorder, then one hooked pair; `IDEA=<flags>` | the dataset you pass |
 
 `hetero_campaign.sh --resume <campaign dir>` carries on an interrupted campaign, `--rerun <run>` redoes a run,
 `--summarize` redoes the summary, and `hetero_campaign_status.sh <campaign dir>` says what `--resume` would do.
-Environment knobs are listed in the script's header. Start with smoke, then probe, then the data ladder.
+Environment knobs are listed in the script's header. Start with smoke, then probe, then the baseline (it
+decides how large a difference counts), then the data ladder.
 
 The same run by hand, for one configuration (the campaign passes the three output directories for you):
 
@@ -156,15 +162,119 @@ rank, step and micro-batch: the sample's workload and the time of each component
 | `PIPELINE`: the vision tower plus the first layers outweigh a fair stage | the stage holding the tower needs fewer layers, and its cost varies with the images |
 | host gap between steps of tens of ms or more | the data loader (image decode and resize) is a bottleneck: raise `dataloader.num_workers` |
 
+## Measuring the two 20% targets
+
+The project claims two speedups: one from an idea that targets the **data's** heterogeneity, one from an idea that
+targets the **model's**. The runs above diagnose and size; this section is how they become a measurement of a claim.
+
+**1. Fix the baseline and its noise (`hetero_baseline_32dev.sh`).** Twin runs of `fixed` and of `both`, 20 steps
+each, the same 640 samples in the same order. The comparison of a run with its twin is the noise floor: a gain
+smaller than it is not a result. The same plan prices the recorders: module hooks on, and the recorder off (the
+trainer's own log, `perf.txt`). Every A/B run below uses the *light* recorder (`hetero_profile.hooks=false`): two
+device events and one synchronization per step, nothing else.
+
+**2. Size the idea before building it (`CEILINGS`, `ASSIGNMENT`).** A 20% speedup means the step shrinks by 16.7%,
+so the idea has to remove at least that share of the step. The `CEILINGS` table lists what each family of change
+could remove if it cost nothing:
+
+| Idea targets | Row of `CEILINGS` that bounds it | Also read |
+| --- | --- | --- |
+| balancing samples over ranks (cost-aware assignment, bucketing, packing) | *balance the data*; *balance every module's work* | `ASSIGNMENT`: with one micro-batch per rank no assignment helps, the costliest sample is the floor; at 2, 4, 8 dealing by cost cuts the busiest rank's work by the percentage listed. `WHAT IF`: regrouping the steps |
+| the vision tower's load (image-level balancing, a separate encoder group, overlap with the decoder) | *only the vision tower*; *vision tower free* | `DATA` (patches, attention pairs), `RANK GROUPS` once the design places the tower apart |
+| the MoE (expert placement or replication, all-to-all overlap, router syncs) | *only the MoE experts*; *MoE router, all-to-alls and syncs free* | `ROUTING by modality`, the exchange row of `MODEL`, `ep_report.txt` |
+| the weight gathers (fusing the small vision FSDP units, deeper prefetch, a different sharding of the tower) | *weight gathers hidden* (vision, decoder) | `idle between modules` in `MODEL`, `trace.txt` |
+| recompute and memory (selective policies per component) | *recompute free* | `MEMORY`, per-component recompute in `MODEL` |
+| the host (data loading, scheduling) | *data loading hidden* | `host gap` in `RUN` |
+
+A row whose ceiling is below +20% cannot deliver the target alone, whatever its implementation; two rows that
+overlap cannot be added. Read the ceilings on the dataset where the idea is supposed to win: `both`, `longtail` or
+`natural` for the data idea, `fixed` for the model idea (no sample differs, so what is left is the model's own).
+In the unpacked regime (`text`, `both`, `longtail`) the sample lengths differ; `vision` is the *packed* regime, where
+every sequence has the same length and only the images differ. Judge the data idea against the baseline practice it
+would replace: against packing, the `vision` ceiling is the realistic one.
+
+**3. Record what the new code costs (`HETERO_PROFILE.region`).** A new design adds work: an all-to-all that moves
+images between ranks, a scheduling decision, a gather of features. Wrap each in a region, and it appears in the
+report as a `custom` component, counted in the rank's work and in the imbalance attribution:
+
+```python
+from hyper_parallel.trainer.runtime.hetero_profile import HETERO_PROFILE
+
+with HETERO_PROFILE.region("vit_redistribute"):      # a stretch of code; "bwd" inside the autograd engine
+    features = redistribute(images)
+```
+
+Modules of a new design are hooked by name with `hetero_profile.extra_roles=["my_role=regex"]` (the regex is matched
+against the module path, its first group is the block index). A region outside a recorded step costs a method call.
+
+**4. Certify the speedup (`hetero_ab_32dev.sh`, `compare_runs.py`).**
+
+```bash
+IDEA="--my_idea.enabled=true" DATASET=both  examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_ab_32dev.sh
+IDEA="--my_model_idea=true"   DATASET=fixed examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_ab_32dev.sh
+```
+
+The plan runs base, candidate, base, candidate (alternation spreads the cluster's drift over both arms), then one pair
+with module hooks. `compare_runs.py` pools the repeats and prints
+
+- the speedup of the step time, end to end (with the host's gap before the step), and in samples, tokens and work
+  per second, each with a 95% bootstrap interval over steps. Work is `tokens + 0.5 * visual tokens`, and the line
+  below the table shows how much the verdict moves with that weight;
+- the *paired* speedup when both arms ran the same samples in the same steps (matched by each micro-batch's
+  fingerprint): the variance the data itself brings drops out, and this interval decides the verdict against +20%:
+  **MET** if its lower end clears the target, **NOT MET** if its upper end falls short, **INCONCLUSIVE** otherwise;
+- the loss and gradient norm of the paired steps (a speedup that moved them is not a speedup), the memory peak, and
+  with the hooked pair the change of every component per 1k tokens, the custom components the idea added, and the
+  busiest-over-mean of the ranks before and after.
+
+An idea that regroups samples (a different order) changes which samples share a step: the arms are then unpaired, the
+comparison rests on work per second, and the loss is compared as a curve over consumed samples, not step by step.
+
+## What the code cannot measure, yet
+
+- **Pipeline, tensor and context parallelism for the vision-language model.** The Trainer's VLM batch path requires
+  TP = CP = PP = 1 on this branch, so a baseline of a design that needs them (pipeline stages that hold the vision
+  tower, context-parallel long samples) cannot be run here. `PIPELINE` and `ASSIGNMENT` price them from the measured
+  costs; the pipeline work lives on the `mpipe` line, where the recorder would have to be ported.
+- **Text-only samples and videos** (see above): not generated, not accounted.
+- **Kernel truth.** The spans come from device events at module boundaries. Their assumption (the entry stamp follows
+  the weights' unshard) is checked against the Ascend trace of `hetero_profile_32dev.sh`, not automatically.
+- **Convergence.** The numerics check covers the first steps on the same samples. Whether a regrouped or rebalanced
+  order changes convergence needs a longer run and its loss curve.
+- **Scales other than 32 dies.** Nothing is tied to 32; the ceilings and the sampling assume the sampler deals
+  consecutive samples to the ranks of a step.
+
+## Trying the report before a run
+
+`synthetic_hetero_records.py` simulates a run with the structure of the real one (weight gathers and EP all-to-alls
+that wait for the slowest rank) from rough FLOP-count costs. **Nothing in it was measured**; the report prints a
+banner, and the header says `time_source: synthetic`. It exists to learn what each section shows and to test the
+analysis at 32 ranks and 48 layers:
+
+```bash
+python examples/qwen3_vl_30b_perf/synthetic_hetero_records.py --out /tmp/demo/both/hetero --scenario both
+python examples/qwen3_vl_30b_perf/synthetic_hetero_records.py --out /tmp/demo/both_balanced/hetero --scenario both --order balanced
+python examples/qwen3_vl_30b_perf/analyze_hetero.py /tmp/demo/both/hetero --skip 1
+python examples/qwen3_vl_30b_perf/compare_runs.py --baseline /tmp/demo/both --candidate /tmp/demo/both_balanced
+```
+
 ## What the numbers are, and are not
 
 - A module's span runs from its entry, taken after the sharding hooks have unsharded its weights, to its exit,
   taken before they reshard. It is the module's own work and any collective inside it (the expert all-to-alls);
   the wait for weights is the gap before it. If the first run shows the gaps holding most of a layer's time,
   the hooks do not sit where this assumes: check the stream waits in `trace.txt` (`hetero_profile` plan).
-- Inside a layer the MoE span holds the all-to-alls, so the ranks of an EP group look more alike there than
-  their routing is. `analyze_ep_instrument.py` (`ep_report.txt`) splits the block into router, dispatch,
-  experts, combine and aggregate and shows the wait for the last rank.
+- Inside a layer the MoE span holds the all-to-alls and the wait for the slowest rank of the EP group, so on its own
+  it would make the ranks of a group look alike. The `text.experts` span (the grouped GEMMs, no collective inside)
+  is what separates the two: the block's span minus the experts' is `ep_exchange`, and `text_layer` keeps the
+  rest. That relies on the EP path calling `module.experts(...)` as a module, as `_run_ep_local_experts` does; if
+  the smoke run shows no `text_experts` row, the expert imbalance is hidden in `text_layer` (the report says so).
+  `analyze_ep_instrument.py` (`ep_report.txt`) splits the block further, into router, dispatch, combine and
+  aggregate.
+- The report prices the critical path two ways. The rank totals (*balance the data*) say what equal total work on
+  every rank would give. The per-module sum says what equal work in every module would give; every layer starts with
+  a collective that all ranks join, so the step is paced by the slowest rank of each module, and this sum is the
+  larger, and the one that the experts' routing and the attention's quadratic cost feed.
 - The patch embedding's backward is not measured (its input has no gradient), nor is a tower root's. The
   vision tower's backward is the sum of its blocks, mergers and deepstack mergers.
 - Peaks are per step (`hetero_profile.step_peaks`). With `ep_instrument.segment_peaks` on they would be reset in
@@ -180,8 +290,10 @@ rank, step and micro-batch: the sample's workload and the time of each component
 | --- | --- |
 | `train_32dev_a3_hetero.yaml` | the configuration: 32 dies, the whole model, the recorders on |
 | `prepare_hetero_data.py`, `variable_length_transform.py` | the datasets, and the transform that keeps each sample's length |
-| `hetero_campaign.sh`, `hetero_campaign_status.sh`, `plans/hetero_*.sh` | the campaign runner and its plans |
-| `analyze_hetero.py` | the heterogeneity report |
+| `hetero_campaign.sh`, `hetero_campaign_status.sh`, `plans/hetero_*.sh` | the campaign runner (runs, reports, comparisons) and its plans |
+| `analyze_hetero.py` | the heterogeneity report: data, components, cost model, imbalance, ceilings, what-ifs |
+| `compare_runs.py` | baseline against candidate: speedup and interval, pairing, numerics, per-component change |
+| `synthetic_hetero_records.py`, `hetero_sampling.py` | simulated records to learn the report; the datasets' arithmetic |
 | `analyze_ep_instrument.py` | the MoE phase and routing report (records from `ep_instrument`) |
 | `analyze_npu_trace.py`, `ascend_trace.py` | the Ascend profiler report (records from `profiling`) |
 | `cropped_qwen3_vl.py`, `prepare_cauldron_data.py`, `parse_perf_log.py` | the model builder, the cauldron helpers, the log parser |

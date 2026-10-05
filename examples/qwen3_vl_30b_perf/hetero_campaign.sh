@@ -35,8 +35,12 @@
 # The plan (see plans/hetero_*.sh) is a bash file that sets:
 #   CONFIG     training YAML, repository-relative
 #   SKIP       (optional) recorded steps the reports drop as warm-up [0]
+#   SKIP_LOG   (optional) leading steps of the trainer's log that perf.txt leaves out [2]
 #   EP_SIZE    (optional) ranks per expert-parallel group, for the routing report [16]
 #   RUNS       one entry per run: "<name> [--override=value ...]", run in order
+#   COMPARE    (optional) A/B comparisons after the runs: "<candidate>:<baseline>" entries; either side may list
+#              several runs separated by commas, which are pooled (repeats). BASELINE=<run> compares every other
+#              run with that one.
 #
 # What it does, stopping a run (not the campaign) at its first failure:
 #   1. per run: launches it once every device is free (torchrun -w --run-id),
@@ -44,8 +48,10 @@
 #   2. gathers the small records (not the traces), merges the ranks of every node
 #      into one directory, and runs the reports: the heterogeneity report
 #      (analyze_hetero.py), the EP phase report, the trace report on the nodes for
-#      profiled runs;
-#   3. writes SUMMARY.txt with each run's state and, over all runs, one sweep table.
+#      profiled runs, and perf.txt, the step times the trainer logged itself;
+#   3. runs the comparisons of COMPARE (compare_runs.py: speedup and interval, pairing by sample, loss
+#      equivalence, per-component change) into compare_<candidate>_vs_<baseline>.txt;
+#   4. writes SUMMARY.txt with each run's state, one sweep table over all runs, and each comparison's verdict.
 #
 # Everything lands in $OUT_BASE/<campaign>/ on the control node; <run>/run_id names
 # the run on the cluster (cluster status/logs/kill). Environment knobs (defaults in
@@ -70,12 +76,19 @@ esac
 [[ $# -eq 1 ]] || { echo "usage: $0 <plan.sh> | --resume <campaign dir> [--rerun <run> ...] | --summarize <campaign dir>" >&2; exit 2; }
 PLAN="$(realpath "$1")"
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # this checkout's analysis scripts
+COMPARE=() BASELINE=""
 # shellcheck source=/dev/null
 source "$PLAN"
 : "${CONFIG:?plan sets CONFIG}"
 [[ ${#RUNS[@]} -ge 1 ]] || { echo "the plan sets no RUNS" >&2; exit 2; }
 SKIP="${SKIP:-0}"
+SKIP_LOG="${SKIP_LOG:-2}"
 EP_SIZE="${EP_SIZE:-16}"
+if [[ -n "$BASELINE" && ${#COMPARE[@]} -eq 0 ]]; then
+  for entry in "${RUNS[@]}"; do
+    [[ "${entry%% *}" != "$BASELINE" ]] && COMPARE+=("${entry%% *}:$BASELINE")
+  done
+fi
 
 OUT_BASE="${OUT_BASE:-/home/pl/a3_runs}"
 RUNS_DIR="${RUNS_DIR:-/home/pl/runs/qwen3_vl_30b_perf}"
@@ -144,6 +157,7 @@ process_run() {  # process_run <name> <override>...
   fi
   local remote="$RUNS_DIR/$run"
   echo "=== $name ($run): ${overrides[*]:-(no overrides)}"
+  printf '%s\n' "${overrides[*]:-}" > "$local_dir/cmdline.txt"
   if [[ "$launch" -eq 1 ]]; then
     echo "$run" > "$local_dir/run_id"
     if ! "${CL[@]}" torchrun -w -i "$INTERVAL" --run-id "$run" scripts/train_vl.py "$CONFIG" \
@@ -161,6 +175,11 @@ process_run() {  # process_run <name> <override>...
     return
   fi
   capture_log "$run" "$local_dir"
+  # The step times the trainer logged itself (no recorder involved): the reference for an overhead or a clean timing.
+  if [[ -s "$local_dir/log.txt" ]]; then
+    python3 "$TOOLS/parse_perf_log.py" --skip "$SKIP_LOG" "$local_dir/log.txt" > "$local_dir/perf.txt" 2>&1 \
+      || echo "$name: no metric lines in the log"
+  fi
   # Records of every node into one directory per kind.
   "${CL[@]}" gather "$remote/hetero" "$remote/instrument" "$OUT/raw/$name" > /dev/null 2>&1 || true
   for kind in hetero instrument; do
@@ -215,7 +234,22 @@ if [[ "$MODE" != summarize ]]; then
   done
 fi
 
-# 3. The summary.
+# 3. The comparisons: <candidate>:<baseline>, each side one run or several pooled with commas.
+sides() {  # sides <a,b,...>: the run directories, space separated
+  local name out=()
+  for name in ${1//,/ }; do out+=("$OUT/$name"); done
+  printf '%s\n' "${out[@]}"
+}
+for pair in "${COMPARE[@]}"; do
+  candidate="${pair%%:*}" baseline="${pair#*:}"
+  file="$OUT/compare_${candidate//,/+}_vs_${baseline//,/+}.txt"
+  mapfile -t base_dirs < <(sides "$baseline")
+  mapfile -t cand_dirs < <(sides "$candidate")
+  python3 "$TOOLS/compare_runs.py" --baseline "${base_dirs[@]}" --candidate "${cand_dirs[@]}" --skip 1 \
+    > "$file" 2>&1 || echo "compare $pair failed (see $file)"
+done
+
+# 4. The summary.
 {
   echo "campaign $CAMPAIGN, config $CONFIG"
   for entry in "${RUNS[@]}"; do
@@ -234,6 +268,13 @@ fi
     echo
     python3 "$TOOLS/analyze_hetero.py" --sweep --skip "$SKIP" --ep-size "$EP_SIZE" "${sweep[@]}" 2>&1 || echo "sweep failed"
   fi
+  for file in "$OUT"/compare_*.txt; do
+    [[ -f "$file" ]] || continue
+    echo
+    grep -E '^A/B:|end to end|work per second|paired steps|verdict|noise:|numerics, |memory:' "$file" \
+      || echo "$(basename "$file"): see the file"
+  done
   echo
-  echo "reports: $OUT/<run>/{report,ep_report,trace}.txt, $OUT/<run>/analysis_hetero/{hetero_report.json,microbatches.csv}"
+  echo "reports: $OUT/<run>/{report,ep_report,trace,perf}.txt, $OUT/compare_*.txt,"
+  echo "         $OUT/<run>/analysis_hetero/{hetero_report.json,microbatches.csv}"
 } | tee "$OUT/SUMMARY.txt"
