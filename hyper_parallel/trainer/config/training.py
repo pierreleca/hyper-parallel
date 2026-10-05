@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Training-loop, debug, wandb and profiling configuration sections.
+"""Training-loop, debug, wandb, profiling and EP-instrument configuration sections.
 
 Split from ``auto_models/trainer/config.py`` in stage 7 (05 §15.2.5);
 class names, fields and defaults are unchanged.
@@ -68,6 +68,32 @@ class WandbConfig:
 
 
 @dataclass
+class EPInstrumentConfig:
+    """Expert-parallel imbalance measurement settings.
+
+    Read by ``EPInstrumentCallback``; the recording itself lives in
+    ``hyper_parallel.distributed.expert_parallel.instrument``.
+    """
+
+    enabled: bool = False
+    output_dir: str = "./outputs/ep_instrument"
+    start_step: int = 1
+    end_step: int = 0
+    segment_peaks: bool = True
+    align_steps: bool = True
+    record_counts: bool = True
+
+    def __post_init__(self) -> None:
+        """Reject a recording window that can never open."""
+        if self.start_step < 1:
+            raise ValueError("ep_instrument.start_step must be at least 1")
+        if self.end_step and self.end_step <= self.start_step:
+            raise ValueError(
+                "ep_instrument.end_step must be greater than start_step, or 0 for every step"
+            )
+
+
+@dataclass
 class ProfilingConfig:
     """Lightweight per-step profiler settings."""
 
@@ -79,4 +105,5 @@ class ProfilingConfig:
     profile_memory: bool = False
     with_stack: bool = False
     with_modules: bool = False
+    # The rank to profile, or -1 for every rank (one rank<N>_<time>_ascend_pt directory each).
     rank: int = 0

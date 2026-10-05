@@ -26,6 +26,7 @@ re-exported here. The temporary ``TempLogCallback`` alias was dropped —
 from hyper_parallel.trainer.state import TrainerState
 from .base import Callback
 from .environ_meter_callback import EnvironMeterCallback
+from .ep_instrument_callback import EPInstrumentCallback
 from .evaluate_callback import EvaluateCallback
 from .garbage_collection_callback import GarbageCollectionCallback
 from .logging_callback import LoggingCallback
@@ -37,6 +38,7 @@ from .tqdm_callback import TqdmCallback
 __all__ = [
     "Callback",
     "EnvironMeterCallback",
+    "EPInstrumentCallback",
     "EvaluateCallback",
     "GarbageCollectionCallback",
     "LoggingCallback",

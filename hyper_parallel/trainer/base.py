@@ -87,6 +87,7 @@ from hyper_parallel.trainer.runtime.device import (  # pylint: disable=syntax-er
 
 from hyper_parallel.trainer.callbacks import (
     EnvironMeterCallback,
+    EPInstrumentCallback,
     EvaluateCallback,
     GarbageCollectionCallback,
     LoggingCallback,
@@ -443,7 +444,11 @@ class BaseTrainer(Stateful, ABC):
         self.evaluate_callback = EvaluateCallback(self)
         self.garbage_collection_callback = GarbageCollectionCallback(self)
         self.profiling_callback = ProfilingCallback(self)
+        self.ep_instrument_callback = EPInstrumentCallback(self)
         self._callbacks = [
+            # First: its step barrier and its device synchronization must
+            # happen before the step timer of the environment meter starts.
+            self.ep_instrument_callback,
             self.environ_meter_callback,
             self.logging_callback,
             self.tqdm_callback,
