@@ -38,6 +38,7 @@ from hyper_parallel.trainer.config.target import Target, _serialize_config_value
 from hyper_parallel.trainer.config.training import (
     DebugConfig,
     EPInstrumentConfig,
+    HeteroProfileConfig,
     ProfilingConfig,
     TrainingConfig,
     WandbConfig,
@@ -81,6 +82,7 @@ class TrainerConfig:
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
     ep_instrument: EPInstrumentConfig = field(default_factory=EPInstrumentConfig)
+    hetero_profile: HeteroProfileConfig = field(default_factory=HeteroProfileConfig)
     magi: Optional[Any] = None
     peft: Optional[Any] = None
 

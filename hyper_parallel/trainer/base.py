@@ -90,6 +90,7 @@ from hyper_parallel.trainer.callbacks import (
     EPInstrumentCallback,
     EvaluateCallback,
     GarbageCollectionCallback,
+    HeteroProfileCallback,
     LoggingCallback,
     ProfilingCallback,
     TqdmCallback,
@@ -445,10 +446,12 @@ class BaseTrainer(Stateful, ABC):
         self.garbage_collection_callback = GarbageCollectionCallback(self)
         self.profiling_callback = ProfilingCallback(self)
         self.ep_instrument_callback = EPInstrumentCallback(self)
+        self.hetero_profile_callback = HeteroProfileCallback(self)
         self._callbacks = [
             # First: its step barrier and its device synchronization must
             # happen before the step timer of the environment meter starts.
             self.ep_instrument_callback,
+            self.hetero_profile_callback,
             self.environ_meter_callback,
             self.logging_callback,
             self.tqdm_callback,

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Training-loop, debug, wandb, profiling and EP-instrument configuration sections.
+"""Training-loop, debug, wandb, profiling, EP-instrument and heterogeneity-profile configuration sections.
 
 Split from ``auto_models/trainer/config.py`` in stage 7 (05 §15.2.5);
 class names, fields and defaults are unchanged.
@@ -90,6 +90,40 @@ class EPInstrumentConfig:
         if self.end_step and self.end_step <= self.start_step:
             raise ValueError(
                 "ep_instrument.end_step must be greater than start_step, or 0 for every step"
+            )
+
+
+@dataclass
+class HeteroProfileConfig:
+    """Per-component timing and per-micro-batch workload recording settings.
+
+    Read by ``HeteroProfileCallback``; the recording itself lives in
+    ``hyper_parallel.trainer.runtime.hetero_profile``. It explains how the
+    imbalance between ranks arises: which model component takes the time, and
+    which property of the samples (tokens, images, image size) makes it take
+    more on one rank than on another.
+    """
+
+    enabled: bool = False
+    output_dir: str = "./outputs/hetero_profile"
+    start_step: int = 1
+    end_step: int = 0
+    # Time each vision block, merger and patch embedding, not only the vision tower.
+    vision_blocks: bool = True
+    # Time the attention and the MoE block of each decoder layer, not only the layer.
+    sublayers: bool = True
+    # Per MoE layer, the expert histogram of the image tokens and of the text tokens.
+    routing_by_modality: bool = True
+    # Read the allocator's allocated bytes at every boundary.
+    memory: bool = True
+
+    def __post_init__(self) -> None:
+        """Reject a recording window that can never open."""
+        if self.start_step < 1:
+            raise ValueError("hetero_profile.start_step must be at least 1")
+        if self.end_step and self.end_step <= self.start_step:
+            raise ValueError(
+                "hetero_profile.end_step must be greater than start_step, or 0 for every step"
             )
 
 

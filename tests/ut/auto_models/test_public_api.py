@@ -226,6 +226,7 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 "DebugConfig",
                 "EPInstrumentConfig",
                 "FSDP2Config",
+                "HeteroProfileConfig",
                 "MixedPrecisionConfig",
                 "OptimizerConfig",
                 "ProfilingConfig",

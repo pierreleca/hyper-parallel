@@ -32,6 +32,7 @@ __all__ = [
     "DebugConfig",
     "EPInstrumentConfig",
     "FSDP2Config",
+    "HeteroProfileConfig",
     "MixedPrecisionConfig",
     "OptimizerConfig",
     "ProfilingConfig",
@@ -69,6 +70,7 @@ from hyper_parallel.trainer.config.trainer import TrainerConfig, save_configs
 from hyper_parallel.trainer.config.training import (
     DebugConfig,
     EPInstrumentConfig,
+    HeteroProfileConfig,
     ProfilingConfig,
     TrainingConfig,
     WandbConfig,

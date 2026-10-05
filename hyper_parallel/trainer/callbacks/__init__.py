@@ -29,6 +29,7 @@ from .environ_meter_callback import EnvironMeterCallback
 from .ep_instrument_callback import EPInstrumentCallback
 from .evaluate_callback import EvaluateCallback
 from .garbage_collection_callback import GarbageCollectionCallback
+from .hetero_profile_callback import HeteroProfileCallback
 from .logging_callback import LoggingCallback
 from .checkpoint_callback import CheckpointerCallback
 from .profiling_callback import ProfilingCallback
@@ -41,6 +42,7 @@ __all__ = [
     "EPInstrumentCallback",
     "EvaluateCallback",
     "GarbageCollectionCallback",
+    "HeteroProfileCallback",
     "LoggingCallback",
     "CheckpointerCallback",
     "ProfilingCallback",
