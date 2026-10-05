@@ -7,6 +7,10 @@
 #   cluster exec 'rm -rf /home/pl/runs/qwen3_vl_30b_perf/<campaign>_*/profile'
 # The EP instrument is off: its device events would sit in the traces. hetero_profile stays on, so each
 # rank's workload is recorded next to its trace (profiler step N is optimizer step N + 1).
+# After the trace report the campaign runs component_trace.py on the nodes: the recorder's components (attention,
+# expert GEMMs, MoE exchange, vision, gaps) drawn as a simplified trace for the busiest and the idlest rank of each
+# node and checked against the kernels of the same step (components.txt, components/<node>_components.json to open
+# in Perfetto; the same lanes over the real events stay on the node in profile/components_full).
 CONFIG=examples/qwen3_vl_30b_perf/train_32dev_a3_hetero.yaml
 DATA=/home/pl/data/qwen3_vl_30b_perf
 PROFILE="--training.train_iters=8 --ep_instrument.enabled=false --hetero_profile.start_step=2 \

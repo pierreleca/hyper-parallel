@@ -48,7 +48,10 @@
 #   2. gathers the small records (not the traces), merges the ranks of every node
 #      into one directory, and runs the reports: the heterogeneity report
 #      (analyze_hetero.py), the EP phase report, the trace report on the nodes for
-#      profiled runs, and perf.txt, the step times the trainer logged itself;
+#      profiled runs, the component trace for profiled runs (component_trace.py, on the
+#      nodes: the recorder's components drawn over the kernels of the busiest and the idlest
+#      rank of each node and checked against them), and perf.txt, the step times the trainer
+#      logged itself;
 #   3. runs the comparisons of COMPARE (compare_runs.py: speedup and interval, pairing by sample, loss
 #      equivalence, per-component change) into compare_<candidate>_vs_<baseline>.txt;
 #   4. writes SUMMARY.txt with each run's state, one sweep table over all runs, and each comparison's verdict.
@@ -208,6 +211,18 @@ process_run() {  # process_run <name> <override>...
       node="${summary#"$OUT/raw/$name/"}"
       cp "$summary" "$local_dir/profile/${node%%/*}.json"
     done
+    # The recorder's components over the kernels (component_trace.py). The small files (lanes, summary, report) come
+    # back to <run>/components/<node>_*; the large ones, with the real events, stay on the node in profile/components_full.
+    "${CL[@]}" exec -p "python examples/qwen3_vl_30b_perf/component_trace.py $remote" \
+      > "$local_dir/components.txt" 2>&1 || echo "$name: component trace failed"
+    "${CL[@]}" gather "$remote/profile/components" "$OUT/raw/$name" > /dev/null 2>&1 || true
+    mkdir -p "$local_dir/components"
+    local file
+    for file in "$OUT/raw/$name"/node*/components/*; do
+      [[ -f "$file" ]] || continue
+      node="${file#"$OUT/raw/$name/"}"
+      cp "$file" "$local_dir/components/${node%%/*}_$(basename "$file")"
+    done
   fi
   echo finished > "$local_dir/state"
 }
@@ -274,7 +289,15 @@ done
     grep -E '^A/B:|end to end|work per second|paired steps|verdict|noise:|numerics, |memory:' "$file" \
       || echo "$(basename "$file"): see the file"
   done
+  for entry in "${RUNS[@]}"; do
+    file="$OUT/${entry%% *}/components.txt"
+    [[ -s "$file" ]] || continue
+    echo
+    echo "components against the kernels, ${entry%% *}:"
+    { grep -E 'ranks drawn|rank [0-9]+:|starts at|lanes against|AGREE|UNCERTAIN|NOTHING TO COMPARE|no Ascend trace|no step|failed' \
+        "$file" || true; } | cut -c1-210
+  done
   echo
-  echo "reports: $OUT/<run>/{report,ep_report,trace,perf}.txt, $OUT/compare_*.txt,"
-  echo "         $OUT/<run>/analysis_hetero/{hetero_report.json,microbatches.csv}"
+  echo "reports: $OUT/<run>/{report,ep_report,trace,components,perf}.txt, $OUT/compare_*.txt,"
+  echo "         $OUT/<run>/analysis_hetero/{hetero_report.json,microbatches.csv}, $OUT/<run>/components/ (Perfetto traces)"
 } | tee "$OUT/SUMMARY.txt"

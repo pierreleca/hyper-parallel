@@ -16,6 +16,7 @@ a model of it.
 | Where does the model's own heterogeneity bite (per layer, vision, head)? | any | `MODEL`, `DECODER LAYERS`, `VISION BLOCKS`, `PIPELINE` |
 | Do image and text tokens load the experts differently? | any | `ROUTING by modality` |
 | What do the spans not show (kernels, stream waits, collectives)? | `hetero_profile` | `trace.txt` |
+| Are attention, expert GEMMs, EP wait, vision... detected where the kernels say? | `hetero_profile` | `components.txt`, the traces in `components/` |
 | How noisy is the baseline, and what do the recorders cost? | `hetero_baseline` | `compare_*.txt` of twin runs |
 | How much could an idea gain at most? | any run with module hooks | `CEILINGS`, `ASSIGNMENT` |
 | Did the idea deliver 20%, and did the loss hold? | `hetero_ab` | `compare_*.txt`: verdict, numerics, components |
@@ -69,6 +70,9 @@ sed -n '/^CEILINGS/,/data loading/p' $C/both/report.txt $C/fixed/report.txt
 # 6. optional: balanced order measured; kernel-level check (then delete the traces)
 examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_balance_32dev.sh
 examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_profile_32dev.sh
+C=$(ls -dt /home/pl/a3_runs/hetero_profile_32dev_* | head -1)
+grep -E "rank [0-9]+:|starts at|lanes against|AGREE|DISAGREE|UNCERTAIN" $C/both/components.txt | cut -c1-200   # kernels vs labels
+ls $C/both/components/                      # <node>_components.json: open in https://ui.perfetto.dev (How each component is detected)
 cluster exec 'rm -rf /home/pl/runs/qwen3_vl_30b_perf/hetero_profile_32dev_*/profile'
 
 # 7. certify an idea: the flags that switch it on, and the dataset where it should win
@@ -357,7 +361,8 @@ comparison rests on work per second, and the loss is compared as a curve over co
   costs; the pipeline work lives on the `mpipe` line, where the recorder would have to be ported.
 - **Text-only samples and videos** (see above): not generated, not accounted.
 - **Kernel truth.** The spans come from device events at module boundaries. Their assumption (the entry stamp follows
-  the weights' unshard) is checked against the Ascend trace of `hetero_profile_32dev.sh`, not automatically.
+  the weights' unshard) and the labels are checked against the Ascend trace of `hetero_profile_32dev.sh` by
+  `component_trace.py` (`components.txt`), on the few profiled steps of that plan only.
 - **Convergence.** The numerics check covers the first steps on the same samples. Whether a regrouped or rebalanced
   order changes convergence needs a longer run and its loss curve.
 - **Scales other than 32 dies.** Nothing is tied to 32; the ceilings and the sampling assume the sampler deals
@@ -377,12 +382,80 @@ python examples/qwen3_vl_30b_perf/analyze_hetero.py /tmp/demo/both/hetero --skip
 python examples/qwen3_vl_30b_perf/compare_runs.py --baseline /tmp/demo/both --candidate /tmp/demo/both_balanced
 ```
 
+## How each component is detected, and how to check it
+
+**The numbers do not come from the Ascend profiler.** `hetero_profile` hooks the modules whose paths match a role and
+stamps a device event (`torch.npu.Event`) at their entry and exit; a component's time is the span between two stamps.
+The profiler is a separate, optional run (`hetero_profile_32dev.sh`) that shows the kernels. What is measured and what is
+derived from it:
+
+| Component | Detected as | Kind |
+| --- | --- | --- |
+| vision | the spans of `visual.patch_embed`, `visual.blocks.N`, the deepstack mergers and `visual.merger` | measured |
+| attention | the span of `language_model.layers.N.self_attn` | measured |
+| expert GEMMs | the span of `...layers.N.mlp.experts`, which the EP path calls as a module; no collective runs inside it | measured |
+| embedding, head | the spans of `embed_tokens` and `lm_head` | measured |
+| loss | from the exit of the model's forward to the gradient reaching `lm_head` | derived from two stamps |
+| MoE exchange | the MoE block's span minus the experts' (and, under lazy recompute, minus the recomputed attention and experts that lie inside it): router, dispatch and combine all-to-all, host syncs, waiting | derived |
+| EP wait | per layer, pass and EP group, a rank's exchange minus the smallest exchange of the group (the floor) | derived across ranks |
+| layer glue | a layer's span minus attention, experts and exchange: norms, residuals | derived |
+| gaps | from one module's exit to the next one's entry: the wait for the weights, launch gaps | derived |
+
+The measured components are as good as the hook placement; the derived ones add that the boundaries sit where intended,
+and the EP wait that the fastest rank of a group waits for nobody. `component_trace.py` shows the partition and tests
+it against the kernels. The campaign runs it by itself for the profiled plan (on the nodes, for the busiest and the
+idlest rank of each); by hand:
+
+```bash
+R=/home/pl/runs/qwen3_vl_30b_perf/hetero_profile_32dev_<stamp>_both       # holds hetero/ and profile/, on each node
+cluster exec -p "python examples/qwen3_vl_30b_perf/component_trace.py $R"  # --rank N ... to choose, --no-original for the small files only
+cluster gather $R/profile/components_full /home/pl/a3_runs/components      # the lanes over the real events (tens of MB per rank)
+```
+
+Open `components/<node>_components.json` (the lanes alone, small) or `components_rank<N>_with_trace.json` (the same lanes
+over the rank's real streams: compute, communication) in <https://ui.perfetto.dev>, chrome://tracing or MindStudio
+Insight. The process `components` holds ten lanes: the step and its phases; the layers and vision blocks by index; then
+the lanes that **partition** the step (vision, attention, expert GEMMs, MoE exchange, embedding/head/loss, inside
+layers, between modules, custom regions) so every instant is in exactly one; a slice is named after its component and
+pass (`attention bwd`, `experts recompute`), and its arguments give the layer, the module path and the duration.
+
+`components.txt` reads, per rank:
+
+- `event-record anchors ...: 7<->6: 100%`: the recorder's stamps are device event records, and the profiler lists a
+  record task for each. The offset at which the stamps coincide with those tasks (within 15 us, found without using any
+  label) ties the two clocks together and pairs the record step with the profiler step; 100% means they coincide.
+  Without such tasks it falls back on the kernels (`found on the kernels alone`): it slides the slices until the
+  grouped-matmul time sits in the expert slices and the attention time in the attention and vision slices, and says
+  how far the best place stands above the next one (it must beat it by 1.3x or the verdict is `ALIGNMENT UNCERTAIN`);
+- `the lanes against the report's components: the same milliseconds`: the lanes carry the same milliseconds as
+  `analyze_hetero.py`'s components. Anything else is a bug in one of the two bookings;
+- per lane, the share of the lane in which the compute stream was busy, waiting on another stream, or idle, the top
+  kernel categories met there and the collectives that overlap it. What the labels predict: attention lane busy with
+  FlashAttention and matmul; expert lane busy with GroupedMatmul; the exchange lane a **waiting** stream
+  (>= 80%) under an `alltoallv`; the between lane a waiting stream under an `allgather` (the weights); the stream
+  never waiting inside the attention, expert and vision slices (`stream waits inside ...: < 10%`; more means the hooks
+  sit before the weights' unshard wait, the assumption at the top of the next section is wrong);
+- three recalls and a verdict: GroupedMatmul kernels inside the expert slices (>= 90%), attention kernels inside the
+  attention and vision slices (>= 90%), all-to-all collectives inside the exchange slices (>= 80%). `AGREE` when all
+  hold. `DISAGREE` names the class that does not, with the alignment sharp: open the `with_trace` file at that lane,
+  and look at the module regexes (`DEFAULT_ROLES`, `hetero_profile.extra_roles`; the header of a rank file lists
+  which module got which role). `ALIGNMENT UNCERTAIN` means look at the file and pass `--offset-ms`.
+
+What it cannot do: the EP wait is a comparison between ranks and one rank's trace cannot confirm it. `trace.txt`
+(`analyze_npu_trace.py --ranks`) matches the k-th all-to-all across the ranks of a group on the kernel timeline and
+gives the wait for the last rank to arrive against the transfer; set it beside the report's `EP wait`. Everything here
+was written against the Ascend trace layout of `ascend_trace.py` and checked on simulated traces
+(`synthetic_hetero_records.py --ascend-ranks`), not yet on a real profile: the anchors need the profiler to list the
+event-record tasks, and the checks need kernel names that `ascend_trace.CATEGORIES` classifies as grouped matmul and
+attention. When either is missing the report says which.
+
 ## What the numbers are, and are not
 
 - A module's span runs from its entry, taken after the sharding hooks have unsharded its weights, to its exit,
   taken before they reshard. It is the module's own work and any collective inside it (the expert all-to-alls);
   the wait for weights is the gap before it. If the first run shows the gaps holding most of a layer's time,
-  the hooks do not sit where this assumes: check the stream waits in `trace.txt` (`hetero_profile` plan).
+  the hooks do not sit where this assumes: check the stream waits in `trace.txt` (`hetero_profile` plan) and the
+  `stream waits inside the attention, expert and vision slices` line of `components.txt`.
 - Inside a layer the MoE span holds the all-to-alls and the wait for the slowest rank of the EP group, so on its own
   it would make the ranks of a group look alike. The `text.experts` span (the grouped GEMMs, no collective inside)
   is what separates the two: the block's span minus the experts' is `ep_exchange`, and `text_layer` keeps the
@@ -415,6 +488,7 @@ python examples/qwen3_vl_30b_perf/compare_runs.py --baseline /tmp/demo/both --ca
 | `synthetic_hetero_records.py`, `hetero_sampling.py` | simulated records to learn the report; the datasets' arithmetic |
 | `analyze_ep_instrument.py` | the MoE phase and routing report (records from `ep_instrument`) |
 | `analyze_npu_trace.py`, `ascend_trace.py` | the Ascend profiler report (records from `profiling`) |
+| `component_trace.py` | the recorder's components as a simplified trace, aligned with and checked against the Ascend kernels |
 | `cropped_qwen3_vl.py`, `prepare_cauldron_data.py`, `parse_perf_log.py` | the model builder, the cauldron helpers, the log parser |
 
 The recorders live in `hyper_parallel/trainer/runtime/hetero_profile.py` (configuration section
