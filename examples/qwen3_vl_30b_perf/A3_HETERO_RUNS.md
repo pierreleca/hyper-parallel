@@ -73,9 +73,12 @@ examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/h
 C=$(ls -dt /home/pl/a3_runs/hetero_profile_32dev_* | head -1)
 grep -E "^rank [0-9]+:|EP wait|last to arrive|starts at|lanes against|stream busy|GroupedMatmul|attention kernels|all-to-all coll|stream waits|AGREE|DISAGREE|UNCERTAIN" $C/profile_both/components.txt | cut -c1-230
 grep -E "^MATCHED|sum over" $C/profile_both/trace.txt     # the k-th all-to-all across the group: waiting for the last rank vs the transfer
-ls $C/profile_both/components/              # <node>_components.json: open in https://ui.perfetto.dev (How each component is detected)
-R=/home/pl/runs/qwen3_vl_30b_perf/$(cat $C/profile_both/run_id)                        # the run on the nodes
-cluster gather $R/profile/components_full /home/pl/a3_runs/components_full             # optional: the lanes over the real events
+ls $C/profile_both/components/              # <node>_components.txt and _summary.json: the report
+grep "^ranks drawn" $C/profile_both/components.txt | cut -c1-200      # the ranks drawn (the idlest and busiest of each node)
+R=/home/pl/runs/qwen3_vl_30b_perf/$(cat $C/profile_both/run_id)    # the run on the nodes
+N=6                                                                  # one of those ranks
+cluster gather $R/profile/components_full/rank${N}_trace_with_components.json /home/pl/a3_runs/traces   # its trace, with the components
+# open it in https://ui.perfetto.dev (How each component is detected, and how to check it)
 cluster exec 'rm -rf /home/pl/runs/qwen3_vl_30b_perf/hetero_profile_32dev_*/profile'
 
 # 7. certify an idea: the flags that switch it on, and the dataset where it should win
@@ -387,10 +390,10 @@ python examples/qwen3_vl_30b_perf/compare_runs.py --baseline /tmp/demo/both --ca
 
 ## How each component is detected, and how to check it
 
-**The numbers do not come from the Ascend profiler.** `hetero_profile` hooks the modules whose paths match a role and
-stamps a device event (`torch.npu.Event`) at their entry and exit; a component's time is the span between two stamps.
-The profiler is a separate, optional run (`hetero_profile_32dev.sh`) that shows the kernels. What is measured and what is
-derived from it:
+**The numbers of the report do not come from the Ascend profiler.** `hetero_profile` hooks the modules whose paths match
+a role and stamps a device event (`torch.npu.Event`) at their entry and exit; a component's time is the span between
+two stamps. The profiler is a separate, optional run (`hetero_profile_32dev.sh`) that shows what the device did. What is
+measured and what is derived from it:
 
 | Component | Detected as | Kind |
 | --- | --- | --- |
@@ -404,60 +407,74 @@ derived from it:
 | layer glue | a layer's span minus attention, experts and exchange: norms, residuals | derived |
 | gaps | from one module's exit to the next one's entry: the wait for the weights, launch gaps | derived |
 
-The measured components are as good as the hook placement; the derived ones add that the boundaries sit where intended,
-and the EP wait that the fastest rank of a group waits for nobody. `component_trace.py` shows the partition and tests
-it against the kernels. The campaign runs it by itself for the profiled plan (on the nodes, for the busiest and the
-idlest rank of each); by hand:
+`component_trace.py` gives the profiler's own trace of a rank back with those components added, to check them by eye.
+For each rank it writes **one file: the original `trace_view.json` with every event untouched** (host and device,
+flows, counters; a trace that is a bare list is extended in place, byte for byte), followed by two new processes on
+the same timeline. Open it in <https://ui.perfetto.dev>, chrome://tracing or MindStudio Insight; the new processes sit
+above the original ones:
+
+| New process | Built from | Lanes |
+| --- | --- | --- |
+| *components from the profile alone* | the trace only: kernel names, stream waits, collectives. No hook record | A to F the kernels by class: attention, expert GEMM, routing/sort/index, dense matmul, norm/activation, other. G the compute stream: computing, waiting (for which kind of collective), idle. H to L the collectives by kind: alltoallv (the MoE token exchange), alltoall, allGather, reduceScatter, other |
+| *components from the hooks* | the rank's `hetero/` records, each module boundary moved onto the profiler's timestamp of the event the recorder took there | the ten lanes of the report: the step and its phases, layers and vision blocks, vision, attention, expert GEMMs, MoE exchange, embedding/head/loss, inside layers, between modules, custom regions |
+
+What to look at: the hooks' *attention* lane over the profile's *attention kernels* lane, the *expert GEMMs* over the
+*expert GEMM kernels*, the *MoE exchange* over the compute stream's *waiting: alltoallv* and the *alltoallv*
+collectives, the *between modules* lane over *waiting: allGather*. Where they differ, the label or the class rule is
+wrong, or the hook sits elsewhere than assumed. A slice of the hooks' lanes carries the layer, the module path and the
+duration in its arguments; the exchange slices also carry the layer's floor and waiting.
 
 ```bash
-R=/home/pl/runs/qwen3_vl_30b_perf/$(cat $C/profile_both/run_id)    # the run on the nodes: hetero/ and profile/
-cluster exec -p "python examples/qwen3_vl_30b_perf/component_trace.py $R"  # --rank N ... to choose, --no-original for the small files only
-cluster gather $R/profile/components_full /home/pl/a3_runs/components      # the lanes over the real events (tens of MB per rank)
+# the profile plan runs it on the nodes by itself; by hand, for a run directory (it holds hetero/ and profile/):
+R=/home/pl/runs/qwen3_vl_30b_perf/$(cat $C/profile_both/run_id)       # the run on the nodes
+cluster exec -p "python examples/qwen3_vl_30b_perf/component_trace.py $R"              # the idlest and busiest rank of each node
+cluster exec -p "python examples/qwen3_vl_30b_perf/component_trace.py $R --rank 6"     # one rank (the node that has it)
+cluster gather $R/profile/components_full/rank6_trace_with_components.json /home/pl/a3_runs/traces   # as large as the original
+# the profile alone, for any trace_view.json (no records needed), on the machine that has it:
+python3 examples/qwen3_vl_30b_perf/component_trace.py path/to/trace_view.json --rank 6
 ```
 
-Open `components/<node>_components.json` (the lanes alone, small) or `components_rank<N>_with_trace.json` (the same lanes
-over the rank's real streams: compute, communication) in <https://ui.perfetto.dev>, chrome://tracing or MindStudio
-Insight. The process `components` holds ten lanes: the step and its phases; the layers and vision blocks by index; then
-the lanes that **partition** the step (vision, attention, expert GEMMs, MoE exchange, embedding/head/loss, inside
-layers, between modules, custom regions) so every instant is in exactly one; a slice is named after its component and
-pass (`attention bwd`, `experts recompute`), and its arguments give the layer, the module path and the duration.
-
-`components.txt` reads, per rank:
+`components.txt` has two parts per rank. **THE PROFILE ALONE** says what the trace holds (the device's streams, the
+kernels that fell in each class with the names of the largest, and of the *other* class so that a name in the wrong
+class is easy to spot, the collectives, the sync tasks, the event-record tasks, the profiler steps) and, per profiled
+step, how the compute stream spends it: computing (by class), waiting for another stream (by what released it), idle
+(gaps by length), and each kind of collective in flight and not hidden by compute. When a class is wrong,
+`--class attention=REGEX` (repeatable; classes: attention, experts, routing, dense, norm, other) wins over the defaults.
+**THE HOOKS** ties the records to that profile:
 
 - `event-record anchors ...: 7<->6: 100%`: the recorder's stamps are device event records, and the profiler lists a
   record task for each. The offset at which the stamps coincide with those tasks (within 15 us, found without using any
-  label) ties the two clocks together and pairs the record step with the profiler step; 100% means they coincide.
-  Without such tasks it falls back on the kernels (`found on the kernels alone`): it slides the slices until the
-  grouped-matmul time sits in the expert slices and the attention time in the attention and vision slices, and says
-  how far the best place stands above the next one (it must beat it by 1.3x or the verdict is `ALIGNMENT UNCERTAIN`);
-- `EP wait (the report's definition ...): exchange E = floor F + waiting W`: computed from the records of the rank's
-  whole EP group (the 16 consecutive ranks; all of them are on a node, and on the control node): a layer's exchange
-  above the smallest exchange in the group is the time the rank waited for the slowest one, the smallest is the
-  floor. `last to arrive` names the ranks that wait least, the ones the others wait for, and how many layers each.
-  Every exchange slice carries `layer_exchange_ms`, `layer_floor_ms`, `layer_wait_ms` and `last_to_arrive_rank` in its
-  arguments. `--ep-size` is the ranks per group (16 here);
+  label) gives the start of the step on the trace and pairs the record step with the profiler step; 100% means they
+  coincide. Without such tasks it falls back on the kernels (`found on the kernels alone`): it slides the slices until
+  the expert GEMM time sits in the expert slices and the attention time in the attention and vision slices, and says
+  how far the best place stands above the next one (1.3x, or the verdict is `ALIGNMENT UNCERTAIN`);
+- `each stamp moved onto its own record task: N of M matched, median shift ..., largest ..., drift ...`: every stamp of
+  the recorder is placed at the profiler's timestamp of its own record task, so the hooks' lanes follow the profiler's
+  clock stamp by stamp. A median near zero, a small largest shift and no drift say the two clocks agree;
+- `EP wait (the report's definition ...): exchange E = floor F + waiting W`: from the records of the rank's whole EP
+  group (the 16 consecutive ranks): a layer's exchange above the smallest exchange in the group is the time the rank
+  waited for the slowest one, the smallest is the floor. `last to arrive` names the ranks that wait least, the ones the
+  others wait for. Every exchange slice carries `layer_exchange_ms`, `layer_floor_ms`, `layer_wait_ms` and
+  `last_to_arrive_rank`. `--ep-size` is the ranks per group;
 - `the lanes against the report's components: the same milliseconds`: the lanes carry the same milliseconds as
-  `analyze_hetero.py`'s components, to 0.5% of a lane or 0.05 ms (device events of adjacent hooks come out of order by
-  a microsecond). A real difference is a bug in one of the two bookings;
-- per lane, the share of the lane in which the compute stream was busy, waiting on another stream, or idle, the top
-  kernel categories met there and the collectives that overlap it. What the labels predict: attention lane busy with
-  FlashAttention and matmul; expert lane busy with GroupedMatmul; the exchange lane a **waiting** stream
-  (>= 80%) under an `alltoallv`; the between lane a waiting stream under an `allgather` (the weights); the stream
-  never waiting inside the attention, expert and vision slices (`stream waits inside ...: < 10%`; more means the hooks
-  sit before the weights' unshard wait, the assumption at the top of the next section is wrong);
+  `analyze_hetero.py`'s components, to 0.5% of a lane or 0.05 ms. A real difference is a bug in one of the two bookings;
+- per lane, the share in which the compute stream was busy, waiting, or idle, the top kernel categories and the
+  collectives that overlap it. What the labels predict: the attention lane busy with FlashAttention and matmul; the
+  expert lane busy with GroupedMatmul; the exchange lane a **waiting** stream (>= 80%) under an `alltoallv`; the
+  between lane a waiting stream under an `allgather`; the stream never waiting inside the attention, expert and vision
+  slices (< 10%; more means the hooks sit before the weights' unshard wait);
 - three recalls and a verdict: GroupedMatmul kernels inside the expert slices (>= 90%), attention kernels inside the
   attention and vision slices (>= 90%), all-to-all collectives inside the exchange slices (>= 80%). `AGREE` when all
-  hold. `DISAGREE` names the class that does not, with the alignment sharp: open the `with_trace` file at that lane,
-  and look at the module regexes (`DEFAULT_ROLES`, `hetero_profile.extra_roles`; the header of a rank file lists
-  which module got which role). `ALIGNMENT UNCERTAIN` means look at the file and pass `--offset-ms`.
+  hold. `DISAGREE` names the class that does not, with the clocks aligned: open the file at that lane, and look at the
+  module regexes (`DEFAULT_ROLES`, `hetero_profile.extra_roles`; the header of a rank file lists which module got which
+  role). `ALIGNMENT UNCERTAIN` means look at the file and pass `--offset-ms`.
 
-What it cannot do: the EP wait is a comparison between ranks and one rank's trace cannot confirm it. `trace.txt`
+The EP wait is a comparison between ranks and one rank's trace cannot confirm it: `trace.txt`
 (`analyze_npu_trace.py --ranks`) matches the k-th all-to-all across the ranks of a group on the kernel timeline and
-gives the wait for the last rank to arrive against the transfer; set it beside the report's `EP wait`. Everything here
-was written against the Ascend trace layout of `ascend_trace.py` and checked on simulated traces
-(`synthetic_hetero_records.py --ascend-ranks`), not yet on a real profile: the anchors need the profiler to list the
-event-record tasks, and the checks need kernel names that `ascend_trace.CATEGORIES` classifies as grouped matmul and
-attention. When either is missing the report says which.
+gives the wait for the last rank to arrive against the transfer; set it beside the report's `EP wait`. The reading of
+the Ascend trace follows `ascend_trace.py`, which analysed real A3 traces on the host-swap branch; this command was
+checked on simulated traces (`synthetic_hetero_records.py --ascend-ranks`), not yet on a real profile, so expect to
+iterate on the class rules: the *other* class and the pairing lines of the report show where.
 
 ## What the numbers are, and are not
 
@@ -500,7 +517,7 @@ attention. When either is missing the report says which.
 | `synthetic_hetero_records.py`, `hetero_sampling.py` | simulated records to learn the report; the datasets' arithmetic |
 | `analyze_ep_instrument.py` | the MoE phase and routing report (records from `ep_instrument`) |
 | `analyze_npu_trace.py`, `ascend_trace.py` | the Ascend profiler report (records from `profiling`) |
-| `component_trace.py` | the recorder's components as a simplified trace, aligned with and checked against the Ascend kernels |
+| `component_trace.py`, `profile_components.py` | the profiler's trace of a rank with the detected components added (from the profile alone, and from the hooks placed on the profiler's timestamps), and the check between the two |
 | `cropped_qwen3_vl.py`, `prepare_cauldron_data.py`, `parse_perf_log.py` | the model builder, the cauldron helpers, the log parser |
 
 The recorders live in `hyper_parallel/trainer/runtime/hetero_profile.py` (configuration section

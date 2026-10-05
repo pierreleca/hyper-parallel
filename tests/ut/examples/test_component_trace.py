@@ -12,16 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""The component trace: lanes that partition a step, the clocks' alignment, and the check against the kernels."""
+"""The component trace: lanes that partition a step, the clocks' alignment, the check against the kernels, and the
+original trace that comes back with the components added."""
 
 import glob
 import importlib.util
 import json
 import pathlib
 import random
+import shutil
 import sys
-from types import ModuleType
-from typing import Callable, Optional
+from types import ModuleType, SimpleNamespace
+from typing import Any, Callable, Optional
 
 import pytest
 
@@ -41,12 +43,19 @@ _load("hetero_sampling")
 synthetic = _load("synthetic_hetero_records")
 report = _load("analyze_hetero")
 _load("ascend_trace")
+pc = _load("profile_components")
 ct = _load("component_trace")
 
 OFFSET_MS = 4321.987
 RANK_SKEW_US = 37.0            # the synthetic trace of rank r starts RANK_SKEW_US * r later
 SMALL = {"scenario": "both", "ranks": 8, "steps": 5, "layers": 4, "blocks": 4, "ep_size": 4, "experts": 16,
          "seed": 2, "slow_rank": None}
+
+
+def _read(path: pathlib.Path) -> Any:
+    """Load a JSON file."""
+    with open(path, encoding="utf-8") as stream:
+        return json.load(stream)
 
 
 def _make(path: pathlib.Path, *, checkpoint: str = "nonreentrant", accumulation: int = 1, shift: int = 1,
@@ -95,19 +104,6 @@ def _edit_headers(path: pathlib.Path, edit: Callable[[dict], None]) -> None:
         lines[0] = json.dumps(header)
         with open(name, "w", encoding="utf-8") as stream:
             stream.write("\n".join(lines) + "\n")
-
-
-# -- intervals ---------------------------------------------------------------------------------------------
-
-def test_interval_helpers():
-    """Union, subtraction and the covered time of a set of intervals."""
-    assert ct.merged([(5, 7), (1, 3), (2, 4), (9, 9)]) == [(1, 4), (5, 7)]
-    assert ct.subtract((0, 10), [(2, 3), (5, 12)]) == [(0, 2), (3, 5)]
-    assert ct.subtract((0, 10), []) == [(0, 10)]
-    busy = ct.Busy([(0, 10), (20, 30), (5, 12)])
-    assert busy.overlap(0, 100) == 22
-    assert busy.overlap(8, 25) == 4 + 5
-    assert busy.overlap(40, 50) == 0 and busy.overlap(3, 3) == 0
 
 
 # -- the lanes ---------------------------------------------------------------------------------------------
@@ -179,28 +175,147 @@ def test_the_clocks_are_aligned_on_the_recorders_event_records(tmp_path, shift):
         assert all(check["share"] > 0.99 for check in finding["checks"])
 
 
-def test_the_default_ranks_are_the_idlest_and_the_busiest_and_the_files_are_written(tmp_path):
-    """The small files hold the lanes, the summary and the report; the large ones add the real events."""
+def test_the_default_ranks_are_the_idlest_and_the_busiest_and_each_gets_its_own_trace_file(tmp_path):
+    """The small directory holds the report and summary; each rank's trace (original plus components) is a file."""
     run = _make(tmp_path)
     findings = _run(run)
     assert sorted(f["rank"] for f in findings) == [0, 3]
-    small = run / "profile" / "components"
-    assert {p.name for p in small.iterdir()} == {"components.json", "components_summary.json", "components.txt"}
-    with open(small / "components.json", encoding="utf-8") as stream:
-        lanes_only = json.load(stream)["traceEvents"]
-    processes = [e["args"]["name"] for e in lanes_only if e["ph"] == "M" and e["name"] == "process_name"]
-    assert len(processes) == 2 and all("SYNTHETIC rank" in name and "components" in name for name in processes)
-    threads = {e["args"]["name"] for e in lanes_only if e["ph"] == "M" and e["name"] == "thread_name"}
-    assert len(threads) == len(ct.LANES) and "6 MoE exchange: router, all-to-all, wait" in threads
-    assert all(e["dur"] >= 0 for e in lanes_only if e["ph"] == "X")
-    with open(run / "profile" / "components_full" / "components_rank0_with_trace.json", encoding="utf-8") as stream:
-        full = json.load(stream)["traceEvents"]
-    names = {e["args"]["name"] for e in full if e["ph"] == "M" and e["name"] == "process_name"}
-    assert {"rank 0 | Ascend Hardware", "rank 0 | Communication"} <= names
-    pids = {e["pid"] for e in full if e["ph"] == "X"}
-    assert len(pids) == 3 and len(full) > len(lanes_only)
-    real = [e for e in full if e["ph"] == "X" and e["pid"] != min(pids)]
-    assert any(e["name"].startswith("hcom_alltoallv") for e in real) and all(e["dur"] >= 5.0 for e in real)
+    small, full = run / "profile" / "components", run / "profile" / "components_full"
+    assert {p.name for p in small.iterdir()} == {"components_summary.json", "components.txt"}
+    assert {p.name for p in full.iterdir()} == {"rank0_trace_with_components.json", "rank3_trace_with_components.json"}
+    for rank in (0, 3):
+        with open(full / f"rank{rank}_trace_with_components.json", encoding="utf-8") as stream:
+            events = json.load(stream)["traceEvents"]
+        names = {e["pid"]: e["args"]["name"] for e in events if e["ph"] == "M" and e["name"] == "process_name"}
+        ours = [name for pid, name in names.items() if pid >= ct.PROCESS_BASE]
+        assert len(ours) == 2 and all(f"rank {rank} |" in name for name in ours), "only this rank's components"
+        assert any("from the hooks" in name and "placed on the profiler's timestamps" in name for name in ours)
+        assert any("from the profile alone" in name for name in ours)
+        threads = {e["args"]["name"] for e in events if e["ph"] == "M" and e["name"] == "thread_name"}
+        assert "6 MoE exchange: router, all-to-all, wait" in threads and "A attention kernels" in threads
+        assert "Stream 7" in threads, "the original threads are still there"
+        assert all(e["dur"] >= 0 for e in events if e["ph"] == "X")
+
+
+def _foreign_events() -> list[dict]:
+    """Events of kinds the analysis ignores, with string timestamps, as a profiler writes them."""
+    return [
+        {"ph": "s", "id": 5, "pid": 1, "tid": 7, "ts": "10.5", "name": "HostToDevice", "cat": "async_npu"},
+        {"ph": "f", "id": 5, "pid": 2, "tid": 7, "ts": "20.5", "name": "HostToDevice", "cat": "async_npu", "bp": "e"},
+        {"ph": "C", "name": "memory", "pid": 3, "ts": 12.0, "args": {"MB": 3}},
+        {"ph": "i", "name": "marker", "pid": 3, "tid": 1, "ts": 30.0, "s": "g"},
+        {"ph": "X", "name": "aclnnWeird", "pid": 2, "tid": 7, "ts": "5000000.25", "dur": "3.5", "args": {"a": 1}},
+    ]
+
+
+def test_the_whole_original_trace_comes_back_untouched_with_only_this_ranks_components_added(tmp_path):
+    """Every original event, of whatever kind, is kept as written and first; what follows is this rank's components."""
+    run = _make(tmp_path)
+    for name in _trace_files(run):
+        with open(name, encoding="utf-8") as stream:
+            data = json.load(stream)
+        data["traceEvents"] += _foreign_events()
+        data["displayTimeUnit"] = "ns"
+        with open(name, "w", encoding="utf-8") as stream:
+            json.dump(data, stream)
+    _run(run, "--rank", "0")
+    full = run / "profile" / "components_full"
+    assert [p.name for p in full.iterdir()] == ["rank0_trace_with_components.json"], "only the rank asked for"
+    original = _read(_trace_files(run)[0])                   # rank 0
+    combined = _read(full / "rank0_trace_with_components.json")
+    assert combined["displayTimeUnit"] == "ns", "the container keeps its other keys"
+    count = len(original["traceEvents"])
+    assert combined["traceEvents"][:count] == original["traceEvents"]
+    new = combined["traceEvents"][count:]
+    used = {event.get("pid") for event in original["traceEvents"]}
+    assert new and all(event["pid"] not in used for event in new), "new processes only"
+    kinds = {event["ph"] for event in original["traceEvents"]}
+    assert {"s", "f", "C", "i", "M", "X"} <= kinds, "the original holds more than slices and names"
+
+
+def test_a_trace_written_as_a_list_comes_back_as_a_list(tmp_path):
+    """The Ascend exporter may write a bare list of events; so does the combined file."""
+    run = _make(tmp_path)
+    name = _trace_files(run)[0]
+    with open(name, encoding="utf-8") as stream:
+        original = json.load(stream)["traceEvents"]
+    with open(name, "w", encoding="utf-8") as stream:
+        json.dump(original, stream)
+    _run(run, "--rank", "0")
+    path = run / "profile" / "components_full" / "rank0_trace_with_components.json"
+    combined = _read(path)
+    assert isinstance(combined, list) and combined[:len(original)] == original and len(combined) > len(original)
+
+
+def test_the_profile_alone_is_enough_for_any_trace_file(tmp_path, capsys):
+    """Given one trace_view.json and no records: the profile process only, numbers from the trace, no hook part."""
+    run = _make(tmp_path)
+    shutil.rmtree(run / "hetero")
+    assert ct.main([_trace_files(run)[0]]) == 0
+    printed = capsys.readouterr().out
+    assert "THE PROFILE ALONE" in printed and "THE HOOKS" not in printed
+    assert "no hetero records: the profile alone for rank 0" in printed
+    finding = _read(run / "profile" / "components" / "components_summary.json")[0]
+    assert finding["rank"] == 0 and finding["profile"] and "step" not in finding and "checks" not in finding
+    numbers = finding["profile"][0]
+    assert numbers["busy_by_class"]["experts"] > 0 and numbers["waits"]["alltoallv"] > 0
+    events = _read(run / "profile" / "components_full" / "rank0_trace_with_components.json")["traceEvents"]
+    names = [e["args"]["name"] for e in events if e["ph"] == "M" and e["name"] == "process_name"]
+    assert sum("components from" in name for name in names) == 1 and any("profile alone" in name for name in names)
+
+
+def test_a_trace_next_to_its_records_gets_the_hooks_too(tmp_path):
+    """Given the trace file of a rank under <run>/profile, the records are found in <run>/hetero."""
+    run = _make(tmp_path)
+    assert ct.main([_trace_files(run)[0]]) == 0
+    finding = _read(run / "profile" / "components" / "components_summary.json")[0]
+    assert finding["rank"] == 0 and finding["verdict"].startswith("AGREE") and finding["profile"]
+
+
+def test_a_class_rule_finds_the_kernels_the_defaults_miss(tmp_path):
+    """A kernel named otherwise than the defaults expect is found with --class, and the check can then run."""
+    run = _make(tmp_path)
+    _edit_traces(run, lambda event: {**event, "name": "aclnnMyExpertKernel"}
+                 if event.get("name", "").startswith("aclnnGroupedMatmul") else event)
+    without = _run(run, "--rank", "0")[0]
+    assert without["checks"][0]["share"] is None, "no kernel of the class: nothing to check"
+    assert without["profile"][0]["busy_by_class"].get("experts", 0.0) == 0.0
+    shared = _run(run, "--rank", "0", "--class", "experts=MyExpertKernel")[0]
+    assert shared["checks"][0]["share"] > 0.99 and shared["profile"][0]["busy_by_class"]["experts"] > 0.0
+    assert ct.main([str(run), "--class", "nonsense=x"]) == 2
+
+
+def test_each_stamp_is_moved_onto_its_own_record_task():
+    """Stamps take the timestamp of the record task next to them; those without one take their neighbours' shift."""
+    offset = 1000.0
+    shifts = [2.0, 2.0, 3.0, None, 5.0, 5.0, 6.0, 7.0, None, None, 9.0, 10.0]
+    marks = [[1, "fwd", 0, "in", float(t), 0] for t in range(len(shifts))]
+    tasks = sorted([offset + t * 1000.0 + shift for t, shift in enumerate(shifts) if shift is not None]
+                   + [offset + 5500.0, offset + 40000.0])            # records of other events, far from any stamp
+    placement = ct.place_on_profile({"marks": marks, "step": 1}, SimpleNamespace(records=tasks), offset)
+    assert (placement.matched, placement.stamps) == (9, 12)
+    assert placement.median_us == pytest.approx(5.0) and placement.worst_us == pytest.approx(10.0)
+    assert 700.0 < placement.drift_us_per_s < 900.0, "the shift grows by ~0.8 us per ms"
+    moved = [mark[4] for mark in placement.record["marks"]]
+    assert moved[0] == pytest.approx(0.002) and moved[11] == pytest.approx(11.010)
+    assert moved[3] == pytest.approx(3.004), "halfway between the shifts 3 and 5"
+    assert moved[8] == pytest.approx(8.0 + 0.007667, abs=1e-5) and moved[9] == pytest.approx(9.0 + 0.008333, abs=1e-5)
+    assert [mark[:4] for mark in placement.record["marks"]] == [mark[:4] for mark in marks]
+    nothing = ct.place_on_profile({"marks": marks}, SimpleNamespace(records=[]), offset)
+    assert nothing.matched == 0 and nothing.record["marks"] == marks
+
+
+def test_the_report_says_what_the_trace_holds_and_how_the_clocks_agree(tmp_path, capsys):
+    """The inventory, the profile numbers and the stamp placement are in the report."""
+    run = _make(tmp_path)
+    assert ct.main([str(run), "--rank", "3"]) == 0
+    printed = capsys.readouterr().out
+    for expected in ("the trace: ", "streams of the device: ", "attention kernels: ",
+                     "expert GEMM kernels (grouped matmul)", "collectives (hcom): alltoallv",
+                     "event-record tasks on the device", "profiler steps: 6",
+                     "computing, by class of kernel: attention", "waiting, by what released it: ",
+                     "each stamp moved onto its own record task: ", "median shift +0.0 us", "wrote "):
+        assert expected in printed, expected
 
 
 def test_kernels_alone_align_when_the_trace_lists_no_record_task(tmp_path):
@@ -320,7 +435,8 @@ def test_slivers_are_counted_in_the_lanes_but_not_drawn():
     ]
     lanes = ct.build_lanes(spans, 10.0, 1)
     assert ct.lane_ms(lanes)["inside"] == pytest.approx(0.0004 + 0.0003 + 0.0003, abs=1e-9)
-    drawn = [e for e in ct.lane_events(lanes, 1, 0.0, 0, False) if e["ph"] == "X" and e["cat"] == "inside"]
+    drawn = [e for e in pc.process_events(1, "x", 0, ct.LANES, lanes, 0.0, 1000.0)
+             if e["ph"] == "X" and e["cat"] == "inside"]
     assert drawn == []
     assert ct.reconcile_tolerance(1.0, 1.0) == ct.RECONCILE_TOLERANCE_MS
     assert ct.reconcile_tolerance(8507.0, 8507.0) == pytest.approx(ct.RECONCILE_RELATIVE * 8507.0)
@@ -366,7 +482,7 @@ def test_the_ep_wait_is_the_reports_and_is_written_on_the_exchange_slices(tmp_pa
         assert finding["ep_wait"]["floor_ms"] == pytest.approx(sum(min(by_rank.values()) for by_rank in mine), abs=1e-6)
         assert finding["ep_wait"]["exchange_ms"] == pytest.approx(
             finding["ep_wait"]["floor_ms"] + finding["ep_wait"]["wait_ms"], abs=1e-6)
-    with open(run / "profile" / "components" / "components.json", encoding="utf-8") as stream:
+    with open(run / "profile" / "components" / "rank0_lanes.json", encoding="utf-8") as stream:
         events = [e for e in json.load(stream)["traceEvents"]
                   if e["ph"] == "X" and e["cat"] == "exchange" and e["pid"] == ct.PROCESS_BASE]
     per_layer = {(e["args"]["micro_batch"], e["args"]["layer"]): e["args"]["layer_wait_ms"] for e in events}

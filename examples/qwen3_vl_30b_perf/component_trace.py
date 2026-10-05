@@ -12,61 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Draw the recorder's components as a trace, and check them against the Ascend profiler's kernels.
+"""Put the detected components into the Ascend profiler's trace, to check them by eye.
 
-The numbers of ``analyze_hetero.py`` do not come from the profiler. ``hetero_profile`` stamps a device event at the
-entry and the exit of each hooked module, and a component is a module, told by the role its path matches:
-``language_model.layers.N.self_attn`` is attention, ``...mlp.experts`` the expert GEMMs, ``visual.blocks.N`` a vision
-block. Some components are derived from those spans, and those are the ones to doubt: the MoE exchange is the MoE
-block's span minus the experts' and the attention's inside it (the router, the dispatch and combine all-to-alls and the
-wait for the rest of the EP group), the gaps are what lies between two spans, the wait for the EP group is the spread of
-the exchange over the ranks of a group. This script draws the partition the report is built on, so that it can be looked
-at, and, when the Ascend profiler ran on the same steps, lays the real kernels, stream waits and collectives of the
-rank under it and measures how well the two agree.
+The numbers of ``analyze_hetero.py`` come from hooks that stamp a device event at the boundaries of modules. This
+command lays what it detects over the profiler's own record of the same rank. For each rank it writes ONE trace file:
+the original ``trace_view.json`` with every event untouched (host and device, flows and counters included), followed
+by new processes drawn on the same timeline, so it opens in https://ui.perfetto.dev, chrome://tracing or MindStudio
+Insight as the original trace with the components above it:
 
-For each rank drawn it writes a Chrome trace (open it in https://ui.perfetto.dev, chrome://tracing or MindStudio
-Insight) with a process ``components`` whose lanes partition the step by the recorder's labels, one lane per component:
+- ``components from the profile alone``: no hook record is used. The kernels of the compute stream by class (attention,
+  expert GEMMs, routing/sort/index, dense matmul, norm/activation, other), the stream's state (computing, waiting for
+  which collective, idle), and the collectives by kind (the MoE token exchange, the counts exchange, all-gather,
+  reduce-scatter). ``profile_components.py`` holds this part and works on any trace_view.json;
+- ``components from the hooks``: the lanes of the heterogeneity report (vision, attention, expert GEMMs, MoE exchange,
+  head and loss, glue inside layers, the gaps between modules, custom regions, the step and its phases), each module
+  boundary placed on the profiler's own timestamp of the device event the recorder took there. Needs the rank's
+  ``hetero/`` records.
 
-    1 step and phases            the step, each micro-batch's forward and backward, the tail (clip, optimizer, sync)
-    2 layers and vision blocks   one slice per decoder layer and vision block and pass, to find a place by index
-    3 vision tower               patch embedding, blocks, deepstack mergers, merger
-    4 attention                  the decoder layers' self-attention
-    5 expert GEMMs               the experts' span (the local experts' GEMMs; no collective inside)
-    6 MoE exchange               the MoE block minus the above: router, dispatch and combine all-to-all, waits
-    7 embedding, head, loss      the embedding, the vocabulary projection and the loss
-    8 inside layers              what a layer holds besides attention and MoE: norms, residuals
-    9 between modules            the weights' wait, launch gaps, glue; named by the slice that follows
-    10 custom regions            modules of ``extra_roles`` and ``HETERO_PROFILE.region`` spans
+    python examples/qwen3_vl_30b_perf/component_trace.py <run dir>            # <run>/profile and <run>/hetero
+    python examples/qwen3_vl_30b_perf/component_trace.py <trace_view.json> --rank 3   # the profile alone, any trace
 
-Lanes 3 to 9 never overlap: every instant between the first and the last boundary is in exactly one of them (lane 10
-belongs to a design and may wrap other modules). A slice is named after its component and pass (``attention fwd``,
-``experts recompute``, ``exchange bwd``) so a viewer colours the same component alike; the layer, the module path and
-the duration are in the slice's arguments.
+The report (``components.txt``) says what the trace holds and how its kernels were classed (so a name in the wrong
+class is easy to see; ``--class attention=REGEX`` adds a rule), numbers each profiled step from the trace alone, and,
+with records, how well the two agree. How the hooks are tied to the profile:
 
-With a profiler trace of the same rank it first ties the two clocks together. The recorder's stamps are device event
-records and the profiler lists a record task for each, so the offset at which the stamps coincide with those tasks (to
-15 us) gives the start of the step on the trace's timeline, and pairs the record step with the profiler step, without
-using a single label. Where the trace lists no such tasks, it slides the slices over the kernels instead, scoring how
-much of the grouped-matmul time falls in the expert slices and of the attention time in the attention and vision slices
-and how busy the compute stream is inside them; that peak must stand out from the best place elsewhere. Then it
-measures what the compute stream really did inside the slices:
+1. The recorder's stamps are device event records, and the profiler lists a record task for each. The offset at which
+   they coincide with those tasks (to 15 us, found without any label) gives the start of the step on the trace's
+   timeline and pairs the record step with the profiler step. Without such tasks the slices are slid over the kernels
+   instead, which is sharper if the labels are right and ambiguous if they are not (the report says which).
+2. Each stamp is then moved onto the timestamp of its own record task, so the lanes follow the profiler's clock stamp
+   by stamp; the median and largest shift and the drift over the step show whether the two clocks agree.
+3. The recall of the three kernel classes the labels predict (GroupedMatmul kernels inside the expert slices, attention
+   kernels inside the attention and vision slices, all-to-alls inside the exchange slices), the compute stream's busy,
+   waiting and idle share inside each lane, and the sum of each lane against the report's component must agree.
 
-- the recall of the three kernel classes the labels predict: the GroupedMatmul kernels inside the expert slices, the
-  attention kernels inside the attention and vision slices, the all-to-all collectives inside the exchange slices;
-- the compute stream's busy, waiting and idle share inside each lane, and the kernels and collectives it met there;
-  the exchange lane should be a stalled stream and an ``alltoallv``, the gaps an all-gather wait, and the stream should
-  not wait inside the attention, expert and vision slices (the weights' wait belongs outside: the hook-order check);
-- the sum of each lane against the report's component (``analyze_hetero.build_rows``), which must be the same number.
-
-The lanes alone (small, for every rank drawn) go to ``<run>/profile/components/components.json`` with the summary and
-the text report; the lanes over that rank's real events of the step, which are large, go to
-``<run>/profile/components_full/components_rank<N>_with_trace.json``.
-
-    python examples/qwen3_vl_30b_perf/component_trace.py <run dir>            # <run>/hetero and <run>/profile
-    python examples/qwen3_vl_30b_perf/component_trace.py <run dir> --rank 0 17 --no-original
-
-It needs nothing but the standard library, so it runs on the nodes (``cluster exec``) where the traces are. Without
-``<run>/profile`` it draws the lanes alone, on the recorder's clock.
+It needs nothing but the standard library, so it runs on the nodes (``cluster exec``) where the traces are.
 """
 
 from __future__ import annotations
@@ -76,15 +56,19 @@ import bisect
 import glob
 import json
 import os
-import re
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Optional, Sequence
 
 # Run as a script, Python puts this directory first on the import path.
 from analyze_hetero import build_rows, exchange_cells, spans_of as record_spans
-from ascend_trace import SYNC_PATTERN, Trace, category, comm_type, find_rank_traces, is_sync
+from ascend_trace import find_rank_traces, trace_rank
+from profile_components import (
+    PROFILE_LANES, Capture, Piece, Signals, describe_step, free_pids, inventory, load_capture, merged, parse_rules,
+    process_events, profile_lanes, read_signals, step_numbers, subtract, total, write_integrated,
+)
 
 PHASES = ("fwd", "recompute", "bwd")
 LANES = (
@@ -114,13 +98,13 @@ SLICE_NAMES = {
     "vision.merger": "merger", "text.attn": "attention", "text.experts": "experts", "lm_head": "lm head",
     "text.embed": "embedding",
 }
-# What the labels predict, as (what, kernel class, lanes whose slices should hold it, least share that must).
+# What the labels predict, as (what, kernel class or "alltoall", lanes whose slices should hold it, least share).
 CHECKS = (
-    ("GroupedMatmul kernels inside the expert slices", "grouped matmul", ("experts",), 0.90),
+    ("GroupedMatmul kernels inside the expert slices", "experts", ("experts",), 0.90),
     ("attention kernels inside the attention and vision slices", "attention", ("attention", "vision"), 0.90),
     ("all-to-all collectives inside the exchange slices", "alltoall", ("exchange",), 0.80),
 )
-ALIGN_CLASSES = (("grouped matmul", ("experts",)), ("attention", ("attention", "vision")))
+ALIGN_CLASSES = (("experts", ("experts",)), ("attention", ("attention", "vision")))
 PROCESS_BASE = 9_000_000
 MIN_SLICE_MS = 0.001             # slices shorter than this are counted in the lanes but not drawn (1 us)
 COARSE_US, WIDE_US, FINE_US, POLISH_US = 2000.0, 10_000.0, 100.0, 10.0
@@ -133,7 +117,6 @@ RECONCILE_RELATIVE = 5e-3        # for device events that come out of order by a
                                  # a whole span, far above that)
 # The recorder stamps its events with a device event record; the profiler lists such a task on the stream, so the
 # stamps are anchors that pin the clocks together to a few microseconds.
-RECORD_PATTERN = re.compile(r"^(EVENT|NOTIFY)[ _]?RECORD", re.IGNORECASE)
 ANCHOR_US = 15.0                 # a stamp and a record task this close are one event
 ANCHOR_HYPOTHESES = 3            # the first stamps, each tried against every record task of the window
 ANCHOR_FIRST, ANCHOR_FIRST_NEED = 8, 6   # a candidate offset must first match 6 of 8 stamps
@@ -142,66 +125,8 @@ ANCHOR_SAMPLE = 400
 MIN_STAMPS = 20
 MIN_ANCHORED = 0.4               # share of the stamps that must coincide with a record task for the anchors to count
 PARTIAL_ANCHORED = 0.9           # below this the match is partial: clocks drifting over the step, or foreign tasks
-
-
-# -- intervals --------------------------------------------------------------------------------------------
-
-def merged(intervals: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
-    """Return the union of intervals as sorted, disjoint (start, end) pairs."""
-    result: list[tuple[float, float]] = []
-    for start, end in sorted(intervals):
-        if end <= start:
-            continue
-        if result and start <= result[-1][1]:
-            result[-1] = (result[-1][0], max(result[-1][1], end))
-        else:
-            result.append((start, end))
-    return result
-
-
-def subtract(base: tuple[float, float], holes: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
-    """Return ``base`` without the (merged, sorted) ``holes``, as disjoint intervals."""
-    pieces, cursor = [], base[0]
-    for start, end in holes:
-        if end <= cursor or start >= base[1]:
-            continue
-        if start > cursor:
-            pieces.append((cursor, min(start, base[1])))
-        cursor = max(cursor, end)
-    if cursor < base[1]:
-        pieces.append((cursor, base[1]))
-    return pieces
-
-
-def total(intervals: Iterable[tuple[float, float]]) -> float:
-    """Return the summed length of intervals."""
-    return sum(end - start for start, end in intervals)
-
-
-class Busy:
-    """The time a set of intervals covers, with prefix sums so that the overlap with any interval costs O(log n)."""
-
-    def __init__(self, intervals: Iterable[tuple[float, float]]) -> None:
-        """Merge the intervals and index them."""
-        self.intervals = merged(intervals)
-        self.starts = [a for a, _ in self.intervals]
-        self.cumulative: list[float] = []
-        running = 0.0
-        for start, end in self.intervals:
-            running += end - start
-            self.cumulative.append(running)
-
-    def before(self, x: float) -> float:
-        """Return the covered time up to ``x``."""
-        index = bisect.bisect_right(self.starts, x) - 1
-        if index < 0:
-            return 0.0
-        start, end = self.intervals[index]
-        return (self.cumulative[index - 1] if index else 0.0) + min(x, end) - start
-
-    def overlap(self, start: float, end: float) -> float:
-        """Return the covered time inside [start, end]."""
-        return self.before(end) - self.before(start) if end > start else 0.0
+MATCH_US = 25.0                  # a stamp is moved onto the record task nearest to it if that is this close
+DESCRIBED_STEPS = 3              # profiled steps whose numbers are printed (the last ones)
 
 
 # -- the recorder's side ----------------------------------------------------------------------------------
@@ -217,16 +142,6 @@ class Span:
     occ: int
     start: float
     end: float
-
-
-@dataclass
-class Piece:
-    """One slice of a lane, in milliseconds since the step's start event."""
-
-    start: float
-    end: float
-    name: str
-    args: dict[str, Any] = field(default_factory=dict)
 
 
 def load_rank(directory: str, rank: int) -> Optional[tuple[dict, list[dict]]]:
@@ -433,54 +348,12 @@ def annotate_exchange(lanes: dict[str, list[Piece]], waits: dict[str, Any]) -> N
                               last_to_arrive_rank=cell["last_to_arrive"])
 
 
-# -- the profiler's side ----------------------------------------------------------------------------------
-
-@dataclass
-class Signals:
-    """What the Ascend trace says about a rank, as interval sets (microseconds on the trace's timeline)."""
-
-    trace: Trace
-    by_category: dict[str, Busy]
-    busy: Busy
-    waits: Busy
-    comm: dict[str, Busy]
-    all_to_all: Busy
-    steps: list[tuple[int, float, float]]
-    extent: tuple[float, float]
-    records: list[float]
-
-
-def read_signals(path: str) -> Signals:
-    """Load a rank's trace and split its compute stream by kernel category, waits and collectives."""
-    trace = Trace.load(path)
-    key = trace.compute_thread()
-    categories: dict[str, list[tuple[float, float]]] = {}
-    busy, waits = [], []
-    for event in trace.thread_events(key):
-        if is_sync(event):
-            if "WAIT" in event.name.upper() and SYNC_PATTERN.match(event.name):
-                waits.append((event.ts, event.end))
-            continue
-        busy.append((event.ts, event.end))
-        categories.setdefault(category(event.name), []).append((event.ts, event.end))
-    comm: dict[str, list[tuple[float, float]]] = {}
-    for event in trace.communications():
-        comm.setdefault(comm_type(event.name).lower(), []).append((event.ts, event.end))
-    all_to_all = Busy(interval for name, items in comm.items() if "alltoall" in name for interval in items)
-    everything = busy + waits
-    extent = (min((a for a, _ in everything), default=0.0), max((b for _, b in everything), default=0.0))
-    hardware = set(trace.find_processes("Ascend Hardware"))
-    records = sorted(event.ts for event in trace.events if event.pid in hardware and RECORD_PATTERN.match(event.name))
-    return Signals(trace, {name: Busy(items) for name, items in categories.items()}, Busy(busy), Busy(waits),
-                   {name: Busy(items) for name, items in comm.items()}, all_to_all, trace.steps(), extent, records)
-
-
 # -- finding where the recorder's clock starts on the trace's timeline -------------------------------------
 
 class Aligner:
     """Scores an offset by how well kernels sit inside the slices that carry their name.
 
-    The score is the mean share of each kernel class (grouped matmul, attention) that falls in its slices, times the
+    The score is the mean share of each kernel class (expert GEMMs, attention) that falls in its slices, times the
     share of the slices that the compute stream keeps busy. Recall alone has a flat top (a shift that keeps the
     kernels inside slightly longer slices costs nothing); the busy share is what makes the peak sharp.
     """
@@ -490,7 +363,7 @@ class Aligner:
         self.signals = signals
         self.classes: dict[str, list[tuple[float, float]]] = {}
         for name, names in ALIGN_CLASSES:
-            if name in signals.by_category:
+            if name in signals.by_class:
                 spans = [(p.start * 1000.0, p.end * 1000.0) for lane in names for p in lanes[lane]]
                 if spans:
                     self.classes[name] = spans
@@ -502,13 +375,13 @@ class Aligner:
 
     def denominators(self, low: float, high: float) -> dict[str, float]:
         """Return each class's kernel time inside [low, high], the reference for the shares."""
-        return {name: self.signals.by_category[name].overlap(low, high) for name in self.classes}
+        return {name: self.signals.by_class[name].overlap(low, high) for name in self.classes}
 
     def score(self, offset: float, totals: dict[str, float]) -> float:
         """Return the alignment score of an offset (microseconds on the trace's timeline)."""
         recalls_, covered = [], 0.0
         for name, spans in self.classes.items():
-            busy = self.signals.by_category[name]
+            busy = self.signals.by_class[name]
             recalls_.append(sum(busy.overlap(offset + a, offset + b) for a, b in spans) / totals[name]
                             if totals[name] else 0.0)
             covered += sum(self.signals.busy.overlap(offset + a, offset + b) for a, b in spans)
@@ -630,6 +503,71 @@ def anchor_search(record: dict, signals: Signals, low: float, high: float) -> Op
     return Anchor(best, anchored_share(stamps, records, best), len(stamps))
 
 
+@dataclass
+class Placement:
+    """A step record whose stamps were moved onto the profiler's timestamps, and how far they moved."""
+
+    record: dict
+    matched: int
+    stamps: int
+    median_us: float
+    worst_us: float
+    drift_us_per_s: float
+
+
+def place_on_profile(record: dict, signals: Signals, offset: float) -> Placement:
+    """Move every stamp of a step record onto the timestamp of its own event-record task in the trace.
+
+    A stamp predicted at ``offset + t`` is matched to the record task nearest to it, within ``MATCH_US``. Stamps
+    without a task take the shift of their neighbours. The shifts say whether the recorder's clock and the profiler's
+    agree: a median near zero, a small worst case and no drift over the step mean they do.
+    """
+    marks = record["marks"]
+    tasks = signals.records
+    predicted = [offset + mark[4] * 1000.0 for mark in marks]
+    shifts: list[Optional[float]] = []
+    for time_us in predicted:
+        index = bisect.bisect_left(tasks, time_us)
+        near = [task - time_us for task in tasks[max(index - 1, 0):index + 1] if abs(task - time_us) <= MATCH_US]
+        shifts.append(min(near, key=abs) if near else None)
+    matched = [(time_us, shift) for time_us, shift in zip(predicted, shifts) if shift is not None]
+    if not matched:
+        return Placement(record, 0, len(marks), 0.0, 0.0, 0.0)
+    filled: list[float] = []
+    previous: Optional[int] = None
+    following = [None] * len(shifts)
+    upcoming: Optional[int] = None
+    for index in range(len(shifts) - 1, -1, -1):
+        if shifts[index] is not None:
+            upcoming = index
+        following[index] = upcoming
+    for index, shift in enumerate(shifts):
+        if shift is not None:
+            previous = index
+            filled.append(shift)
+            continue
+        after = following[index]
+        if previous is None:
+            filled.append(shifts[after])
+        elif after is None:
+            filled.append(shifts[previous])
+        else:
+            span = predicted[after] - predicted[previous]
+            weight = (predicted[index] - predicted[previous]) / span if span > 0 else 0.0
+            filled.append(shifts[previous] * (1 - weight) + shifts[after] * weight)
+    values = sorted(shift for _, shift in matched)
+    drift = 0.0
+    if len(matched) >= 5:
+        mean_time = sum(time_us for time_us, _ in matched) / len(matched)
+        mean_shift = sum(shift for _, shift in matched) / len(matched)
+        variance = sum((time_us - mean_time) ** 2 for time_us, _ in matched)
+        if variance > 0:
+            drift = sum((time_us - mean_time) * (shift - mean_shift) for time_us, shift in matched) / variance * 1e6
+    moved = [[*mark[:4], round(mark[4] + shift / 1000.0, 6), *mark[5:]] for mark, shift in zip(marks, filled)]
+    return Placement({**record, "marks": moved}, len(matched), len(marks), values[len(values) // 2],
+                     max(abs(value) for value in values), drift)
+
+
 # -- the cross-check --------------------------------------------------------------------------------------
 
 def pieces_us(lanes: dict[str, list[Piece]], names: Sequence[str], offset: float) -> list[tuple[float, float]]:
@@ -666,7 +604,7 @@ def recalls(lanes: dict[str, list[Piece]], signals: Signals, offset: float, step
     step = (offset, offset + step_ms * 1000.0)
     found = []
     for what, kind, names, floor in CHECKS:
-        busy = signals.all_to_all if kind == "alltoall" else signals.by_category.get(kind)
+        busy = signals.all_to_all if kind == "alltoall" else signals.by_class.get(kind)
         inside_step = busy.overlap(*step) if busy is not None else 0.0
         share = (sum(busy.overlap(a, b) for a, b in merged(pieces_us(lanes, names, offset))) / inside_step
                  if inside_step > 0 else None)
@@ -703,53 +641,44 @@ def verdict(checks: list[dict[str, Any]], certain: bool, waiting: Optional[float
             + ("" if certain else " (the alignment is not unique, but every class still falls in its slices)") + tail)
 
 
-# -- the output trace -------------------------------------------------------------------------------------
+# -- the inputs of one command ----------------------------------------------------------------------------
 
-def lane_events(lanes: dict[str, list[Piece]], pid: int, offset_us: float, rank: int, synthetic: bool) -> list[dict]:
-    """Return the Chrome-trace events of one rank's simplified process."""
-    tag = "SYNTHETIC " if synthetic else ""
-    events: list[dict[str, Any]] = [
-        {"ph": "M", "name": "process_name", "pid": pid,
-         "args": {"name": f"{tag}rank {rank} | components (hetero_profile)"}},
-        {"ph": "M", "name": "process_sort_index", "pid": pid, "args": {"sort_index": -1000 + pid % 1000}},
-    ]
-    for number, (lane, title) in enumerate(LANES, start=1):
-        events.append({"ph": "M", "name": "thread_name", "pid": pid, "tid": number, "args": {"name": title}})
-        events.append({"ph": "M", "name": "thread_sort_index", "pid": pid, "tid": number,
-                       "args": {"sort_index": number}})
-        for piece in lanes[lane]:
-            if piece.end - piece.start < MIN_SLICE_MS:
-                continue
-            events.append({"ph": "X", "name": piece.name, "cat": lane, "pid": pid, "tid": number,
-                           "ts": offset_us + piece.start * 1000.0, "dur": (piece.end - piece.start) * 1000.0,
-                           "args": piece.args})
-    return events
+@dataclass
+class Job:
+    """What one run of the command works from."""
+
+    args: argparse.Namespace
+    traces: dict[int, str]
+    hetero_dir: Optional[str]
+    rules: list
+    out_dir: str
+    full_dir: str
 
 
-def original_events(signals: Signals, first_pid: int, window: tuple[float, float], rank: int, host: bool,
-                    min_us: float) -> tuple[list[dict], int]:
-    """Return the rank's real events inside the window, in processes of their own, and how many were left out."""
-    trace = signals.trace
-    wanted = set(trace.processes) if host else set(trace.find_processes("Ascend Hardware")) | set(
-        trace.find_processes("Communication"))
-    mapping = {pid: first_pid + index for index, pid in enumerate(sorted(wanted, key=str))}
-    events: list[dict[str, Any]] = []
-    for pid, new in mapping.items():
-        events.append({"ph": "M", "name": "process_name", "pid": new,
-                       "args": {"name": f"rank {rank} | {trace.processes.get(pid, pid)}"}})
-        events.append({"ph": "M", "name": "process_sort_index", "pid": new, "args": {"sort_index": new % 1000}})
-    for (pid, tid), name in trace.threads.items():
-        if pid in mapping:
-            events.append({"ph": "M", "name": "thread_name", "pid": mapping[pid], "tid": tid, "args": {"name": name}})
-    skipped = 0
-    for event in trace.events:
-        if event.pid in mapping and event.end >= window[0] and event.ts <= window[1]:
-            if event.dur < min_us:
-                skipped += 1
-                continue
-            events.append({"ph": "X", "name": event.name, "pid": mapping[event.pid], "tid": event.tid, "ts": event.ts,
-                           "dur": event.dur, "args": event.args})
-    return events, skipped
+def has_records(directory: str) -> bool:
+    """Return whether a directory holds hetero_profile record files."""
+    return os.path.isdir(directory) and bool(glob.glob(os.path.join(directory, "rank*.jsonl")))
+
+
+def resolve(args: argparse.Namespace) -> Job:
+    """Work out the traces, the records and the output directories from the path given."""
+    path = os.path.abspath(args.path)
+    rules = parse_rules(args.class_rules)
+    if os.path.isfile(path):
+        rank = args.rank[0] if args.rank else trace_rank(path)
+        traces = {rank if rank is not None else 0: path}
+        profile = next((parent for parent in Path(path).parents if parent.name == "profile"), None)
+        base = str(profile) if profile is not None else os.path.dirname(path)
+        guess = os.path.join(os.path.dirname(base), "hetero") if profile is not None else ""
+        hetero = args.hetero_dir or (guess if has_records(guess) else None)
+        out_dir, full_dir = os.path.join(base, "components"), os.path.join(base, "components_full")
+    else:
+        traces = find_rank_traces(path)
+        hetero = args.hetero_dir or next((d for d in (os.path.join(path, "hetero"), path) if has_records(d)), None)
+        base = os.path.join(path, "profile") if (os.path.isdir(os.path.join(path, "profile")) or has_records(
+            os.path.join(path, "hetero"))) else path
+        out_dir, full_dir = os.path.join(base, "components"), os.path.join(base, "components_full")
+    return Job(args, {} if args.no_trace else traces, hetero, rules, args.out or out_dir, args.full_out or full_dir)
 
 
 # -- one rank ---------------------------------------------------------------------------------------------
@@ -808,7 +737,7 @@ def choose(by_step: dict[int, dict], header: dict, signals: Signals, args: argpa
             anchors.append((found.share, step, number, found))
     if anchors:
         anchors.sort(key=lambda item: -item[0])
-        out.append("  event-record anchors (record step <-> profiler step: share of stamps matched): " + ", ".join(
+        out.append("    event-record anchors (record step <-> profiler step: share of stamps matched): " + ", ".join(
             f"{step}<->{number}: {share:.0%}" for share, step, number, _ in anchors[:8]))
         share, step, number, found = anchors[0]
         if share >= MIN_ANCHORED:
@@ -825,11 +754,11 @@ def choose(by_step: dict[int, dict], header: dict, signals: Signals, args: argpa
         scores = scan(aligner, totals, low, max(high, low + grid), grid)
         scanned.append((max(scores)[0], step, number, aligner, totals, scores, grid))
     if not scanned:
-        out.append("  no record step pairs with a profiler step, or the trace has no grouped matmul or attention "
-                   "kernel")
+        out.append("    no record step pairs with a profiler step, or the trace has no expert GEMM or attention kernel "
+                   "(see the classes above; --class adds a rule)")
         return None
     scanned.sort(key=lambda item: -item[0])
-    out.append("  no event-record anchors" + ("" if not anchors else f" (best {anchors[0][0]:.0%})")
+    out.append("    no event-record anchors" + ("" if not anchors else f" (best {anchors[0][0]:.0%})")
                + "; kernel alignment, pairings (record step <-> profiler step: coarse score): " + ", ".join(
                    f"{step}<->{number}: {value:.2f}" for value, step, number, *_ in scanned[:8]))
     fits = [(refine(aligner, totals, scores, grid), step, number) for _, step, number, aligner, totals, scores, grid
@@ -838,123 +767,180 @@ def choose(by_step: dict[int, dict], header: dict, signals: Signals, args: argpa
     return Choice(step, number, fit.offset_us, fit=fit)
 
 
-def process_rank(rank: int, hetero_dir: str, profile_dir: str, args: argparse.Namespace, index: int,
-                 out: list[str], full_dir: Optional[str]) -> Optional[tuple[list[dict], dict[str, Any]]]:
-    """Build one rank's events and findings; None if the rank has no usable record."""
-    loaded = load_rank(hetero_dir, rank)
+def hook_part(rank: int, job: Job, signals: Optional[Signals], out: list[str], finding: dict[str, Any]
+              ) -> Optional[tuple[dict[str, list[Piece]], float]]:
+    """Align and check the hooks' lanes of one rank; return the lanes to draw and where they start (microseconds)."""
+    args, hetero_dir = job.args, job.hetero_dir
+    loaded = load_rank(hetero_dir, rank) if hetero_dir else None
     if loaded is None:
-        out.append(f"rank {rank}: no record file in {hetero_dir}")
+        out.append(f"  hooks: no record file for rank {rank}" + (f" in {hetero_dir}" if hetero_dir else ""))
         return None
     header, records = loaded
     by_step = {record["step"]: record for record in records if record["marks"]}
     if not by_step:
-        out.append(f"rank {rank}: no step with module boundaries (was hetero_profile.hooks off?)")
+        out.append("  hooks: no step with module boundaries (was hetero_profile.hooks off?)")
         return None
-    traces = find_rank_traces(profile_dir) if os.path.isdir(profile_dir) and not args.no_trace else {}
-    signals = read_signals(traces[rank]) if rank in traces else None
     choice: Optional[Choice] = None
-    number = -1
-    offset = 0.0
+    number, offset = -1, 0.0
+    out.append("  THE HOOKS (hetero_profile)" + (" AGAINST THE PROFILE" if signals is not None else ""))
     if signals is None:
         step = args.step if args.step is not None else max(by_step)
-        out.append(f"rank {rank}: no Ascend trace here, so the lanes alone, on the recorder's clock")
+        out.append("    no Ascend trace for this rank: the lanes alone, on the recorder's clock")
     elif args.offset_ms is not None:
         step = args.step if args.step is not None else max(by_step)
         offset = args.offset_ms * 1000.0
-        out.append(f"rank {rank}: the step starts at {args.offset_ms} ms on the trace, as given")
+        out.append(f"    the step starts at {args.offset_ms} ms on the trace, as given")
     else:
-        out.append(f"rank {rank}:")
         choice = choose(by_step, header, signals, args, out)
         if choice is None:
             return None
         step, number, offset = choice.step, choice.profiler_step, choice.offset_us
     if step not in by_step:
-        out.append(f"rank {rank}: no step {step} with module boundaries; steps are {sorted(by_step)}")
+        out.append(f"    no step {step} with module boundaries; steps are {sorted(by_step)}")
         return None
     record = by_step[step]
     step_ms = record["device_ms"]
-    lanes = build_lanes(spans_of(header, record), step_ms, step)
-    spent = lane_ms(lanes)
-    finding: dict[str, Any] = {"rank": rank, "step": step, "profiler_step": number, "step_ms": step_ms,
-                               "lanes_ms": spent, "synthetic": header.get("time_source") == "synthetic"}
-    out.append(f"  record step {step}, {step_ms:.1f} ms of device time; the lanes partition it:")
+    lanes_report = build_lanes(spans_of(header, record), step_ms, step)
+    spent = lane_ms(lanes_report)
+    finding.update(step=step, profiler_step=number, step_ms=step_ms, lanes_ms=spent,
+                   synthetic=header.get("time_source") == "synthetic")
+    out.append(f"    record step {step}, {step_ms:.1f} ms of device time; the lanes partition it:")
     for lane in PARTITION:
         if spent[lane]:
-            out.append(f"    {lane:10s} {spent[lane]:10.1f} ms  {spent[lane] / step_ms:6.1%}")
+            out.append(f"      {lane:10s} {spent[lane]:10.1f} ms  {spent[lane] / step_ms:6.1%}")
+    certain = choice is None
+    lanes = lanes_report
+    if signals is not None and choice is not None:
+        if choice.anchor is not None:
+            certain = True
+            finding.update(anchored=choice.anchor.share)
+            placement = place_on_profile(record, signals, offset)
+            lanes = build_lanes(spans_of(header, placement.record), step_ms, step)
+            aligner = Aligner(lanes, signals)
+            score = (aligner.score(offset, aligner.denominators(offset, offset + step_ms * 1000.0))
+                     if aligner.usable() else 0.0)
+            partial = "" if choice.anchor.share >= PARTIAL_ANCHORED else (
+                " (partial: the clocks drift over the step, or some tasks are not the recorder's)")
+            out.append(f"    the step starts at {offset / 1000.0:.3f} ms on the trace (profiler step {number}), found "
+                       f"on the recorder's own event-record tasks: {choice.anchor.share:.0%} of its "
+                       f"{choice.anchor.stamps} stamps coincide with one within {ANCHOR_US:g} us{partial}; the "
+                       f"kernels score {score:.2f} there")
+            finding.update(placement={"matched": placement.matched, "stamps": placement.stamps,
+                                      "median_shift_us": placement.median_us, "worst_shift_us": placement.worst_us,
+                                      "drift_us_per_s": placement.drift_us_per_s})
+            out.append(f"    each stamp moved onto its own record task: {placement.matched} of {placement.stamps} "
+                       f"matched, median shift {placement.median_us:+.1f} us, largest {placement.worst_us:.1f} us, "
+                       f"drift {placement.drift_us_per_s:+.2f} us per second of step")
+        elif choice.fit is not None:
+            certain = choice.fit.clear
+            finding.update(alignment=choice.fit.score, elsewhere=choice.fit.elsewhere)
+            out.append(f"    the step starts at {offset / 1000.0:.3f} ms on the trace (profiler step {number}), found "
+                       f"on the kernels alone: score {choice.fit.score:.2f}, best elsewhere {choice.fit.elsewhere:.2f}"
+                       "; the lanes are placed by that offset, not stamp by stamp")
     waits = ep_group_waits(hetero_dir, rank, step, args.ep_size)
     group = f"{rank // args.ep_size * args.ep_size}-{rank // args.ep_size * args.ep_size + args.ep_size - 1}"
     if waits is None:
-        out.append(f"  EP wait not computed: a rank of the group of {args.ep_size} (ranks {group}) has no record of "
+        out.append(f"    EP wait not computed: a rank of the group of {args.ep_size} (ranks {group}) has no record of "
                    f"step {step}, or there are no expert spans (--ep-size is the ranks per EP group)")
     else:
         annotate_exchange(lanes, waits)
         last = Counter(cell["last_to_arrive"] for cell in waits["layers"].values()).most_common(3)
         finding["ep_wait"] = {key: waits[key] for key in ("ep_size", "exchange_ms", "floor_ms", "wait_ms")}
         share = waits["wait_ms"] / max(waits["exchange_ms"], 1e-9)
-        out.append(f"  EP wait (the report's definition: a layer's exchange above the smallest in the group of "
+        out.append(f"    EP wait (the report's definition: a layer's exchange above the smallest in the group of "
                    f"{args.ep_size}, ranks {group}): exchange {waits['exchange_ms']:.0f} ms = floor "
                    f"{waits['floor_ms']:.0f} ms + waiting {waits['wait_ms']:.0f} ms ({share:.0%})")
-        out.append("  last to arrive, the rank that waits least, most often: " + ", ".join(
+        out.append("    last to arrive, the rank that waits least, most often: " + ", ".join(
             f"rank {member} ({count} of {len(waits['layers'])} layers)" for member, count in last))
-    pairs = reconcile(header, record, lanes)
+    pairs = reconcile(header, record, lanes_report)
     worst = max((abs(mine - theirs) for mine, theirs in pairs.values()), default=0.0)
     different = {lane: (mine, theirs) for lane, (mine, theirs) in pairs.items()
                  if abs(mine - theirs) > reconcile_tolerance(mine, theirs)}
     finding["reconcile"] = {lane: {"lane_ms": mine, "report_ms": theirs} for lane, (mine, theirs) in pairs.items()}
-    out.append("  the lanes against the report's components (analyze_hetero): " + (
+    out.append("    the lanes against the report's components (analyze_hetero): " + (
         f"the same milliseconds (largest difference {worst:.4f} ms)" if not different else
         "DIFFERENT, " + ", ".join(f"{lane} {mine:.3f} vs {theirs:.3f} ms" for lane, (mine, theirs)
                                   in different.items())))
-    events = lane_events(lanes, PROCESS_BASE + 1000 * index, offset, rank, finding["synthetic"])
     if signals is None:
-        return events, finding
+        return lanes, 0.0
     shape = composition(lanes, signals, offset)
     checks = recalls(lanes, signals, offset, step_ms)
     waiting = hook_order(shape)
     finding.update(offset_us=offset, composition=shape, checks=checks, compute_wait_share=waiting)
-    certain = choice is None
-    if choice is not None and choice.anchor is not None:
-        certain = True
-        finding.update(anchored=choice.anchor.share)
-        aligner = Aligner(lanes, signals)
-        score = (aligner.score(offset, aligner.denominators(offset, offset + step_ms * 1000.0))
-                 if aligner.usable() else 0.0)
-        out.append(f"  the step starts at {offset / 1000.0:.3f} ms on the trace (profiler step {number}), found on the "
-                   f"recorder's own event-record tasks: {choice.anchor.share:.0%} of its {choice.anchor.stamps} stamps "
-                   f"coincide with one within {ANCHOR_US:g} us"
-                   + ("" if choice.anchor.share >= PARTIAL_ANCHORED else " (partial: the clocks drift over the step, "
-                                                                        "or some tasks are not the recorder's)")
-                   + f"; the kernels score {score:.2f} there")
-    elif choice is not None and choice.fit is not None:
-        certain = choice.fit.clear
-        finding.update(alignment=choice.fit.score, elsewhere=choice.fit.elsewhere)
-        out.append(f"  the step starts at {offset / 1000.0:.3f} ms on the trace (profiler step {number}), found on the "
-                   f"kernels alone: score {choice.fit.score:.2f}, best elsewhere {choice.fit.elsewhere:.2f}")
     for lane in PARTITION:
         if lane not in shape:
             continue
         entry = shape[lane]
         kernels = ", ".join(f"{name} {share:.0%}" for name, share in list(entry["kernels"].items())[:3]) or "none"
         comms = ", ".join(f"{name} {ms:.1f} ms" for name, ms in list(entry["collectives_ms"].items())[:2]) or "none"
-        out.append(f"    {lane:10s} stream busy {entry['busy']:4.0%} waiting {entry['wait']:4.0%} idle "
+        out.append(f"      {lane:10s} stream busy {entry['busy']:4.0%} waiting {entry['wait']:4.0%} idle "
                    f"{entry['idle']:4.0%} | kernels: {kernels} | collectives: {comms}")
     for check in checks:
         share = check["share"]
-        out.append(f"    {check['what']}: " + ("n/a (none in the step)" if share is None else f"{share:.1%}"))
+        out.append(f"      {check['what']}: " + ("n/a (none in the step)" if share is None else f"{share:.1%}"))
     if waiting is not None:
-        out.append(f"    stream waits inside the attention, expert and vision slices: {waiting:.1%} of their time")
+        out.append(f"      stream waits inside the attention, expert and vision slices: {waiting:.1%} of their time")
     finding["verdict"] = verdict(checks, certain, waiting)
-    out.append(f"  {finding['verdict']}")
-    if args.original and full_dir is not None:
-        window = (offset - args.margin_ms * 1000.0, offset + step_ms * 1000.0 + args.margin_ms * 1000.0)
-        extra, skipped = original_events(signals, PROCESS_BASE + 1000 * index + 1, window, rank,
-                                         args.include_host, args.min_us)
-        os.makedirs(full_dir, exist_ok=True)
-        path = os.path.join(full_dir, f"components_rank{rank}_with_trace.json")
+    out.append(f"    {finding['verdict']}")
+    return lanes, offset
+
+
+def profile_part(capture: Capture, signals: Signals, job: Job, out: list[str], finding: dict[str, Any]
+                 ) -> dict[str, list[Piece]]:
+    """Describe what the trace holds and each profiled step from the profile alone; return the lanes to draw."""
+    out.append("  THE PROFILE ALONE (no hook record used)")
+    out.extend("    " + line for line in inventory(capture, signals))
+    steps = signals.steps[-DESCRIBED_STEPS:] or [(-1, signals.extent[0], signals.extent[1])]
+    finding["profile"] = []
+    for number, start, end in steps:
+        numbers = step_numbers(signals, number, start, end)
+        finding["profile"].append(numbers)
+        out.extend("    " + line for line in describe_step(numbers))
+    return profile_lanes(signals, job.args.merge_us, job.args.idle_us)
+
+
+def process_rank(rank: int, job: Job, out: list[str]) -> Optional[dict[str, Any]]:
+    """Analyse one rank, write its trace file, and return its findings; None if there is nothing to draw."""
+    args = job.args
+    out.append(f"rank {rank}:")
+    finding: dict[str, Any] = {"rank": rank}
+    capture = signals = None
+    if rank in job.traces:
+        capture = load_capture(job.traces[rank])
+        signals = read_signals(capture.trace, job.rules)
+    profile = profile_part(capture, signals, job, out, finding) if capture and signals else None
+    hooked = hook_part(rank, job, signals, out, finding) if job.hetero_dir else None
+    if profile is None and hooked is None:
+        out.append("  nothing to draw: no trace and no hooks record for this rank")
+        return None
+    tag = "SYNTHETIC " if finding.get("synthetic") else ""
+    new_events: list[dict[str, Any]] = []
+    pids = free_pids(capture.events if capture else [], 2, PROCESS_BASE)
+    if hooked is not None:
+        lanes, offset = hooked
+        placed = "placed on the profiler's timestamps" if capture and finding.get("anchored") else (
+            "placed by an offset" if capture else "on the recorder's clock")
+        new_events += process_events(
+            pids[0], f"{tag}rank {rank} | components from the hooks (hetero_profile), {placed}", -1000, LANES, lanes,
+            offset, 1000.0)
+    if profile is not None:
+        new_events += process_events(pids[1], f"rank {rank} | components from the profile alone (kernel classes, "
+                                              "stream state, collectives)", -999, PROFILE_LANES, profile)
+    if capture is not None and args.original:
+        path = os.path.join(job.full_dir, f"rank{rank}_trace_with_components.json")
+        size = write_integrated(capture, new_events, path)
+        processes = int(hooked is not None) + int(profile is not None)
+        out.append(f"  wrote {path}: {size / 2 ** 20:,.0f} MiB, the {len(capture.events):,} original events untouched, "
+                   f"then {len(new_events):,} new ones in {processes} process(es)")
+        finding["trace_file"] = path
+    elif capture is None and hooked is not None:
+        path = os.path.join(job.out_dir, f"rank{rank}_lanes.json")
+        os.makedirs(job.out_dir, exist_ok=True)
         with open(path, "w", encoding="utf-8") as stream:
-            json.dump({"traceEvents": events + extra, "displayTimeUnit": "ms"}, stream)
-        out.append(f"  wrote {path} ({len(extra)} real events, {skipped} shorter than {args.min_us:g} us left out)")
-    return events, finding
+            json.dump({"traceEvents": new_events, "displayTimeUnit": "ms"}, stream)
+        out.append(f"  wrote {path} ({len(new_events):,} events: the lanes alone)")
+        finding["trace_file"] = path
+    return finding
 
 
 # -- the command ------------------------------------------------------------------------------------------
@@ -965,14 +951,18 @@ def leaf_work(header: dict, record: dict) -> float:
     return sum(spent[lane] for lane in ("vision", "attention", "experts", "head"))
 
 
-def pick_ranks(hetero_dir: str, profile_dir: str, out: list[str]) -> list[int]:
-    """Return the idlest and the busiest rank of the last recorded step among those that have a record and a trace."""
-    traces = find_rank_traces(profile_dir) if os.path.isdir(profile_dir) else {}
-    local = ranks_with_records(hetero_dir)
-    candidates = [rank for rank in local if rank in traces] or local
+def pick_ranks(job: Job, out: list[str]) -> list[int]:
+    """Return the ranks to draw: with records the idlest and the busiest that have a trace, else the first trace."""
+    if not job.hetero_dir:
+        chosen = sorted(job.traces)[:1]
+        out.append(f"no hetero records: the profile alone for rank {chosen[0] if chosen else '-'} "
+                   f"of {len(job.traces)} trace(s); --rank chooses others")
+        return chosen
+    local = ranks_with_records(job.hetero_dir)
+    candidates = [rank for rank in local if rank in job.traces] or local
     scored = []
     for rank in candidates:
-        loaded = load_rank(hetero_dir, rank)
+        loaded = load_rank(job.hetero_dir, rank)
         hooked = [record for record in (loaded[1] if loaded else []) if record["marks"]]
         if hooked:
             scored.append((leaf_work(loaded[0], hooked[-1]), rank))
@@ -981,69 +971,72 @@ def pick_ranks(hetero_dir: str, profile_dir: str, out: list[str]) -> list[int]:
     if len(scored) > 1:
         out.append(f"ranks drawn, among {len(candidates)}: the idlest, rank {scored[0][1]} ({scored[0][0]:.0f} ms of "
                    f"vision, attention, expert and head work in the last recorded step), and the busiest, rank "
-                   f"{scored[-1][1]} ({scored[-1][0]:.0f} ms)")
+                   f"{scored[-1][1]} ({scored[-1][0]:.0f} ms); one trace file each")
     else:
         out.append(f"rank drawn: {chosen}")
     return chosen
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    """Parse the command line, build the traces and print the findings."""
+def parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
+    """Parse the command line."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("run", help="run directory holding hetero/ (records) and profile/ (Ascend traces)")
-    parser.add_argument("--hetero-dir", default=None, help="the records (default: <run>/hetero, or <run> itself)")
-    parser.add_argument("--profile-dir", default=None, help="the Ascend traces (default: <run>/profile)")
+    parser.add_argument("path", help="a run directory (hetero/ records and profile/ traces), a directory of traces, "
+                                     "or one trace_view.json")
+    parser.add_argument("--hetero-dir", default=None, help="the hetero_profile records (default: <run>/hetero)")
     parser.add_argument("--rank", type=int, nargs="+", default=None,
-                        help="ranks to draw (default: the idlest and the busiest of those that have both files)")
+                        help="ranks to process (default: with records the idlest and the busiest that have a trace, "
+                             "else the first trace)")
+    parser.add_argument("--class", dest="class_rules", action="append", default=[], metavar="CLASS=REGEX",
+                        help="classify the kernels whose name matches REGEX as CLASS (attention, experts, routing, "
+                             "dense, norm, other), before the defaults; repeatable")
     parser.add_argument("--step", type=int, default=None, help="the record step (default: found by alignment)")
-    parser.add_argument("--profiler-step", type=int, default=None, help="the ProfilerStep number to use")
+    parser.add_argument("--profiler-step", type=int, default=None, help="the ProfilerStep number to pair with")
     parser.add_argument("--ep-size", type=int, default=16, help="ranks per expert-parallel group (for the EP wait)")
     parser.add_argument("--offset-ms", type=float, default=None,
-                        help="where the step starts on the trace's timeline, instead of searching (one --rank)")
+                        help="where the record step starts on the trace's timeline, instead of searching (one --rank)")
     parser.add_argument("--search-all", action="store_true",
                         help="search the whole trace for the step, not the profiler step's range (slower)")
-    parser.add_argument("--out", default=None, help="small files: lanes, summary, report (<run>/profile/components)")
+    parser.add_argument("--merge-us", type=float, default=100.0,
+                        help="kernels of one class this close are drawn as one slice in the profile lanes")
+    parser.add_argument("--idle-us", type=float, default=20.0,
+                        help="a gap on the compute stream this long is drawn as idle in the profile lanes")
+    parser.add_argument("--out", default=None, help="small files: report and summary (<run>/profile/components)")
     parser.add_argument("--full-out", default=None,
-                        help="large files: lanes and the real events (<run>/profile/components_full)")
-    parser.add_argument("--no-trace", action="store_true", help="draw the lanes alone, from the records")
+                        help="large files: the trace of each rank with the components (<run>/profile/components_full)")
+    parser.add_argument("--no-trace", action="store_true", help="ignore the traces: the hooks' lanes alone")
     parser.add_argument("--no-original", dest="original", action="store_false",
-                        help="do not write the file that holds the real device events under the lanes")
-    parser.add_argument("--include-host", action="store_true", help="copy the host processes of the trace as well")
-    parser.add_argument("--margin-ms", type=float, default=50.0, help="real events kept around the step")
-    parser.add_argument("--min-us", type=float, default=5.0, help="real events shorter than this are left out")
-    args = parser.parse_args(argv)
-    default = os.path.join(args.run, "hetero")
-    hetero_dir = args.hetero_dir or (default if os.path.isdir(default) else args.run)
-    profile_dir = args.profile_dir or os.path.join(args.run, "profile")
-    out_dir = args.out or os.path.join(args.run, "profile", "components")
-    full_dir = args.full_out or os.path.join(args.run, "profile", "components_full")
+                        help="do not write the trace files (report only)")
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Parse the command line, process the ranks, write the trace files and print the findings."""
+    args = parse_args(argv)
+    try:
+        job = resolve(args)
+    except ValueError as error:
+        print(error)
+        return 2
+    if not job.traces and not job.hetero_dir:
+        print(f"no trace_view.json and no rank*.jsonl under {args.path}: pass a run directory (it holds hetero/ and "
+              "profile/), a directory of traces, or one trace_view.json")
+        return 1
     out: list[str] = []
-    if not glob.glob(os.path.join(hetero_dir, "rank*.jsonl")):
-        print(f"no rank*.jsonl in {hetero_dir}: pass the run directory (it holds hetero/ and profile/) or --hetero-dir")
-        return 1
-    ranks = args.rank if args.rank is not None else pick_ranks(hetero_dir, profile_dir, out)
-    events: list[dict[str, Any]] = []
+    ranks = args.rank if args.rank is not None else pick_ranks(job, out)
     findings = []
-    for index, rank in enumerate(ranks):
-        built = process_rank(rank, hetero_dir, profile_dir, args, index, out, full_dir)
-        if built is not None:
-            events += built[0]
-            findings.append(built[1])
+    for rank in ranks:
+        finding = process_rank(rank, job, out)
+        if finding is not None:
+            findings.append(finding)
+    print("\n".join(out))
     if not findings:
-        print("\n".join(out))
         return 1
-    os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "components.json"), "w", encoding="utf-8") as stream:
-        json.dump({"traceEvents": events, "displayTimeUnit": "ms"}, stream)
-    with open(os.path.join(out_dir, "components_summary.json"), "w", encoding="utf-8") as stream:
-        json.dump(findings, stream, indent=2)
-    out.append(f"wrote {os.path.join(out_dir, 'components.json')} ({len(events)} events: the lanes alone) and "
-               "components_summary.json; open a trace in https://ui.perfetto.dev, chrome://tracing or MindStudio "
-               "Insight, the process 'components' sits above the real streams")
-    report = "\n".join(out)
-    print(report)
-    with open(os.path.join(out_dir, "components.txt"), "w", encoding="utf-8") as stream:
-        stream.write(report + "\n")
+    os.makedirs(job.out_dir, exist_ok=True)
+    with open(os.path.join(job.out_dir, "components_summary.json"), "w", encoding="utf-8") as stream:
+        json.dump(findings, stream, indent=2, default=str)
+    with open(os.path.join(job.out_dir, "components.txt"), "w", encoding="utf-8") as stream:
+        stream.write("\n".join(out) + "\n")
+    print(f"report: {os.path.join(job.out_dir, 'components.txt')} (and components_summary.json)")
     return 0
 
 
