@@ -481,16 +481,12 @@ def attach_received_pairs(run: Run, rows: list[dict], ep_size: int) -> int:
     return attached
 
 
-def exchange_split(run: Run, ep_size: int) -> Optional[dict[str, float]]:
-    """Split the MoE exchange into what the rank that waits least pays and the waiting above it.
+def exchange_cells(run: Run, ep_size: int) -> dict[tuple[int, int, int, int], dict[int, float]]:
+    """Return each rank's MoE exchange per (step, micro-batch, layer, expert-parallel group), over all passes.
 
-    For every step, micro-batch, layer and expert-parallel group (``ep_size`` consecutive ranks) each rank's exchange
-    is the MoE block's span minus its experts' span, over the forward, the recompute and the backward pass (the lazy
-    recompute's router and all-to-alls included). The smallest value in the group is the floor: router, transfers and
-    host syncs with nobody to wait for. What a rank pays above it is waiting for a slower rank of its group.
-
-    Returns ``floor_ms`` (the sum over layers of the floors, per micro-batch, averaged over groups) and ``wait_ms``
-    (what an average rank waits above the floor, summed over layers), or None without the experts' spans.
+    A rank's exchange is the MoE block's span minus its experts' span, summed over the forward, the recompute and
+    the backward pass (the lazy recompute's router and all-to-alls included). The groups are ``ep_size``
+    consecutive ranks of ``run.ranks``. Empty without the experts' spans.
     """
     cells: dict[tuple[int, int, int, int], dict[int, float]] = {}
     for position, rank in enumerate(run.ranks):
@@ -519,6 +515,22 @@ def exchange_split(run: Run, ep_size: int) -> Optional[dict[str, float]]:
                     exchange = sum(max(moe[phase] - experts[phase], 0.0) for phase in PHASES)
                     key = (record["step"], occurrence, layer, position // ep_size)
                     cells.setdefault(key, {})[rank] = exchange
+    return cells
+
+
+def exchange_split(run: Run, ep_size: int) -> Optional[dict[str, float]]:
+    """Split the MoE exchange into what the rank that waits least pays and the waiting above it.
+
+    For every step, micro-batch, layer and expert-parallel group (``ep_size`` consecutive ranks) each rank's exchange
+    is the MoE block's span minus its experts' span, over the forward, the recompute and the backward pass (the lazy
+    recompute's router and all-to-alls included; see ``exchange_cells``). The smallest value in the group is the
+    floor: router, transfers and host syncs with nobody to wait for. What a rank pays above it is waiting for a
+    slower rank of its group.
+
+    Returns ``floor_ms`` (the sum over layers of the floors, per micro-batch, averaged over groups) and ``wait_ms``
+    (what an average rank waits above the floor, summed over layers), or None without the experts' spans.
+    """
+    cells = exchange_cells(run, ep_size)
     if not cells:
         return None
     floor: dict[tuple[int, int, int], float] = {}

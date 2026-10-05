@@ -77,12 +77,13 @@ import glob
 import json
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Iterable, Optional, Sequence
 
 # Run as a script, Python puts this directory first on the import path.
-from analyze_hetero import build_rows, spans_of as record_spans
+from analyze_hetero import build_rows, exchange_cells, spans_of as record_spans
 from ascend_trace import SYNC_PATTERN, Trace, category, comm_type, find_rank_traces, is_sync
 
 PHASES = ("fwd", "recompute", "bwd")
@@ -121,13 +122,15 @@ CHECKS = (
 )
 ALIGN_CLASSES = (("grouped matmul", ("experts",)), ("attention", ("attention", "vision")))
 PROCESS_BASE = 9_000_000
-MIN_SLICE_MS = 0.001
+MIN_SLICE_MS = 0.001             # slices shorter than this are counted in the lanes but not drawn (1 us)
 COARSE_US, WIDE_US, FINE_US, POLISH_US = 2000.0, 10_000.0, 100.0, 10.0
 MARGIN_BEFORE_US, MARGIN_AFTER_US = 300_000.0, 600_000.0
 SEPARATE_US = 20_000.0           # peaks closer than this are one peak
 CLEAR_PEAK = 1.3                 # the best alignment must beat any other by this factor
 HOOK_ORDER_WAIT_SHARE = 0.10     # stream waits inside compute slices above this share: the hooks sit elsewhere
-RECONCILE_TOLERANCE_MS = 0.01
+RECONCILE_TOLERANCE_MS = 0.05    # the lanes and the report may differ by this much, or by RECONCILE_RELATIVE of a lane,
+RECONCILE_RELATIVE = 5e-3        # for device events that come out of order by a microsecond or two (a misbooking is
+                                 # a whole span, far above that)
 # The recorder stamps its events with a device event record; the profiler lists such a task on the stream, so the
 # stamps are anchors that pin the clocks together to a few microseconds.
 RECORD_PATTERN = re.compile(r"^(EVENT|NOTIFY)[ _]?RECORD", re.IGNORECASE)
@@ -286,8 +289,8 @@ def build_lanes(spans: list[Span], step_ms: float, step: int) -> dict[str, list[
     lanes: dict[str, list[Piece]] = {lane: [] for lane, _ in LANES}
 
     def add(lane: str, start: float, end: float, name: str, **args: Any) -> None:
-        """Append a slice if it has a length."""
-        if end - start >= MIN_SLICE_MS:
+        """Append a slice if it has a length (even a sub-microsecond one, so that the lanes add up exactly)."""
+        if end > start:
             lanes[lane].append(Piece(start, end, name, {**args, "ms": round(end - start, 3)}))
 
     def facts(span: Span) -> dict[str, Any]:
@@ -356,6 +359,11 @@ def build_lanes(spans: list[Span], step_ms: float, step: int) -> dict[str, list[
     return lanes
 
 
+def reconcile_tolerance(mine: float, theirs: float) -> float:
+    """Return how far apart a lane and the report's component may be before the two bookings are called different."""
+    return max(RECONCILE_TOLERANCE_MS, RECONCILE_RELATIVE * max(abs(mine), abs(theirs)))
+
+
 def lane_ms(lanes: dict[str, list[Piece]]) -> dict[str, float]:
     """Return the milliseconds each lane holds."""
     return {lane: total((p.start, p.end) for p in pieces) for lane, pieces in lanes.items()}
@@ -382,6 +390,47 @@ def reconcile(header: dict, record: dict, lanes: dict[str, list[Piece]]) -> dict
     if summed("text_layer") > 0:
         pairs["inside"] = summed("text_layer") - summed("text_attn") - summed("text_experts")
     return {lane: (spent[lane], value) for lane, value in pairs.items()}
+
+
+def ep_group_waits(hetero_dir: str, rank: int, step: int, ep_size: int) -> Optional[dict[str, Any]]:
+    """Return the report's floor and waiting of one rank's MoE exchange, from the records of its whole EP group.
+
+    ``analyze_hetero`` defines them per micro-batch and layer: a rank's exchange (the MoE block's span minus the
+    experts', over the passes) minus the smallest exchange among the ``ep_size`` consecutive ranks of its group is the
+    time it waited for the slowest rank of the group, and the smallest is the floor, the exchange with nobody to wait
+    for. None when a rank of the group has no record of the step (then the group is not whole).
+    """
+    first = rank // ep_size * ep_size
+    members = list(range(first, first + ep_size))
+    headers, steps = {}, {}
+    for member in members:
+        loaded = load_rank(hetero_dir, member)
+        record = next((r for r in (loaded[1] if loaded else []) if r["step"] == step and r["marks"]), None)
+        if loaded is None or record is None:
+            return None
+        headers[member], steps[member] = loaded[0], [record]
+    cells = exchange_cells(SimpleNamespace(ranks=members, headers=headers, steps=steps), ep_size)
+    layers: dict[tuple[int, int], dict[str, Any]] = {}
+    for (_step, occurrence, layer, _group), by_rank in cells.items():
+        low = min(by_rank.values())
+        layers[(occurrence, layer)] = {"exchange_ms": by_rank[rank], "floor_ms": low, "wait_ms": by_rank[rank] - low,
+                                       "last_to_arrive": min(by_rank, key=lambda member: by_rank[member])}
+    if not layers:
+        return None
+    return {"ep_size": ep_size, "layers": layers,
+            "exchange_ms": sum(cell["exchange_ms"] for cell in layers.values()),
+            "floor_ms": sum(cell["floor_ms"] for cell in layers.values()),
+            "wait_ms": sum(cell["wait_ms"] for cell in layers.values())}
+
+
+def annotate_exchange(lanes: dict[str, list[Piece]], waits: dict[str, Any]) -> None:
+    """Put the layer's floor and waiting in the arguments of every exchange slice of that layer."""
+    for piece in lanes["exchange"]:
+        cell = waits["layers"].get((piece.args.get("micro_batch"), piece.args.get("layer")))
+        if cell is not None:
+            piece.args.update(layer_exchange_ms=round(cell["exchange_ms"], 3),
+                              layer_floor_ms=round(cell["floor_ms"], 3), layer_wait_ms=round(cell["wait_ms"], 3),
+                              last_to_arrive_rank=cell["last_to_arrive"])
 
 
 # -- the profiler's side ----------------------------------------------------------------------------------
@@ -669,6 +718,8 @@ def lane_events(lanes: dict[str, list[Piece]], pid: int, offset_us: float, rank:
         events.append({"ph": "M", "name": "thread_sort_index", "pid": pid, "tid": number,
                        "args": {"sort_index": number}})
         for piece in lanes[lane]:
+            if piece.end - piece.start < MIN_SLICE_MS:
+                continue
             events.append({"ph": "X", "name": piece.name, "cat": lane, "pid": pid, "tid": number,
                            "ts": offset_us + piece.start * 1000.0, "dur": (piece.end - piece.start) * 1000.0,
                            "args": piece.args})
@@ -830,13 +881,30 @@ def process_rank(rank: int, hetero_dir: str, profile_dir: str, args: argparse.Na
     for lane in PARTITION:
         if spent[lane]:
             out.append(f"    {lane:10s} {spent[lane]:10.1f} ms  {spent[lane] / step_ms:6.1%}")
+    waits = ep_group_waits(hetero_dir, rank, step, args.ep_size)
+    group = f"{rank // args.ep_size * args.ep_size}-{rank // args.ep_size * args.ep_size + args.ep_size - 1}"
+    if waits is None:
+        out.append(f"  EP wait not computed: a rank of the group of {args.ep_size} (ranks {group}) has no record of "
+                   f"step {step}, or there are no expert spans (--ep-size is the ranks per EP group)")
+    else:
+        annotate_exchange(lanes, waits)
+        last = Counter(cell["last_to_arrive"] for cell in waits["layers"].values()).most_common(3)
+        finding["ep_wait"] = {key: waits[key] for key in ("ep_size", "exchange_ms", "floor_ms", "wait_ms")}
+        share = waits["wait_ms"] / max(waits["exchange_ms"], 1e-9)
+        out.append(f"  EP wait (the report's definition: a layer's exchange above the smallest in the group of "
+                   f"{args.ep_size}, ranks {group}): exchange {waits['exchange_ms']:.0f} ms = floor "
+                   f"{waits['floor_ms']:.0f} ms + waiting {waits['wait_ms']:.0f} ms ({share:.0%})")
+        out.append("  last to arrive, the rank that waits least, most often: " + ", ".join(
+            f"rank {member} ({count} of {len(waits['layers'])} layers)" for member, count in last))
     pairs = reconcile(header, record, lanes)
     worst = max((abs(mine - theirs) for mine, theirs in pairs.values()), default=0.0)
+    different = {lane: (mine, theirs) for lane, (mine, theirs) in pairs.items()
+                 if abs(mine - theirs) > reconcile_tolerance(mine, theirs)}
     finding["reconcile"] = {lane: {"lane_ms": mine, "report_ms": theirs} for lane, (mine, theirs) in pairs.items()}
     out.append("  the lanes against the report's components (analyze_hetero): " + (
-        f"the same milliseconds (largest difference {worst:.4f} ms)" if worst <= RECONCILE_TOLERANCE_MS else
-        "DIFFERENT, " + ", ".join(f"{lane} {mine:.1f} vs {theirs:.1f}" for lane, (mine, theirs) in pairs.items()
-                                  if abs(mine - theirs) > RECONCILE_TOLERANCE_MS)))
+        f"the same milliseconds (largest difference {worst:.4f} ms)" if not different else
+        "DIFFERENT, " + ", ".join(f"{lane} {mine:.3f} vs {theirs:.3f} ms" for lane, (mine, theirs)
+                                  in different.items())))
     events = lane_events(lanes, PROCESS_BASE + 1000 * index, offset, rank, finding["synthetic"])
     if signals is None:
         return events, finding
@@ -910,7 +978,12 @@ def pick_ranks(hetero_dir: str, profile_dir: str, out: list[str]) -> list[int]:
             scored.append((leaf_work(loaded[0], hooked[-1]), rank))
     scored.sort()
     chosen = sorted({scored[0][1], scored[-1][1]}) if scored else candidates[:1]
-    out.append(f"ranks drawn: the idlest and the busiest of the last recorded step, among {len(candidates)}: {chosen}")
+    if len(scored) > 1:
+        out.append(f"ranks drawn, among {len(candidates)}: the idlest, rank {scored[0][1]} ({scored[0][0]:.0f} ms of "
+                   f"vision, attention, expert and head work in the last recorded step), and the busiest, rank "
+                   f"{scored[-1][1]} ({scored[-1][0]:.0f} ms)")
+    else:
+        out.append(f"rank drawn: {chosen}")
     return chosen
 
 
@@ -924,6 +997,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="ranks to draw (default: the idlest and the busiest of those that have both files)")
     parser.add_argument("--step", type=int, default=None, help="the record step (default: found by alignment)")
     parser.add_argument("--profiler-step", type=int, default=None, help="the ProfilerStep number to use")
+    parser.add_argument("--ep-size", type=int, default=16, help="ranks per expert-parallel group (for the EP wait)")
     parser.add_argument("--offset-ms", type=float, default=None,
                         help="where the step starts on the trace's timeline, instead of searching (one --rank)")
     parser.add_argument("--search-all", action="store_true",

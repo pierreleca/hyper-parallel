@@ -18,6 +18,7 @@ import glob
 import importlib.util
 import json
 import pathlib
+import random
 import sys
 from types import ModuleType
 from typing import Callable, Optional
@@ -38,7 +39,7 @@ def _load(name: str) -> ModuleType:
 
 _load("hetero_sampling")
 synthetic = _load("synthetic_hetero_records")
-_load("analyze_hetero")
+report = _load("analyze_hetero")
 _load("ascend_trace")
 ct = _load("component_trace")
 
@@ -49,11 +50,11 @@ SMALL = {"scenario": "both", "ranks": 8, "steps": 5, "layers": 4, "blocks": 4, "
 
 
 def _make(path: pathlib.Path, *, checkpoint: str = "nonreentrant", accumulation: int = 1, shift: int = 1,
-          ranks=(0, 3)) -> pathlib.Path:
+          ranks=(0, 3), layers: int = SMALL["layers"]) -> pathlib.Path:
     """Simulate a run of records with Ascend-like traces for some ranks; return the run directory."""
     synthetic.write_run(str(path / "hetero"), accumulation=accumulation, checkpoint=checkpoint,
                         ascend_dir=str(path / "profile"), ascend_ranks=list(ranks), ascend_offset_ms=OFFSET_MS,
-                        ascend_step_shift=shift, **SMALL)
+                        ascend_step_shift=shift, **{**SMALL, "layers": layers})
     return path
 
 
@@ -307,3 +308,76 @@ def test_a_directory_without_records_is_reported(tmp_path, capsys):
     """Pointing the command at the wrong directory says what it expects."""
     assert ct.main([str(tmp_path)]) == 1
     assert "no rank*.jsonl" in capsys.readouterr().out
+
+
+def test_slivers_are_counted_in_the_lanes_but_not_drawn():
+    """Pieces shorter than a microsecond (adjacent hooks) count, so the lanes add up exactly, but are not emitted."""
+    spans = [
+        ct.Span("text.layer", 0, "text.layer.0", "fwd", 0, 0.0, 10.0),
+        ct.Span("text.attn", 0, "text.attn.0", "fwd", 0, 0.0004, 5.0),
+        ct.Span("text.moe", 0, "text.moe.0", "fwd", 0, 5.0003, 9.9997),
+        ct.Span("text.experts", 0, "text.experts.0", "fwd", 0, 6.0, 8.0),
+    ]
+    lanes = ct.build_lanes(spans, 10.0, 1)
+    assert ct.lane_ms(lanes)["inside"] == pytest.approx(0.0004 + 0.0003 + 0.0003, abs=1e-9)
+    drawn = [e for e in ct.lane_events(lanes, 1, 0.0, 0, False) if e["ph"] == "X" and e["cat"] == "inside"]
+    assert drawn == []
+    assert ct.reconcile_tolerance(1.0, 1.0) == ct.RECONCILE_TOLERANCE_MS
+    assert ct.reconcile_tolerance(8507.0, 8507.0) == pytest.approx(ct.RECONCILE_RELATIVE * 8507.0)
+
+
+def test_the_two_ranks_drawn_by_default_are_named_idlest_and_busiest(tmp_path, capsys):
+    """The report says which of the two ranks is which, with the work each holds."""
+    run = _make(tmp_path)
+    assert ct.main([str(run), "--no-original"]) == 0
+    first = capsys.readouterr().out.splitlines()[0]
+    assert first.startswith("ranks drawn, among 2: the idlest, rank ") and "and the busiest, rank " in first
+
+
+def test_microsecond_jitter_in_the_stamps_does_not_make_the_two_bookings_differ(tmp_path):
+    """Boundaries of adjacent hooks that come out of order by a few microseconds move the lanes a hair, not a span."""
+    run = _make(tmp_path, layers=24)
+    noise = random.Random(5)
+    for name in glob.glob(str(run / "hetero" / "rank*.jsonl")):
+        with open(name, encoding="utf-8") as stream:
+            lines = [json.loads(line) for line in stream]
+        for record in lines[1:]:
+            for mark in record["marks"]:
+                mark[4] = round(mark[4] + noise.uniform(-0.002, 0.002), 4)
+        with open(name, "w", encoding="utf-8") as stream:
+            stream.write("\n".join(json.dumps(line) for line in lines) + "\n")
+    for finding in _run(run, "--rank", "0", "3", "--no-trace"):
+        for lane, entry in finding["reconcile"].items():
+            assert abs(entry["lane_ms"] - entry["report_ms"]) <= ct.reconcile_tolerance(
+                entry["lane_ms"], entry["report_ms"]), lane
+
+
+def test_the_ep_wait_is_the_reports_and_is_written_on_the_exchange_slices(tmp_path):
+    """Floor and waiting come from the whole EP group's records, equal the report's cells, and sit on the slices."""
+    run = _make(tmp_path, ranks=(), layers=6)
+    findings = _run(run, "--rank", "0", "3", "--no-trace", "--ep-size", "4")
+    last_step = max(record["step"] for record in report.Run(str(run / "hetero")).steps[0])
+    cells = {key: by_rank for key, by_rank in report.exchange_cells(report.Run(str(run / "hetero")), 4).items()
+             if key[0] == last_step}
+    for finding in findings:
+        mine = [by_rank for by_rank in cells.values() if finding["rank"] in by_rank]
+        assert finding["ep_wait"]["wait_ms"] == pytest.approx(
+            sum(by_rank[finding["rank"]] - min(by_rank.values()) for by_rank in mine), abs=1e-6)
+        assert finding["ep_wait"]["floor_ms"] == pytest.approx(sum(min(by_rank.values()) for by_rank in mine), abs=1e-6)
+        assert finding["ep_wait"]["exchange_ms"] == pytest.approx(
+            finding["ep_wait"]["floor_ms"] + finding["ep_wait"]["wait_ms"], abs=1e-6)
+    with open(run / "profile" / "components" / "components.json", encoding="utf-8") as stream:
+        events = [e for e in json.load(stream)["traceEvents"]
+                  if e["ph"] == "X" and e["cat"] == "exchange" and e["pid"] == ct.PROCESS_BASE]
+    per_layer = {(e["args"]["micro_batch"], e["args"]["layer"]): e["args"]["layer_wait_ms"] for e in events}
+    assert len(per_layer) == 6
+    assert sum(per_layer.values()) == pytest.approx(findings[0]["ep_wait"]["wait_ms"], abs=0.001 * len(per_layer))
+    assert all(0 <= e["args"]["last_to_arrive_rank"] <= 3 for e in events)
+
+
+def test_an_ep_group_that_is_not_whole_is_reported_not_guessed(tmp_path, capsys):
+    """With 8 ranks and the default group of 16, no EP wait is computed and the report says why."""
+    run = _make(tmp_path, ranks=())
+    finding = _run(run, "--rank", "0", "--no-trace")[0]
+    assert "ep_wait" not in finding
+    assert "EP wait not computed" in capsys.readouterr().out

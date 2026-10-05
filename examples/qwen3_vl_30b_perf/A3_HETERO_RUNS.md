@@ -427,8 +427,15 @@ pass (`attention bwd`, `experts recompute`), and its arguments give the layer, t
   Without such tasks it falls back on the kernels (`found on the kernels alone`): it slides the slices until the
   grouped-matmul time sits in the expert slices and the attention time in the attention and vision slices, and says
   how far the best place stands above the next one (it must beat it by 1.3x or the verdict is `ALIGNMENT UNCERTAIN`);
+- `EP wait (the report's definition ...): exchange E = floor F + waiting W`: computed from the records of the rank's
+  whole EP group (the 16 consecutive ranks; all of them are on a node, and on the control node): a layer's exchange
+  above the smallest exchange in the group is the time the rank waited for the slowest one, the smallest is the
+  floor. `last to arrive` names the ranks that wait least, the ones the others wait for, and how many layers each.
+  Every exchange slice carries `layer_exchange_ms`, `layer_floor_ms`, `layer_wait_ms` and `last_to_arrive_rank` in its
+  arguments. `--ep-size` is the ranks per group (16 here);
 - `the lanes against the report's components: the same milliseconds`: the lanes carry the same milliseconds as
-  `analyze_hetero.py`'s components. Anything else is a bug in one of the two bookings;
+  `analyze_hetero.py`'s components, to 0.5% of a lane or 0.05 ms (device events of adjacent hooks come out of order by
+  a microsecond). A real difference is a bug in one of the two bookings;
 - per lane, the share of the lane in which the compute stream was busy, waiting on another stream, or idle, the top
   kernel categories met there and the collectives that overlap it. What the labels predict: attention lane busy with
   FlashAttention and matmul; expert lane busy with GroupedMatmul; the exchange lane a **waiting** stream

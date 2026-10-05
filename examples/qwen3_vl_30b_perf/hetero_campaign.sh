@@ -213,7 +213,7 @@ process_run() {  # process_run <name> <override>...
     done
     # The recorder's components over the kernels (component_trace.py). The small files (lanes, summary, report) come
     # back to <run>/components/<node>_*; the large ones, with the real events, stay on the node in profile/components_full.
-    "${CL[@]}" exec -p "python examples/qwen3_vl_30b_perf/component_trace.py $remote" \
+    "${CL[@]}" exec -p "python examples/qwen3_vl_30b_perf/component_trace.py $remote --ep-size $EP_SIZE" \
       > "$local_dir/components.txt" 2>&1 || echo "$name: component trace failed"
     "${CL[@]}" gather "$remote/profile/components" "$OUT/raw/$name" > /dev/null 2>&1 || true
     mkdir -p "$local_dir/components"
@@ -289,13 +289,14 @@ done
     grep -E '^A/B:|end to end|work per second|paired steps|verdict|noise:|numerics, |memory:' "$file" \
       || echo "$(basename "$file"): see the file"
   done
+  keep='ranks drawn|rank [0-9]+:|EP wait|last to arrive|starts at|lanes against'
+  keep+='|AGREE|UNCERTAIN|NOTHING TO COMPARE|no Ascend trace|no step|failed'
   for entry in "${RUNS[@]}"; do
     file="$OUT/${entry%% *}/components.txt"
     [[ -s "$file" ]] || continue
     echo
     echo "components against the kernels, ${entry%% *}:"
-    { grep -E 'ranks drawn|rank [0-9]+:|starts at|lanes against|AGREE|UNCERTAIN|NOTHING TO COMPARE|no Ascend trace|no step|failed' \
-        "$file" || true; } | cut -c1-210
+    { grep -E "$keep" "$file" || true; } | cut -c1-210
   done
   echo
   echo "reports: $OUT/<run>/{report,ep_report,trace,components,perf}.txt, $OUT/compare_*.txt,"
