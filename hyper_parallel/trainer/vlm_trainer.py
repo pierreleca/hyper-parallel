@@ -224,6 +224,9 @@ class VLMTrainer:
             num_micro_steps,
         )
 
+        if config.debug.check_nan_inf:
+            self.base.report_non_finite(total_loss)
+
         grad_norm = clip_grad_norm_(
             self.base.model,
             config.training.max_grad_norm,
