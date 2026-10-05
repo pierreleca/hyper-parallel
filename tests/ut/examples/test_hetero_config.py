@@ -43,6 +43,8 @@ _SCRIPT = textwrap.dedent("""
     print(config.dataset.data_path)
     print(config.dataset.data_transform._target_path)
     print(config.model._target_path)
+    print(config.hetero_profile.hooks, config.hetero_profile.enabled, config.ep_instrument.enabled,
+          config.training.train_iters, config.training.global_batch_size)
 """)
 
 
@@ -54,7 +56,7 @@ def _resolve(*overrides: str) -> list:
         text=True, timeout=300, check=False,
     )
     assert result.returncode == 0, result.stderr[-2000:]
-    return result.stdout.strip().splitlines()[-6:]
+    return result.stdout.strip().splitlines()[-7:]
 
 
 def test_configuration_resolves_with_the_defaults():
@@ -77,3 +79,12 @@ def test_overrides_reach_the_new_sections():
     assert lines[1].startswith("True /tmp/run/hetero 2")
     assert lines[2] == "True False selective"
     assert lines[3].endswith("vlm_conversations.balanced.json")
+
+
+def test_the_flags_of_the_plans_are_accepted():
+    """The A/B and baseline plans switch the recorders and the length of the run with these overrides."""
+    light = _resolve("--hetero_profile.hooks=false", "--ep_instrument.enabled=false", "--training.train_iters=20")
+    assert light[6] == "False True False 20 32"
+    off = _resolve("--hetero_profile.enabled=false", "--ep_instrument.enabled=false",
+                   "--training.global_batch_size=64", "--training.train_iters=10")
+    assert off[6] == "True False False 10 64"
