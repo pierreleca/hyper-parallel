@@ -19,11 +19,17 @@
 #   examples/qwen3_vl_30b_perf/hetero_campaign.sh --resume <campaign dir> [--rerun <run> ...]
 #   examples/qwen3_vl_30b_perf/hetero_campaign.sh --summarize <campaign dir>
 #
+# The runs go first, back to back, and are analysed afterwards: the devices are busy
+# only while a run trains, so the analysis (slow with profiler traces) never keeps
+# them from the next run or from somebody else. TRAIN_ONLY=1 stops after the last run;
+# --resume then does the analysis whenever it suits.
+#
 # --resume carries on a campaign that was interrupted: a run with a recorded state
-# (<run>/state: finished or FAILED) is kept; one still running on the cluster is
-# waited for, one that finished there is analysed, one that was killed or never
-# launched is launched (again, under a new run id). --rerun discards the named runs'
-# results and launches them again. --summarize only redoes steps 3 below.
+# (<run>/state: trained, finished or FAILED) is kept (a trained one is analysed);
+# one still running on the cluster is waited for, one that finished there is
+# analysed, one that was killed or never launched is launched (again, under a new run
+# id). --rerun discards the named runs' results and launches them again.
+# --summarize only redoes steps 3 and 4 below.
 # hetero_campaign_status.sh <campaign dir> shows what --resume would do.
 #
 # Before it: select the nodes (cluster select -a 2), deploy the code to them and to the
@@ -43,9 +49,9 @@
 #              run with that one.
 #
 # What it does, stopping a run (not the campaign) at its first failure:
-#   1. per run: launches it once every device is free (torchrun -w --run-id),
-#      waits for its end (status -w), kills what is left if it failed;
-#   2. gathers the small records (not the traces), merges the ranks of every node
+#   1. per run, in order: launches it once every device is free (torchrun -w --run-id),
+#      waits for its end (status -w), kills what is left if it failed, captures its log;
+#   2. then, per run that trained: gathers the small records (not the traces), merges the ranks of every node
 #      into one directory, and runs the reports: the heterogeneity report
 #      (analyze_hetero.py), the EP phase report, the trace report on the nodes for
 #      profiled runs, the component trace for profiled runs (component_trace.py, on the
@@ -61,6 +67,7 @@
 # brackets):
 #   OUT_BASE [/home/pl/a3_runs]   RUNS_DIR [/home/pl/runs/qwen3_vl_30b_perf]
 #   INTERVAL [30]   RUN_TIMEOUT [7200]   CLUSTER [cluster], e.g. "cluster -c other.env"
+#   TRAIN_ONLY [0]: 1 stops after the last run has trained; analyse later with --resume
 #   LOG_WAIT [45]: seconds of `cluster logs` captured per run into <run>/log.txt (the kit
 #   follows the logs from their first line and never stops on its own); the summary
 #   quotes their first error and, with debug.check_nan_inf, the first non-finite gradient.
@@ -141,8 +148,9 @@ mkdir -p "$OUT/raw"
 exec > >(tee -a "$OUT/campaign.log") 2>&1
 read -r -a CL <<< "${CLUSTER:-cluster}"
 
-# One run: launch it unless the cluster already has it, wait, record its state, analyse it.
-process_run() {  # process_run <name> <override>...
+# One run: launch it unless the cluster already has it, wait for it, capture its log, record its state
+# (trained, FAILED, launch failed). Nothing here needs more than the devices.
+train_run() {  # train_run <name> <override>...
   local name="$1"; shift
   local overrides=("$@") local_dir="$OUT/$name" run launch=1 state
   mkdir -p "$local_dir"
@@ -178,6 +186,17 @@ process_run() {  # process_run <name> <override>...
     return
   fi
   capture_log "$run" "$local_dir"
+  echo trained > "$local_dir/state"
+}
+
+# The analysis of a run that trained: reports from the records, and for a profiled run the reports on the traces,
+# which stay on the nodes (so the selection must still be the one the run used). Records the state finished.
+analyse_run() {  # analyse_run <name>
+  local name="$1"
+  local local_dir="$OUT/$name" run remote
+  run="$(cat "$local_dir/run_id" 2>/dev/null || echo "${CAMPAIGN}_${name}")"
+  remote="$RUNS_DIR/$run"
+  echo "=== analysing $name ($run)"
   # The step times the trainer logged itself (no recorder involved): the reference for an overhead or a clean timing.
   if [[ -s "$local_dir/log.txt" ]]; then
     python3 "$TOOLS/parse_perf_log.py" --skip "$SKIP_LOG" "$local_dir/log.txt" > "$local_dir/perf.txt" 2>&1 \
@@ -199,7 +218,7 @@ process_run() {  # process_run <name> <override>...
     python3 "$TOOLS/analyze_ep_instrument.py" "$local_dir/instrument" --skip "$SKIP" --ep-size "$EP_SIZE" \
       --out-dir "$local_dir/analysis_ep" > "$local_dir/ep_report.txt" 2>&1 || echo "$name: EP report failed"
   fi
-  if [[ " ${overrides[*]} " == *" --profiling.enabled=true "* ]]; then
+  if grep -q -- "--profiling.enabled=true" "$local_dir/cmdline.txt" 2>/dev/null; then
     "${CL[@]}" exec -p "python examples/qwen3_vl_30b_perf/analyze_npu_trace.py $remote/profile --ranks" \
       > "$local_dir/trace.txt" 2>&1 || echo "$name: trace report failed"
     # Each node's per-rank summary, small enough to keep: <run>/profile/node<N>.json.
@@ -228,7 +247,7 @@ process_run() {  # process_run <name> <override>...
   echo finished > "$local_dir/state"
 }
 
-# 1 and 2. The runs, each analysed before the next starts.
+# 1. The runs, one after the other. 2. Their analysis.
 if [[ "$MODE" != summarize ]]; then
   echo "campaign $CAMPAIGN ($MODE): ${#RUNS[@]} run(s), $CONFIG; output in $OUT"
   echo "code: $(git -C "$TOOLS" rev-parse --short HEAD 2>/dev/null || echo "not a git checkout") at $TOOLS"
@@ -246,7 +265,14 @@ if [[ "$MODE" != summarize ]]; then
     if [[ "$MODE" == resume && -n "$(run_state "${words[0]}")" ]]; then
       echo "=== ${words[0]}: kept ($(run_state "${words[0]}" | cut -c1-80))"; continue
     fi
-    process_run "${words[@]}"
+    train_run "${words[@]}"
+  done
+  if [[ "${TRAIN_ONLY:-0}" == 1 ]]; then
+    echo "TRAIN_ONLY: the devices are free; analyse with: $0 --resume $OUT"
+    exit 0
+  fi
+  for entry in "${RUNS[@]}"; do
+    if [[ "$(run_state "${entry%% *}")" == trained ]]; then analyse_run "${entry%% *}"; fi
   done
 fi
 

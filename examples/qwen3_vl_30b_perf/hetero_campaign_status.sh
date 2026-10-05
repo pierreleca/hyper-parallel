@@ -17,7 +17,7 @@
 #
 #   examples/qwen3_vl_30b_perf/hetero_campaign_status.sh <campaign dir>
 #
-# A run with a recorded state (finished, FAILED) is kept by --resume; for the others
+# A run with a recorded state (trained, finished, FAILED) is kept by --resume (a trained one is analysed); for the others
 # it asks the cluster (cluster status) about the run's id.
 set -euo pipefail
 [[ $# -eq 1 ]] || { echo "usage: $0 <campaign dir>" >&2; exit 2; }
@@ -34,6 +34,7 @@ for entry in "${RUNS[@]}"; do
   run="$(cat "$dir/run_id" 2>/dev/null || echo "${CAMPAIGN}_${name}")"
   if [[ -f "$dir/state" ]]; then
     what="$(cut -c1-100 "$dir/state")"
+    [[ "$what" == trained ]] && what="trained, not analysed (--resume analyses it)"
   elif [[ -d "$dir/hetero" || -d "$dir/instrument" || -f "$dir/trace.txt" ]]; then
     what="finished"
   else

@@ -98,7 +98,13 @@ cluster status; cluster logs; cluster kill
 Runs per plan: `hetero_smoke_32dev.sh` 1 (8 steps); `hetero_baseline_32dev.sh` 6 (20 steps each, in the order
 `both_a`, `fixed_a`, `both_b`, `fixed_b`, `both_hooks`, `both_off`) and 4 comparisons made afterwards on the control
 node; `hetero_data_32dev.sh` 6 (14 steps); `hetero_balance_32dev.sh` 6 (20 and 10 steps); `hetero_profile_32dev.sh` 2;
-`hetero_probe_32dev.sh` 4; `hetero_ab_32dev.sh` 6 (20 steps). They run one after the other.
+`hetero_probe_32dev.sh` 4; `hetero_ab_32dev.sh` 6 (20 steps). They run one after the other, and **all the runs go
+first, the analysis afterwards**: the devices are busy only while a run trains, and the analysis (the trace reports of
+a profiled run are slow) never delays the next run or keeps the devices from somebody else. The terminal prints
+`=== <run> ...` for each run as it starts, then `=== analysing <run>` for each once they have all trained. The analysis
+needs the nodes of the runs (the traces stay there), not their devices. `TRAIN_ONLY=1 hetero_campaign.sh <plan>` stops
+after the last run, with each run recorded as `trained`; `hetero_campaign.sh --resume $C` then does the analysis
+whenever it suits.
 
 The campaign's own terminal prints `=== <run> (<run id>): <overrides>` when a run starts, then nothing until it ends
 (it waits for the devices to be free, then polls the run every 30 s); the same text goes to `$C/campaign.log`. From a
@@ -110,13 +116,13 @@ watch -n 30 examples/qwen3_vl_30b_perf/hetero_campaign_status.sh $C       # one 
 R=$(ls -t $C/*/run_id | head -1)                                          # the run that started last
 cluster logs "$(cat $R)" | grep --line-buffered -E "performance/step_time|Hetero profile: |Error|OutOfMemory|Traceback"
 cluster status "$(cat $R)"                                                # per node: RUNNING / FINISHED / DEAD (exit N)
-cat $C/*/state                                                            # finished, or FAILED: <first error>
+cat $C/*/state                                                            # trained, finished, or FAILED: <first error>
 ```
 
 `Ctrl-C` on `cluster logs` stops the tail only. A run goes through: waiting for free devices, a silent start-up (the
 checkpoint is read, the model sharded, the data workers started), step lines (`Training: 5/20 ... performance/step_time=`),
-then the campaign gathers the records and writes `$C/<run>/{report,perf}.txt`. `SUMMARY.txt` and the comparisons are
-written when the last run has ended; the noise floor of `both` can be read earlier, once `both_b` has finished:
+and the run is `trained`. The analysis then gathers the records and writes `$C/<run>/{report,perf}.txt`.
+`SUMMARY.txt` and the comparisons are written when the last run has been analysed; the noise floor of `both` can be read once `both_b` has been analysed:
 `python3 examples/qwen3_vl_30b_perf/compare_runs.py --baseline $C/both_a --candidate $C/both_b --skip 1`.
 
 A run that fails (out of memory, a crash) is killed, recorded as `FAILED: <first error>` and the campaign goes on with
