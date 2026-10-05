@@ -376,6 +376,52 @@ def report_time(table: dict, ranks: list[int], out: list[str]) -> dict[str, Any]
     return summary
 
 
+def report_phase_floor(table: dict, ranks: list[int], ep_size: int, out: list[str]) -> dict[str, Any]:
+    """Split every phase's time into its floor and what ranks pay above it, per expert-parallel group.
+
+    For each step, layer and group (``ep_size`` consecutive ranks) the smallest time of a phase in the group is its
+    floor: what the rank that waits for nobody pays. What the other ranks pay above it is waiting for a slower rank
+    of the group in a phase that ends in a collective, and extra work of its own in a compute phase. The floor is
+    summed over the layers; the excess is averaged over the ranks, both per step. A phase that is mostly floor is a
+    cost every rank pays on every layer; one that is mostly excess is a matter of who arrives when.
+    """
+    phase_keys = [f"{pass_name}:{label}" for pass_name, phases in (("fwd", FWD_PHASES), ("recompute", FWD_PHASES),
+                                                                    ("bwd", BWD_PHASES)) for *_x, label in phases]
+    group_of = {rank: position // ep_size for position, rank in enumerate(ranks)}
+    members_of: dict[int, list[int]] = {}
+    for rank, group in group_of.items():
+        members_of.setdefault(group, []).append(rank)
+    floor: dict[str, dict[tuple[int, int], float]] = {key: {} for key in phase_keys}
+    above: dict[str, dict[tuple[int, int], float]] = {key: {} for key in phase_keys}
+    for (step, _layer), per_rank in table.items():
+        for group, members in members_of.items():
+            if len(members) < ep_size or any(rank not in per_rank for rank in members):
+                continue
+            for key in phase_keys:
+                values = {rank: per_rank[rank].get(key) for rank in members}
+                if any(value is None for value in values.values()):
+                    continue
+                low = min(values.values())
+                floor[key][(step, group)] = floor[key].get((step, group), 0.0) + low
+                for rank, value in values.items():
+                    above[key][(step, rank)] = above[key].get((step, rank), 0.0) + value - low
+    out.append(f"TIME SPLIT (device ms per step, summed over layers, groups of {ep_size} ranks)")
+    out.append("  floor = what the rank that pays least in its group pays; above = what the average rank pays above it")
+    out.append("  phase                          floor      above   above share")
+    summary: dict[str, Any] = {}
+    for key in phase_keys:
+        if not floor[key]:
+            continue
+        floor_ms, above_ms = statistics.fmean(floor[key].values()), statistics.fmean(above[key].values())
+        if floor_ms + above_ms < 0.05:
+            continue
+        summary[key] = {"floor_ms": floor_ms, "above_ms": above_ms}
+        out.append(f"  {key:<26}{floor_ms:10.1f} {above_ms:10.1f} {above_ms / (floor_ms + above_ms):10.0%}")
+    if not summary:
+        out.append(f"  (no group of {ep_size} ranks has every phase recorded: --ep-size is the ranks per EP group)")
+    return summary
+
+
 def report_memory(collected: dict, out: list[str]) -> dict[str, Any]:
     """Report each rank's peak and the phase boundaries that hold it."""
     ranks = collected["ranks"]
@@ -1112,6 +1158,7 @@ def main() -> int:
              " ep_host_swap/; the first is the baseline the deltas are taken against",
     )
     parser.add_argument("--out-dir", default=None, help="where to write the CSVs")
+    parser.add_argument("--ep-size", type=int, default=16, help="ranks per expert-parallel group (the time split)")
     parser.add_argument("--trace", action="store_true", help="also write a Chrome trace")
     parser.add_argument("--trace-step", type=int, default=None, help="step to trace")
     parser.add_argument(
@@ -1165,6 +1212,8 @@ def main() -> int:
     summary["persistence"] = report_persistence(collected, out)
     out.append("")
     summary["time"] = report_time(table, collected["ranks"], out)
+    out.append("")
+    summary["time_split"] = report_phase_floor(table, collected["ranks"], args.ep_size, out)
     out.append("")
     summary["memory"] = report_memory(collected, out)
     out.append("")

@@ -258,6 +258,30 @@ def test_analysis_reports_known_imbalance(tmp_path, capsys):
     capsys.readouterr()
 
 
+def test_analysis_splits_each_phase_into_floor_and_excess():
+    """A phase's floor is the smallest time in the group per layer; the ranks pay the rest above it."""
+    analyzer = _load_analyzer()
+    # (layer, rank) -> (router+counts, experts): two groups of two ranks, two layers, one step.
+    values = {
+        (0, 0): (10.0, 5.0), (0, 1): (4.0, 7.0), (0, 2): (6.0, 5.0), (0, 3): (6.0, 5.0),
+        (1, 0): (3.0, 4.0), (1, 1): (9.0, 4.0), (1, 2): (8.0, 6.0), (1, 3): (2.0, 2.0),
+    }
+    table = {}
+    for (layer, rank), (router, experts) in values.items():
+        table.setdefault((1, layer), {})[rank] = {"fwd:router+counts": router, "fwd:experts": experts}
+    out = []
+    split = analyzer.report_phase_floor(table, [0, 1, 2, 3], 2, out)
+    # router+counts: group 0 floors 4 + 3, group 1 floors 6 + 2 -> mean 7.5; ranks pay 6, 6, 6, 0 above -> 4.5.
+    assert split["fwd:router+counts"] == {"floor_ms": pytest.approx(7.5), "above_ms": pytest.approx(4.5)}
+    # experts: floors 5 + 4 and 5 + 2 -> mean 8; ranks pay 0, 2, 4, 0 above -> 1.5.
+    assert split["fwd:experts"] == {"floor_ms": pytest.approx(8.0), "above_ms": pytest.approx(1.5)}
+    assert any("fwd:router+counts" in line and "38%" in line for line in out), "4.5 of 12.0 is above the floor"
+    # A group that is not whole is left out, and the report says why when nothing is left.
+    out = []
+    assert analyzer.report_phase_floor(table, [0, 1, 2], 4, out) == {}
+    assert any("no group of 4 ranks" in line for line in out)
+
+
 def test_analysis_subtracts_the_recompute_from_the_backward(tmp_path):
     """Recompute time inside a backward phase is not counted twice."""
     analyzer = _load_analyzer()

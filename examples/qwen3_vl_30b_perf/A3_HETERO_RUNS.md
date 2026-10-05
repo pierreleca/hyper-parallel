@@ -71,7 +71,8 @@ sed -n '/^CEILINGS/,/data loading/p' $C/both/report.txt $C/fixed/report.txt
 examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_balance_32dev.sh
 examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_profile_32dev.sh
 C=$(ls -dt /home/pl/a3_runs/hetero_profile_32dev_* | head -1)
-grep -E "rank [0-9]+:|EP wait|last to arrive|starts at|lanes against|AGREE|DISAGREE|UNCERTAIN" $C/profile_both/components.txt | cut -c1-200
+grep -E "^rank [0-9]+:|EP wait|last to arrive|starts at|lanes against|stream busy|GroupedMatmul|attention kernels|all-to-all coll|stream waits|AGREE|DISAGREE|UNCERTAIN" $C/profile_both/components.txt | cut -c1-230
+grep -E "^MATCHED|sum over" $C/profile_both/trace.txt     # the k-th all-to-all across the group: waiting for the last rank vs the transfer
 ls $C/profile_both/components/              # <node>_components.json: open in https://ui.perfetto.dev (How each component is detected)
 R=/home/pl/runs/qwen3_vl_30b_perf/$(cat $C/profile_both/run_id)                        # the run on the nodes
 cluster gather $R/profile/components_full /home/pl/a3_runs/components_full             # optional: the lanes over the real events
@@ -308,7 +309,7 @@ could remove if it cost nothing:
 | the vision tower's load (image-level balancing, a separate encoder group, overlap with the decoder) | *only the vision tower*; *vision tower free* | `DATA` (patches, attention pairs), `RANK GROUPS` once the design places the tower apart |
 | the MoE (expert placement or replication, all-to-all overlap, router syncs) | *only the MoE experts*; *MoE router, all-to-alls and syncs free* | `ROUTING by modality`, the exchange row of `MODEL`, `ep_report.txt` |
 | the weight gathers (fusing the small vision FSDP units, deeper prefetch, a different sharding of the tower) | *weight gathers hidden* (vision, decoder) | `idle between modules` in `MODEL`, `trace.txt` |
-| recompute and memory (selective policies per component) | *recompute free* | `MEMORY`, per-component recompute in `MODEL` |
+| recompute and memory (selective policies per component) | *recompute free*, a lower bound: the recomputed router and all-to-alls are booked under *ep_exchange* backward | `MEMORY`, per-component recompute in `MODEL`, the `recompute:*` rows of `ep_report.txt` |
 | the host (data loading, scheduling) | *data loading hidden* | `host gap` in `RUN` |
 
 A row whose ceiling is below +20% cannot deliver the target alone, whatever its implementation; two rows that
@@ -470,8 +471,10 @@ attention. When either is missing the report says which.
   is what separates the two: the block's span minus the experts' is `ep_exchange`, and `text_layer` keeps the
   rest. That relies on the EP path calling `module.experts(...)` as a module, as `_run_ep_local_experts` does; if
   the smoke run shows no `text_experts` row, the expert imbalance is hidden in `text_layer` (the report says so).
-  `analyze_ep_instrument.py` (`ep_report.txt`) splits the block further, into router, dispatch, combine and
-  aggregate.
+  `analyze_ep_instrument.py` (`ep_report.txt`) splits the block further, into the router with its counts exchange
+  and host syncs, the dispatch, the experts, the combine and the aggregate, for the forward, the recompute and the
+  backward pass. Its `TIME SPLIT` says, per phase, how much every rank pays (the floor: the smallest time in its EP
+  group, per layer) and how much only some ranks pay above it (waiting for a slower rank, or extra work).
 - The report prices the critical path two ways. The rank totals (*balance the data*) say what equal total work on
   every rank would give. The per-module sum says what equal work in every module would give; every layer starts with
   a collective that all ranks join, so the step is paced by the slowest rank of each module, and this sum is the

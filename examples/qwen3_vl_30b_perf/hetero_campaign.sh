@@ -196,7 +196,7 @@ process_run() {  # process_run <name> <override>...
       --out-dir "$local_dir/analysis_hetero" > "$local_dir/report.txt" 2>&1 || echo "$name: hetero report failed"
   fi
   if [[ -d "$local_dir/instrument" ]]; then
-    python3 "$TOOLS/analyze_ep_instrument.py" "$local_dir/instrument" --skip "$SKIP" \
+    python3 "$TOOLS/analyze_ep_instrument.py" "$local_dir/instrument" --skip "$SKIP" --ep-size "$EP_SIZE" \
       --out-dir "$local_dir/analysis_ep" > "$local_dir/ep_report.txt" 2>&1 || echo "$name: EP report failed"
   fi
   if [[ " ${overrides[*]} " == *" --profiling.enabled=true "* ]]; then
