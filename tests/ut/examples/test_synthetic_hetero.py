@@ -194,3 +194,55 @@ def test_the_candidate_with_a_balanced_order_is_credited_on_work_not_on_time(tmp
     assert summary["components"]["candidate"]["busiest_over_mean"] < summary["components"]["baseline"][
         "busiest_over_mean"]
     assert any("where the time moved" in line for line in lines)
+
+
+def test_lazy_recompute_is_booked_under_the_modules_that_ran_it(tmp_path):
+    """Non-reentrant checkpointing recomputes inside the MoE block's backward and abandons the block: the report moves
+    the attention's and the experts' recompute out of the block, and the layer's own work still adds up."""
+    records = _make(tmp_path, checkpoint="nonreentrant")
+    run = report.Run(str(records), 0)
+    rows = report.build_rows(run)
+    row = rows[0]
+    assert row["lazy_recompute"]
+    layer = report.component_time(row, "text_layer")
+    attention = report.component_time(row, "text_attn")
+    experts = report.component_time(row, "text_experts")
+    assert layer == pytest.approx(attention + experts, rel=0.2)       # was far lower while the recompute leaked
+    assert row["t"]["text_moe"]["recompute"] == pytest.approx(row["t"]["text_experts"]["recompute"])
+    assert row["t"]["ep_exchange"]["recompute"] == 0.0
+    lines: list = []
+    report.report_components(rows, lines)
+    assert any("recomputed lazily" in line for line in lines)
+
+
+def test_both_ways_of_recomputing_give_the_same_report(tmp_path):
+    """The same simulated run, recomputed lazily or before the backward, reads alike in the components that count."""
+    totals = {}
+    for mode in ("reentrant", "nonreentrant"):
+        rows = report.build_rows(report.Run(str(_make(tmp_path / mode, checkpoint=mode)), 0))
+        totals[mode] = {part: report.mean([report.component_time(row, part) for row in rows])
+                        for part in ("text_layer", "text_attn", "text_experts", "ep_exchange", "vision")}
+    for part, value in totals["reentrant"].items():
+        assert totals["nonreentrant"][part] == pytest.approx(value, rel=0.05), part
+
+
+def test_exchange_splits_into_a_floor_and_waiting(tmp_path):
+    """Per layer and EP group the least-waiting rank pays the floor; floor plus waiting is the exchange."""
+    records = _make(tmp_path, checkpoint="nonreentrant", steps=8)
+    run = report.Run(str(records), 0)
+    rows = report.build_rows(run)
+    split = report.exchange_split(run, 4)
+    assert split["floor_ms"] > 0 and split["wait_ms"] >= 0
+    exchange = report.mean([report.component_time(row, "ep_exchange") for row in rows])
+    assert split["floor_ms"] + split["wait_ms"] == pytest.approx(exchange, rel=0.03)
+    _, summary = report.analyse(str(records), 0, 4, [2], 3, None)
+    assert summary["model"]["exchange_split"]["floor_ms"] == pytest.approx(split["floor_ms"])
+    label = "MoE router, all-to-alls and syncs free (floor of each layer, no waiting)"
+    assert summary["ceilings"][label]["ms"] > 0
+
+
+def test_a_balanced_run_waits_less_for_its_ep_group(tmp_path):
+    """Alike samples in a step leave little to wait for inside an EP group; random ones leave a lot."""
+    random_run = report.Run(str(_make(tmp_path / "random", steps=8, order="random")), 0)
+    balanced = report.Run(str(_make(tmp_path / "balanced", steps=8, order="balanced")), 0)
+    assert report.exchange_split(balanced, 4)["wait_ms"] < report.exchange_split(random_run, 4)["wait_ms"]

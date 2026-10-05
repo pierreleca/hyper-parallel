@@ -206,12 +206,24 @@ def _separate_exchange(row: dict, has_experts: bool) -> None:
     the expert-parallel group) and the expert GEMMs; the experts' span holds the GEMMs alone. The difference is
     ``ep_exchange``, and it is taken out of ``text_layer``, which then is compute only. Without the experts'
     spans nothing can be separated and ``text_layer`` keeps the waits.
+
+    Non-reentrant checkpointing (what the Trainer's wrapper uses) recomputes a layer lazily, inside the backward
+    of its last module and stopping as soon as its last saved tensor is back, which is inside the MoE block: the
+    block's recompute span never closes (it reads zero), and the recompute of the attention and of the experts
+    lies inside the block's *backward* span. That compute is moved out of the block's backward, and what remains
+    of it, the recompute's own router and all-to-alls with their waits, counts as backward exchange.
     """
     t = row["t"]
     exchange = {phase: 0.0 for phase in PHASES}
+    nested = False
     if has_experts:
+        moe, experts, attention = t["text_moe"], t["text_experts"], t["text_attn"]
+        nested = moe["recompute"] == 0.0 and attention["recompute"] + experts["recompute"] > 0.0
+        if nested:
+            moe["bwd"] = max(moe["bwd"] - attention["recompute"] - experts["recompute"], 0.0)
+            moe["recompute"] = experts["recompute"]
         for phase in PHASES:
-            exchange[phase] = max(t["text_moe"][phase] - t["text_experts"][phase], 0.0)
+            exchange[phase] = max(moe[phase] - experts[phase], 0.0)
         layer = t["text_layer"]
         if layer["recompute"] > 0:                       # the layer's hook is inside the checkpoint
             for phase in PHASES:
@@ -221,6 +233,7 @@ def _separate_exchange(row: dict, has_experts: bool) -> None:
             layer["bwd"] = max(layer["bwd"] - exchange["bwd"] - exchange["recompute"], 0.0)
     t["ep_exchange"] = exchange
     row["has_experts"] = has_experts
+    row["lazy_recompute"] = nested
 
 
 def _custom_times(spans: dict, modules: list[dict], micro_batches: int) -> dict[str, list[dict[str, float]]]:
@@ -468,6 +481,58 @@ def attach_received_pairs(run: Run, rows: list[dict], ep_size: int) -> int:
     return attached
 
 
+def exchange_split(run: Run, ep_size: int) -> Optional[dict[str, float]]:
+    """Split the MoE exchange into what the rank that waits least pays and the waiting above it.
+
+    For every step, micro-batch, layer and expert-parallel group (``ep_size`` consecutive ranks) each rank's exchange
+    is the MoE block's span minus its experts' span, over the forward, the recompute and the backward pass (the lazy
+    recompute's router and all-to-alls included). The smallest value in the group is the floor: router, transfers and
+    host syncs with nobody to wait for. What a rank pays above it is waiting for a slower rank of its group.
+
+    Returns ``floor_ms`` (the sum over layers of the floors, per micro-batch, averaged over groups) and ``wait_ms``
+    (what an average rank waits above the floor, summed over layers), or None without the experts' spans.
+    """
+    cells: dict[tuple[int, int, int, int], dict[int, float]] = {}
+    for position, rank in enumerate(run.ranks):
+        by_layer: dict[int, dict[str, int]] = {}
+        for module in run.headers[rank]["modules"]:
+            if module["role"] in ("text.moe", "text.experts", "text.attn") and module["index"] is not None:
+                by_layer.setdefault(module["index"], {})[module["role"]] = module["id"]
+        for record in run.steps[rank]:
+            spans = spans_of(record)
+            for occurrence in range(len(record["micro_batches"])):
+                for layer, ids in by_layer.items():
+                    if "text.moe" not in ids or "text.experts" not in ids:
+                        continue
+
+                    def duration(role: str, phase: str, ids: dict = ids, occurrence: int = occurrence) -> float:
+                        """The span of one module in one phase, 0 if it was not recorded."""
+                        module_id = ids.get(role)
+                        return (_span_ms(spans, module_id, phase, occurrence) or 0.0) if module_id is not None else 0.0
+
+                    moe = {phase: duration("text.moe", phase) for phase in PHASES}
+                    experts = {phase: duration("text.experts", phase) for phase in PHASES}
+                    attention_recompute = duration("text.attn", "recompute")
+                    if moe["recompute"] == 0.0 and attention_recompute + experts["recompute"] > 0.0:
+                        moe["bwd"] = max(moe["bwd"] - attention_recompute - experts["recompute"], 0.0)
+                        moe["recompute"] = experts["recompute"]
+                    exchange = sum(max(moe[phase] - experts[phase], 0.0) for phase in PHASES)
+                    key = (record["step"], occurrence, layer, position // ep_size)
+                    cells.setdefault(key, {})[rank] = exchange
+    if not cells:
+        return None
+    floor: dict[tuple[int, int, int], float] = {}
+    waiting: dict[tuple[int, int, int], float] = {}
+    for (step, occurrence, _layer, group), by_rank in cells.items():
+        low = min(by_rank.values())
+        floor[(step, occurrence, group)] = floor.get((step, occurrence, group), 0.0) + low
+        for rank, value in by_rank.items():
+            waiting[(step, occurrence, rank)] = waiting.get((step, occurrence, rank), 0.0) + value - low
+    micro = len({(step, occurrence) for step, occurrence, _group in floor}) or 1
+    return {"floor_ms": sum(floor.values()) / (micro * max(len({g for _s, _o, g in floor}), 1)),
+            "wait_ms": mean(list(waiting.values())), "micro_batches": float(micro)}
+
+
 def component_time(row: dict, component: str) -> float:
     """Return a component's time in the micro-batch: forward, recompute and backward together."""
     return sum(row["t"][component][phase] for phase in PHASES)
@@ -566,7 +631,7 @@ def report_data(rows: list[dict], out: list[str]) -> dict[str, Any]:
     return summary
 
 
-def report_components(rows: list[dict], out: list[str]) -> dict[str, Any]:
+def report_components(rows: list[dict], out: list[str], split: Optional[dict[str, float]] = None) -> dict[str, Any]:
     """Where a micro-batch's time goes, by component and phase, and the cost per unit of work."""
     count = len(rows)
     total_mb = mean([row.get("mb_ms", 0.0) for row in rows])
@@ -598,9 +663,20 @@ def report_components(rows: list[dict], out: list[str]) -> dict[str, Any]:
     out.append("  idle between consecutive modules (the wait for weights, exposed communication, launch gaps): "
                + ", ".join(f"{name} {value:.1f}" for name, value in gaps.items()))
     summary["gaps"] = gaps
+    if split:
+        total = split["floor_ms"] + split["wait_ms"]
+        out.append(f"  ep_exchange per micro-batch = {split['floor_ms']:.1f} ms that even the rank of an EP group "
+                   f"that waits least pays on every layer (router, transfers, host syncs) + {split['wait_ms']:.1f} ms "
+                   f"waiting for slower ranks of its group ({split['wait_ms'] / total if total else 0.0:.0%} of the "
+                   "exchange)")
+        summary["exchange_split"] = split
     accounted = sum(summary[c]["total"] for c in (*WORK_PARTS, "ep_exchange") if c in summary) + sum(gaps.values())
     out.append(f"  components + exchange + gaps account for {accounted:.1f} ms of {total_mb:.1f} ms; the rest is glue "
                "between the towers and the loss inputs")
+    if any(row.get("lazy_recompute") for row in rows):
+        out.append("  note: the layers are recomputed lazily (non-reentrant checkpointing), inside the MoE block's "
+                   "backward: the recompute of attention and experts is booked under their own names, and the "
+                   "recompute's router and all-to-alls under ep_exchange backward")
     if not any(row.get("has_experts") for row in rows):
         out.append("  note: no text.experts spans, so the MoE exchange could not be told from the layer's work: "
                    "text_layer holds the all-to-all waits, and the rank totals below understate the imbalance")
@@ -1068,7 +1144,8 @@ def leaf_excess(run: Run, rows: list[dict]) -> dict[int, dict[str, float]]:
     return result
 
 
-def report_bounds(run: Run, rows: list[dict], ep: Optional[dict[str, float]], out: list[str]) -> dict[str, Any]:
+def report_bounds(run: Run, rows: list[dict], ep: Optional[dict[str, float]], out: list[str],
+                  split: Optional[dict[str, float]] = None) -> dict[str, Any]:
     """The most each kind of change could gain, with the busiest rank's time as the critical path.
 
     Every row is a ceiling: the change costs nothing and moves nothing elsewhere. The rows overlap (balancing the
@@ -1120,7 +1197,9 @@ def report_bounds(run: Run, rows: list[dict], ep: Optional[dict[str, float]], ou
         ("vision tower free, and its weight gathers hidden",
          (totals["vision"] + totals["vision_gaps"]) / count, base),
         ("decoder weight gathers and launch gaps hidden", totals["decoder_gaps"] / count, base),
-        ("MoE router, all-to-alls and syncs free (no waiting)", totals["exchange"] / count, base),
+        ("MoE router, all-to-alls and syncs free (floor of each layer, no waiting)",
+         (split["floor_ms"] * (len(rows) / max(len(steps) * len(run.ranks), 1)) if split
+          else totals["exchange"] / count), base),
         ("head and loss free (chunked loss, fused head)", totals["head_loss"] / count, base),
         ("recompute free (lower bound: its attention and MoE spans)", totals["recompute"] / count, base),
         ("gradient clip, optimizer and final sync free", totals["tail"] / count, base),
@@ -1277,7 +1356,8 @@ def analyse(directory: str, skip: int, ep_size: int, stages: Sequence[int], top:
     summary["overview"] = report_overview(run, rows, out)
     summary["groups"] = report_groups(run, rows, out)
     summary["data"] = report_data(rows, out)
-    summary["model"] = report_components(rows, out)
+    split = exchange_split(run, ep_size)
+    summary["model"] = report_components(rows, out, split)
     summary["layers"] = report_layers(run, rows, out, top)
     attach_received_pairs(run, rows, ep_size)
     models = report_fit(rows, out)
@@ -1287,7 +1367,7 @@ def analyse(directory: str, skip: int, ep_size: int, stages: Sequence[int], top:
     summary["balancing"] = report_whatif_balancing(rows, models, summary["imbalance"], out)
     summary["assignment"] = report_assignment(rows, models, out)
     ep = ep_ceilings(ep_dir, skip) if ep_dir and glob.glob(os.path.join(ep_dir, "rank*.jsonl")) else None
-    summary["ceilings"] = report_bounds(run, rows, ep, out)
+    summary["ceilings"] = report_bounds(run, rows, ep, out, split)
     summary["pipeline"] = report_pipeline(run, rows, stages, out)
     summary["memory"] = report_memory(rows, out)
     summary["routing"] = report_routing(run, ep_size, out, top)

@@ -239,15 +239,30 @@ rank, step and micro-batch: the sample's workload and the time of each component
   micro-batches and `max/mean over ranks`, how far the biggest sample of a step is above the mean one.
 - **MODEL**: the time of a micro-batch by component and phase. `recompute` is the second forward of a
   checkpointed block; `loss` runs from the end of the model's forward to the gradient reaching the logits.
-  The *idle between modules* line is the wait for weights (exposed all-gather) and launch gaps.
+  `text_layer` is the decoder layer's *own* work (attention, the expert GEMMs, norms); `ep_exchange` is the MoE
+  block's span minus the experts' (router, dispatch and combine all-to-alls, host syncs, and the wait for the
+  slowest rank of the EP group), kept out of the layer so that the ranks of one EP group do not look alike only
+  because they wait for each other. A line below the table splits it into the *floor* (what even the rank of an EP
+  group that waits least pays on every layer) and the *waiting* for slower ranks of the group. With non-reentrant
+  checkpointing (the Trainer's wrapper) a layer is recomputed lazily, inside the MoE block's backward, and the block
+  is abandoned before it returns; the report books the recompute of attention and experts under their own names and
+  the recompute's router and all-to-alls under `ep_exchange` backward. The *idle between modules* line is the wait
+  for weights (exposed all-gather, plus the wait for the slowest rank) and launch gaps, net of the recompute that
+  runs inside a backward gap.
 - **DECODER LAYERS / VISION BLOCKS**: the slowest indices, and whether the first and last stand out.
 - **COST MODEL**: each component's time fitted on the sample's features (tokens, tokens squared for the
-  decoder; patches and the vision attention cost for the vision tower), with R squared. A high R squared
-  means the data decides that component's time.
+  decoder; patches and the vision attention cost for the vision tower; the pairs received for the experts), with
+  R squared. A high R squared means the data decides that component's time. The experts' time follows the
+  pairs the rank *receives*, which its group's samples decide: balancing the ranks' own tokens does not balance them.
 - **IMBALANCE**: a rank's *work* is the sum of its modules' own time. The busiest rank over the mean, its
-  excess as a share of the step, which component the excess comes from, and the rank correlation between
-  the cost model's order and the measured order inside a step.
+  excess as a share of the step, which component the excess comes from, the rank correlation between
+  the cost model's order and the measured order inside a step, and, measured directly, how long a rank waits (weight
+  gathers and MoE exchange) above the rank that waits least.
 - **WHAT IF**: the same samples sorted into steps by modeled cost; the share of the excess that removes.
+- **ASSIGNMENT**: dealing a global batch of 32 x A samples to the ranks in arrival order against dealing by cost, for
+  A = 1, 2, 4, 8 micro-batches per rank.
+- **CEILINGS**: the most each family of change could gain, against the 16.7% of a step that +20% needs.
+- **RANK GROUPS** (only when the ranks hold different modules): utilisation of each kind of rank.
 - **PIPELINE**: the model's pieces cut into 2, 4, 8 contiguous stages (best cut, and the even-layers cut).
 - **MEMORY**: the per-step peak against tokens and patches; the longest sample sets the die's limit.
 - **ROUTING by modality**: per MoE layer, the busiest EP rank over the mean for all tokens, image tokens and

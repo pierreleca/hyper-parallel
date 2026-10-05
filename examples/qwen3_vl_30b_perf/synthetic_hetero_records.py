@@ -79,8 +79,15 @@ class Simulator:
     """Plays the ranks of a run through forward, recompute and backward, with the collectives that couple them."""
 
     def __init__(self, *, ranks: int, ep_size: int, layers: int, blocks: int, experts: int, top_k: int,
-                 costs: Costs, seed: int, slow_rank: Optional[int] = None, slow_factor: float = 1.06) -> None:
-        """Set up the ranks, their speeds and the module table."""
+                 costs: Costs, seed: int, slow_rank: Optional[int] = None, slow_factor: float = 1.06,
+                 checkpoint: str = "reentrant") -> None:
+        """Set up the ranks, their speeds and the module table.
+
+        ``checkpoint`` is how the layers are recomputed: ``reentrant`` runs the whole layer again before its
+        backward; ``nonreentrant`` (what the Trainer's wrapper does) recomputes it lazily inside the backward of
+        its last module, and stops as soon as its last saved tensor is back, i.e. inside the MoE block.
+        """
+        self.checkpoint = checkpoint
         self.ranks, self.ep_size, self.layers, self.blocks = ranks, ep_size, layers, blocks
         self.experts, self.top_k, self.costs = experts, top_k, costs
         self.rng = random.Random(seed)
@@ -182,12 +189,17 @@ class Simulator:
         return received
 
     def layer_pass(self, phase: str, occ: int, layer: int, samples: list[dict], routing: list,
-                   factor: float = 1.0) -> None:
-        """One decoder layer, forward or recompute: attention, then the MoE block with its two all-to-alls."""
+                   factor: float = 1.0, interrupted: bool = False) -> None:
+        """One decoder layer, forward or recompute: attention, then the MoE block with its two all-to-alls.
+
+        ``interrupted`` is the lazy recompute of non-reentrant checkpointing: the layer's own hooks sit outside the
+        checkpoint and do not see it, and the MoE block is abandoned before it returns, so it never closes.
+        """
         c, ids = self.costs, self.ids
         recv = self.received(routing, layer)
         for r in range(self.ranks):
-            self.mark(r, ids["text.layer", layer], phase, occ, IN)
+            if not interrupted:
+                self.mark(r, ids["text.layer", layer], phase, occ, IN)
             self.t[r] += c.norms_per_token * samples[r]["real_tokens"] * 0.5 * factor
             self.mark(r, ids["text.attn", layer], phase, occ, IN)
             tokens = samples[r]["real_tokens"]
@@ -204,6 +216,8 @@ class Simulator:
         self.group_barrier(recv)
         for r in range(self.ranks):
             self.t[r] += c.aggregate_per_token * samples[r]["real_tokens"] * factor
+            if interrupted:
+                continue
             self.mark(r, ids["text.moe", layer], phase, occ, OUT)
             self.t[r] += c.norms_per_token * samples[r]["real_tokens"] * 0.5 * factor
             self.mark(r, ids["text.layer", layer], phase, occ, OUT)
@@ -271,13 +285,19 @@ class Simulator:
             self.live[r] -= tokens * 151936 * 10.0
             self.mark(r, ids["lm_head", None], BWD, occ, OUT)
         self.entry = list(self.t)
+        lazy = self.checkpoint == "nonreentrant"
         for layer in reversed(range(self.layers)):
             self.gate(c.ag_text)
-            self.layer_pass(RECOMPUTE, occ, layer, samples, routing)
+            if lazy:           # the gradient reaches the MoE block first; the recompute runs inside its backward
+                for r in range(self.ranks):
+                    self.mark(r, ids["text.layer", layer], BWD, occ, IN)
+                    self.mark(r, ids["text.moe", layer], BWD, occ, IN)
+            self.layer_pass(RECOMPUTE, occ, layer, samples, routing, interrupted=lazy)
             recv = self.received(routing, layer)
             for r in range(self.ranks):
-                self.mark(r, ids["text.layer", layer], BWD, occ, IN)
-                self.mark(r, ids["text.moe", layer], BWD, occ, IN)
+                if not lazy:
+                    self.mark(r, ids["text.layer", layer], BWD, occ, IN)
+                    self.mark(r, ids["text.moe", layer], BWD, occ, IN)
                 self.t[r] += c.aggregate_per_token * samples[r]["real_tokens"] * c.bwd_factor
             self.group_barrier(recv)
             for r in range(self.ranks):
@@ -353,14 +373,14 @@ def draw_samples(count: int, scenario: str, *, seed: int, mean_len: int = 8192, 
 
 def write_run(out: str, *, scenario: str, ranks: int, steps: int, accumulation: int, layers: int, blocks: int,
               ep_size: int, experts: int, seed: int, slow_rank: Optional[int], first_step: int = 3,
-              order: str = "random") -> None:
+              order: str = "random", checkpoint: str = "reentrant") -> None:
     """Simulate a run and write one ``rank*.jsonl`` per rank into ``out``.
 
     ``order`` is how the drawn samples are dealt to the steps: ``random`` (the draw order) or ``balanced`` (sorted by
     cost into steps of alike samples, as ``prepare_hetero_data.py --arrange balanced`` writes them).
     """
     simulator = Simulator(ranks=ranks, ep_size=ep_size, layers=layers, blocks=blocks, experts=experts, top_k=8,
-                          costs=Costs(), seed=seed, slow_rank=slow_rank)
+                          costs=Costs(), seed=seed, slow_rank=slow_rank, checkpoint=checkpoint)
     samples = draw_samples(ranks * accumulation * steps, scenario, seed=seed)
     ranked = arrange([sample_cost({"tokens": x["real_tokens"], "visual_tokens": x["visual_tokens"]}, 0.5)
                       for x in samples], ranks, order, random.Random(seed + 1))
@@ -413,12 +433,14 @@ def main() -> int:
     parser.add_argument("--experts", type=int, default=128)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--slow-rank", type=int, default=None, help="make one die 6%% slower")
+    parser.add_argument("--checkpoint", choices=("reentrant", "nonreentrant"), default="reentrant",
+                        help="how the layers are recomputed (nonreentrant is what the Trainer's wrapper does)")
     parser.add_argument("--order", choices=("random", "balanced"), default="random",
                         help="deal the samples in the draw order, or sorted by cost into steps of alike samples")
     args = parser.parse_args()
     write_run(args.out, scenario=args.scenario, ranks=args.ranks, steps=args.steps, accumulation=args.accumulation,
               layers=args.layers, blocks=args.blocks, ep_size=args.ep_size, experts=args.experts, seed=args.seed,
-              slow_rank=args.slow_rank, order=args.order)
+              slow_rank=args.slow_rank, order=args.order, checkpoint=args.checkpoint)
     print(f"wrote {args.ranks} rank files of {args.steps} steps to {args.out}: SYNTHETIC, nothing measured")
     return 0
 
