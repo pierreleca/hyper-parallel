@@ -14,7 +14,10 @@
 # ============================================================================
 """The heterogeneity profiler: workload of a micro-batch, component boundaries, routing by modality."""
 
+import importlib.util
 import json
+import pathlib
+import sys
 from types import SimpleNamespace
 from typing import Optional
 
@@ -308,9 +311,41 @@ def test_callback_window_follows_the_config(tmp_path):
                                                                 start_step=2, end_step=4))
     trainer = SimpleNamespace(config=config, mesh=None, model=None, global_rank=0)
     callback = HeteroProfileCallback(trainer)
-    assert [callback._records(SimpleNamespace(global_step=step)) for step in range(5)] \
-        == [False, True, True, False, False]  # pylint: disable=protected-access
+    try:
+        assert [callback._records(SimpleNamespace(global_step=step)) for step in range(5)] \
+            == [False, True, True, False, False]  # pylint: disable=protected-access
+    finally:
+        callback.profiler.configure(enabled=False, output_dir="")   # the callback configures the shared recorder
     with pytest.raises(ValueError):
         HeteroProfileConfig(start_step=0)
     with pytest.raises(ValueError):
         HeteroProfileConfig(start_step=3, end_step=3)
+
+
+def test_records_feed_the_report(tmp_path):
+    """What the profiler writes is what the analysis script reads: a rank file per rank, steps, workloads."""
+    path = pathlib.Path(__file__).parents[3] / "examples" / "qwen3_vl_30b_perf" / "analyze_hetero.py"
+    spec = importlib.util.spec_from_file_location("analyze_hetero_for_test", path)
+    report = importlib.util.module_from_spec(spec)
+    sys.modules["analyze_hetero_for_test"] = report
+    spec.loader.exec_module(report)
+
+    profiler = _profiler(tmp_path / "source")
+    model = _Model(recompute=True)
+    profiler.attach(model)
+    for step in range(1, 5):
+        _run_step(model, profiler, step=step)
+    profiler.close()
+    lines = (tmp_path / "source" / "rank000.jsonl").read_text().splitlines()
+    run_dir = tmp_path / "run" / "hetero"
+    run_dir.mkdir(parents=True)
+    for rank in range(3):                  # the same records stand in for three ranks
+        header = json.loads(lines[0])
+        header["rank"] = rank
+        (run_dir / f"rank{rank:03d}.jsonl").write_text("\n".join([json.dumps(header)] + lines[1:]) + "\n")
+    text, summary = report.analyse(str(run_dir), skip=1, ep_size=2, stages=[2], top=3, out_dir=None)
+    joined = "\n".join(text)
+    assert summary["overview"]["ranks"] == 3 and summary["overview"]["steps"] == 3
+    assert summary["model"]["vision"]["total"] > 0 and summary["model"]["text_layer"]["total"] > 0
+    assert "ROUTING by modality" in joined and summary["routing"]["layers"]
+    assert summary["imbalance"]["busiest_over_mean"] == 1.0 or summary["imbalance"]["busiest_over_mean"] >= 1.0

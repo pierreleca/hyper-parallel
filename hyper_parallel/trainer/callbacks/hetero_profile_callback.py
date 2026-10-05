@@ -16,7 +16,7 @@
 
 from typing import Any, Dict, List, Optional
 
-from hyper_parallel.trainer.runtime.hetero_profile import HeteroProfiler, step_digest
+from hyper_parallel.trainer.runtime.hetero_profile import HETERO_PROFILE, step_digest
 from hyper_parallel.trainer.runtime.logging import create_logger
 
 from .base import Callback, TrainerState
@@ -37,7 +37,7 @@ class HeteroProfileCallback(Callback):
         """Configure the profiler from ``TrainerConfig.hetero_profile``."""
         super().__init__(trainer)
         self.config = trainer.config.hetero_profile
-        self.profiler = HeteroProfiler()
+        self.profiler = HETERO_PROFILE
         self.profiler.configure(
             enabled=self.config.enabled,
             output_dir=self.config.output_dir,
@@ -45,6 +45,7 @@ class HeteroProfileCallback(Callback):
             sublayers=self.config.sublayers,
             routing_by_modality=self.config.routing_by_modality,
             memory=self.config.memory,
+            step_peaks=self.config.step_peaks,
         )
 
     def _records(self, state: TrainerState) -> bool:

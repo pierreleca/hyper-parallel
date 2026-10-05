@@ -116,6 +116,10 @@ class HeteroProfileConfig:
     routing_by_modality: bool = True
     # Read the allocator's allocated bytes at every boundary.
     memory: bool = True
+    # Record each step's peak allocated and reserved bytes, which resets the allocator's peak counters
+    # at every step; the trainer's own peak metric folds the recorder's running peak back in. Leave it
+    # off together with ep_instrument.segment_peaks, which resets them in the middle of the step.
+    step_peaks: bool = True
 
     def __post_init__(self) -> None:
         """Reject a recording window that can never open."""

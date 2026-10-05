@@ -221,9 +221,16 @@ class _DeviceClock:
         """Return the bytes the caching allocator holds for live tensors."""
         return None if self.device is None else int(self.device.memory_allocated())
 
-    def peak_allocated(self) -> Optional[int]:
-        """Return the allocated peak since the last reset, without resetting it."""
-        return None if self.device is None else int(self.device.max_memory_allocated())
+    def peaks(self) -> tuple[Optional[int], Optional[int]]:
+        """Return the allocated and reserved peaks since the last reset."""
+        if self.device is None:
+            return None, None
+        return int(self.device.max_memory_allocated()), int(self.device.max_memory_reserved())
+
+    def reset_peaks(self) -> None:
+        """Restart the allocator's peak counters at the current occupancy."""
+        if self.device is not None:
+            self.device.reset_peak_memory_stats()
 
 
 class _Boundary(torch.autograd.Function):  # pylint: disable=abstract-method
@@ -269,7 +276,9 @@ class HeteroProfiler:
         self.sublayers = True
         self.routing_by_modality = True
         self.memory = True
+        self.step_peaks = True
         self.spatial_merge_size = 2
+        self._run_peaks = [0, 0]
         self._roles = [(role, re.compile(pattern)) for role, pattern in roles]
         self._clock: Optional[_DeviceClock] = None
         self._modules: list[dict[str, Any]] = []
@@ -302,6 +311,7 @@ class HeteroProfiler:
             sublayers: bool = True,
             routing_by_modality: bool = True,
             memory: bool = True,
+            step_peaks: bool = True,
             spatial_merge_size: int = 2,
     ) -> None:
         """Enable recording and choose where the per-rank files are written."""
@@ -311,6 +321,7 @@ class HeteroProfiler:
         self.sublayers = sublayers
         self.routing_by_modality = routing_by_modality
         self.memory = memory
+        self.step_peaks = step_peaks
         self.spatial_merge_size = spatial_merge_size
         if enabled:
             self._clock = _DeviceClock()
@@ -415,6 +426,8 @@ class HeteroProfiler:
         self._routing = []
         self._visual_mask = None
         self._extras = {}
+        if self.step_peaks:
+            self._clock.reset_peaks()
         started = time.perf_counter()
         self._inter_step_ms = None if self._last_end is None else (started - self._last_end) * 1e3
         self._wall_start = started
@@ -430,6 +443,9 @@ class HeteroProfiler:
         wall_ms = (time.perf_counter() - self._wall_start) * 1e3
         self._clock.synchronize()
         self._last_end = time.perf_counter()
+        peak_allocated, peak_reserved = self._clock.peaks() if self.step_peaks else (None, None)
+        if peak_allocated is not None:
+            self._run_peaks = [max(self._run_peaks[0], peak_allocated), max(self._run_peaks[1], peak_reserved)]
         record: dict[str, Any] = {
             "kind": "step",
             "step": self._step,
@@ -439,11 +455,22 @@ class HeteroProfiler:
             "micro_batches": self._micro_batches,
             "marks": [self._resolve(mark) for mark in self._marks],
             "routing": self._drain_routing(),
-            "peak_allocated": self._clock.peak_allocated() if self.memory else None,
+            "peak_allocated": peak_allocated,
+            "peak_reserved": peak_reserved,
         }
         record.update(extras)
         self._write(record)
         return record
+
+    def fold_peaks(self, allocated: int, reserved: int) -> tuple[int, int]:
+        """Return peaks that survive this recorder's resets of the allocator's counters.
+
+        Reading a peak per step resets the allocator's counters, so the trainer's own
+        peak metric would otherwise report the last step only.
+        """
+        if not self.enabled or not self.step_peaks:
+            return allocated, reserved
+        return max(allocated, self._run_peaks[0]), max(reserved, self._run_peaks[1])
 
     def close(self) -> None:
         """Close the per-rank file and remove the hooks."""
@@ -572,9 +599,14 @@ class HeteroProfiler:
             experts = int(logits.shape[-1])
             occurrence = max(self._occurrences.get((self._root_id, FWD), 1) - 1, 0)
             with torch.no_grad():
-                visual = torch.bincount(indices[mask].reshape(-1), minlength=experts)
-                text = torch.bincount(indices[~mask].reshape(-1), minlength=experts)
-            self._routing.append((int(layer if layer is not None else -1), occurrence, visual, text))
+                # Static shapes only (no boolean indexing, whose size the host would have to wait for):
+                # the image tokens' choices are counted with a weight of 1, every choice with a weight of 1.
+                flat = indices.reshape(-1)
+                weight = mask.reshape(-1, 1).expand(-1, indices.shape[-1]).reshape(-1).to(torch.float32)
+                visual = torch.zeros(experts, dtype=torch.float32, device=flat.device).index_add_(0, flat, weight)
+                total = torch.zeros(experts, dtype=torch.float32, device=flat.device).index_add_(
+                    0, flat, torch.ones_like(weight))
+            self._routing.append((int(layer if layer is not None else -1), occurrence, visual, total - visual))
 
         return hook
 
@@ -587,7 +619,8 @@ class HeteroProfiler:
         stacked = torch.stack([torch.stack([visual, text]) for _, _, visual, text in self._routing]).cpu()
         rows = []
         for (layer, occurrence, _visual, _text), counts in zip(self._routing, stacked.tolist()):
-            rows.append({"layer": layer, "mb": occurrence, "visual": counts[0], "text": counts[1]})
+            rows.append({"layer": layer, "mb": occurrence, "visual": [int(round(count)) for count in counts[0]],
+                         "text": [int(round(count)) for count in counts[1]]})
         self._routing = []
         return rows
 
@@ -627,6 +660,9 @@ class HeteroProfiler:
             self._header_written = True
         self._stream.write(json.dumps(record) + "\n")
         self._stream.flush()
+
+
+HETERO_PROFILE = HeteroProfiler()
 
 
 def step_digest(record: Mapping[str, Any], modules: Sequence[Mapping[str, Any]]) -> dict[str, float]:
@@ -669,6 +705,6 @@ def step_digest(record: Mapping[str, Any], modules: Sequence[Mapping[str, Any]])
 
 
 __all__ = [
-    "BWD", "DEFAULT_ROLES", "ENTER", "EXIT", "FWD", "HeteroProfiler", "RECOMPUTE", "batch_workload",
+    "BWD", "DEFAULT_ROLES", "ENTER", "EXIT", "FWD", "HETERO_PROFILE", "HeteroProfiler", "RECOMPUTE", "batch_workload",
     "normalize_module_path", "step_digest",
 ]

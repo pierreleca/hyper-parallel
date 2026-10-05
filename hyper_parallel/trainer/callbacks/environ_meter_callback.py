@@ -22,6 +22,7 @@ from typing import Any
 
 from hyper_parallel.distributed.expert_parallel.instrument import EP_INSTRUMENT
 from hyper_parallel.trainer.runtime.distributed import get_world_size_safe
+from hyper_parallel.trainer.runtime.hetero_profile import HETERO_PROFILE
 from hyper_parallel.trainer.runtime.distributed import all_reduce
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.trainer.runtime.device import get_device_type, get_torch_device
@@ -218,13 +219,14 @@ class EnvironMeterCallback(Callback):
         if get_device_type() == "cpu":
             return {}
         device = get_torch_device()
-        # The EP instrument reads a peak per phase, which resets the
-        # allocator's peak counters; it keeps the running peaks so this
-        # metric still reports the peak of the whole run.
+        # The EP instrument reads a peak per phase and the heterogeneity profiler one
+        # per step, which reset the allocator's peak counters; each keeps its running
+        # peaks so this metric still reports the peak of the whole run.
         local_allocated, local_reserved = EP_INSTRUMENT.fold_peaks(
             device.max_memory_allocated(),
             device.max_memory_reserved(),
         )
+        local_allocated, local_reserved = HETERO_PROFILE.fold_peaks(local_allocated, local_reserved)
         allocated = self._reduce(local_allocated, op="max")
         reserved = self._reduce(local_reserved, op="max")
         gibibyte = 1024 ** 3
