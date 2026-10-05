@@ -186,7 +186,8 @@ def test_wrapper_segments_do_not_change_a_role():
     assert HeteroProfiler().match_role(path) == ("text.attn", 3)
     assert HeteroProfiler().match_role("model.visual.blocks.12") == ("vision.block", 12)
     assert HeteroProfiler().match_role("model.language_model.layers.1.mlp.gate") == ("text.router", 1)
-    assert HeteroProfiler().match_role("model.language_model.layers.1.mlp.experts") == (None, None)
+    assert HeteroProfiler().match_role("model.language_model.layers.1.mlp.experts") == ("text.experts", 1)
+    assert HeteroProfiler().match_role("model.language_model.layers.1.mlp.shared_expert") == (None, None)
 
 
 def test_attach_hooks_each_role_once(tmp_path):
