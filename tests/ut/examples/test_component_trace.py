@@ -293,7 +293,8 @@ def test_each_stamp_is_moved_onto_its_own_record_task():
     marks = [[1, "fwd", 0, "in", float(t), 0] for t in range(len(shifts))]
     tasks = sorted([offset + t * 1000.0 + shift for t, shift in enumerate(shifts) if shift is not None]
                    + [offset + 5500.0, offset + 40000.0])            # records of other events, far from any stamp
-    placement = ct.place_on_profile({"marks": marks, "step": 1}, SimpleNamespace(records=tasks), offset)
+    signals = SimpleNamespace(records=tasks, compute_records=tasks)
+    placement = ct.place_on_profile({"marks": marks, "step": 1}, signals, offset)
     assert (placement.matched, placement.stamps) == (9, 12)
     assert placement.median_us == pytest.approx(5.0) and placement.worst_us == pytest.approx(10.0)
     assert 700.0 < placement.drift_us_per_s < 900.0, "the shift grows by ~0.8 us per ms"
@@ -302,7 +303,7 @@ def test_each_stamp_is_moved_onto_its_own_record_task():
     assert moved[3] == pytest.approx(3.004), "halfway between the shifts 3 and 5"
     assert moved[8] == pytest.approx(8.0 + 0.007667, abs=1e-5) and moved[9] == pytest.approx(9.0 + 0.008333, abs=1e-5)
     assert [mark[:4] for mark in placement.record["marks"]] == [mark[:4] for mark in marks]
-    nothing = ct.place_on_profile({"marks": marks}, SimpleNamespace(records=[]), offset)
+    nothing = ct.place_on_profile({"marks": marks}, SimpleNamespace(records=[], compute_records=[]), offset)
     assert nothing.matched == 0 and nothing.record["marks"] == marks
 
 
@@ -612,3 +613,10 @@ def test_the_nearest_record_of_stamps_that_are_the_tasks():
     assert exact == {"stamps": 40, "share": 1.0, "median_us": 0.0}
     assert ct.nearest_record({"marks": marks}, [], 1000.0)["median_us"] is None
     assert ct.nearest_record({"marks": []}, tasks, 0.0) == {"stamps": 0, "share": 0.0, "median_us": None}
+
+
+def test_the_anchor_tasks_are_the_compute_streams_when_it_has_any():
+    """The recorder records on the compute stream; the device's other streams record far more, of other events."""
+    signals = SimpleNamespace(compute_records=[1.0, 2.0], records=[1.0, 2.0, 3.0, 4.0])
+    assert ct.anchor_tasks(signals) == [1.0, 2.0]
+    assert ct.anchor_tasks(SimpleNamespace(compute_records=[], records=[9.0])) == [9.0], "else whatever there is"

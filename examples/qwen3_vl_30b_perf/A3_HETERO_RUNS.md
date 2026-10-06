@@ -456,6 +456,12 @@ its projections and reshapes included, so the first lies *inside* the second and
 whole trace a class lane draws a run of same-class kernels within `--merge-us` (100 us) as one slice, which makes a
 slice end later than the kernel under it; `--window-ms` turns the merging off and draws one slice per kernel.
 
+How well the two sides can be made to agree is itself a measurement, and the first real traces gave it: the
+recorder's stamps sit on the profiler's event-record tasks to **3.5 us** on one node and to about **30 us** on the
+other, and a hook span brackets the kernels it contains to a few tens of microseconds. That is the resolution of the
+method: good to a kernel boundary, not to a kernel. It is immaterial for attributing seconds over 48 layers and three
+passes, and useless for reasoning about one 20 us kernel, which is what the trace itself is for.
+
 The report's `how tightly the spans bracket their kernels` line measures what the eye is judging: the median distance
 from a span's start to its first kernel and from its last kernel to the span's end, the share of spans that end while a
 kernel is still running, and the shift that would centre them. Both numbers small and positive is a tight bracket;

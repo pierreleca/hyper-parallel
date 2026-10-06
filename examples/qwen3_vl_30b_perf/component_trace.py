@@ -124,7 +124,10 @@ RECONCILE_RELATIVE = 5e-3        # for device events that come out of order by a
                                  # a whole span, far above that)
 # The recorder stamps its events with a device event record; the profiler lists such a task on the stream, so the
 # stamps are anchors that pin the clocks together to a few microseconds.
-ANCHOR_US = 15.0                 # a stamp and a record task this close are one event
+# A stamp and a record task this close are the same event. The recorder's stamps and the profiler's tasks agreed to
+# 3.5 us on one node of the first real campaign and to about 30 us on the other, so the tolerance is set well above
+# both: the compute stream records one task every few milliseconds, and at 50 us a wrong match stays near 1%.
+ANCHOR_US = 50.0
 ANCHOR_HYPOTHESES = 3            # the first stamps, each tried against every record task of the window
 ANCHOR_FIRST, ANCHOR_FIRST_NEED = 8, 6   # a candidate offset must first match 6 of 8 stamps
 ANCHOR_PROBE, ANCHOR_PROBE_SHARE = 40, 0.6
@@ -132,7 +135,7 @@ ANCHOR_SAMPLE = 400
 MIN_STAMPS = 20
 MIN_ANCHORED = 0.4               # share of the stamps that must coincide with a record task for the anchors to count
 PARTIAL_ANCHORED = 0.9           # below this the match is partial: clocks drifting over the step, or foreign tasks
-MATCH_US = 25.0                  # a stamp is moved onto the record task nearest to it if that is this close
+MATCH_US = 60.0                  # a stamp is moved onto the record task nearest to it if that is this close
 DESCRIBED_STEPS = 3              # profiled steps whose numbers are printed (the last ones)
 
 
@@ -453,6 +456,15 @@ def search_window(window: tuple[float, float], step_ms: float) -> tuple[float, f
     return low, max(window[1] - step_ms * 1000.0 + MARGIN_AFTER_US, low + MIN_SEARCH_US)
 
 
+def anchor_tasks(signals: Signals) -> list[float]:
+    """Return the event-record tasks a stamp may be: the compute stream's, where the recorder records them.
+
+    The device's other streams record hundreds of thousands of tasks of their own; matching against those as well
+    would make a chance match far likelier without making a true one any surer.
+    """
+    return signals.compute_records or signals.records
+
+
 def spread(values: Sequence[float], count: int) -> list[float]:
     """Return about ``count`` values spread evenly over a sorted sequence."""
     return list(values[::max(len(values) // count, 1)])
@@ -487,7 +499,7 @@ def anchor_search(record: dict, signals: Signals, low: float, high: float) -> Op
     result does not depend on the labels, so it pins the clocks together before the labels are checked, and it checks
     the recorder's clock as a side effect.
     """
-    records = signals.records
+    records = anchor_tasks(signals)
     stamps = sorted({mark[4] * 1000.0 for mark in record["marks"]})
     if len(stamps) < MIN_STAMPS or not records:
         return None
@@ -554,7 +566,7 @@ def place_on_profile(record: dict, signals: Signals, offset: float) -> Placement
     agree: a median near zero, a small worst case and no drift over the step mean they do.
     """
     marks = record["marks"]
-    tasks = signals.records
+    tasks = anchor_tasks(signals)
     predicted = [offset + mark[4] * 1000.0 for mark in marks]
     shifts: list[Optional[float]] = []
     for time_us in predicted:
