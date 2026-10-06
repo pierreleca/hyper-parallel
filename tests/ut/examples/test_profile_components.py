@@ -156,7 +156,7 @@ def test_the_inventory_names_the_streams_the_classes_and_the_collectives(tmp_pat
     capture, signals = _signals(tmp_path)
     text = "\n".join(pc.inventory(capture, signals))
     assert "Stream 5 8 tasks (compute)" in text
-    assert "attention kernels: 1 kernels" in text and "aclnnFlashAttentionScore" in text
+    assert "attention kernels (FlashAttention only): 1 kernels" in text and "aclnnFlashAttentionScore" in text
     assert "expert GEMM kernels (grouped matmul): 1 kernels" in text
     assert "collectives (hcom): alltoallv x2, allGather x1" in text
     assert "EVENT_WAIT x2" in text and "EVENT_RECORD x1" in text and "event-record tasks on the device: 1" in text
@@ -164,7 +164,7 @@ def test_the_inventory_names_the_streams_the_classes_and_the_collectives(tmp_pat
     (tmp_path / "ruled").mkdir()
     capture, ruled = _signals(tmp_path / "ruled", pc.parse_rules(["other=FlashAttention"]))
     listed = "\n".join(pc.inventory(capture, ruled))
-    assert "attention kernels: none" in listed, "a rule moves the kernel out of its class"
+    assert "attention kernels (FlashAttention only): none" in listed, "a rule moves the kernel out of its class"
 
 
 # -- the lanes ---------------------------------------------------------------------------------------------

@@ -41,7 +41,7 @@ import json
 import os
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Optional, Sequence
 
 # Run as a script, Python puts this directory first on the import path.
@@ -51,11 +51,14 @@ from ascend_trace import (
 )
 
 # The classes of kernels, as (key, title); the first is drawn first.
+# A class is a set of kernel names, NOT a module: the attention class holds the FlashAttention kernels only, while
+# the attention module also runs its projections (dense matmul) and its reshapes (copy / cast). The check between the
+# two sides is containment, never equality.
 CLASSES = (
-    ("attention", "attention kernels"),
+    ("attention", "attention kernels (FlashAttention only)"),
     ("experts", "expert GEMM kernels (grouped matmul)"),
     ("routing", "routing, sort, index kernels"),
-    ("dense", "dense matmul kernels"),
+    ("dense", "dense matmul kernels (projections, head)"),
     ("norm", "norm and activation kernels"),
     ("other", "copy, cast, elementwise and other kernels"),
 )
@@ -85,7 +88,8 @@ COLLECTIVE_LANE_OF = {"alltoallv": "coll:alltoallv", "alltoall": "coll:alltoall"
 PROFILE_LANES = tuple((f"class:{key}", f"{letter} {title}") for letter, (key, title) in zip("ABCDEF", CLASSES)) + (
     (STATE_LANE, "G compute stream: computing / waiting / idle"),
 ) + tuple((key, f"{letter} {title}") for letter, (key, title) in zip("HIJKL", COLLECTIVE_LANES))
-MERGE_US = 100.0                 # same-class kernels this close are drawn as one slice
+MERGE_US = 100.0                 # same-class kernels this close are drawn as one slice (0: one slice per kernel)
+RESTRICT_MARGIN_US = 50_000.0    # events kept around a window, so a slice at its edge still has its neighbours
 IDLE_US = 20.0                   # a gap this long on the compute stream is drawn as idle
 MIN_DRAW_US = 1.0                # slices shorter than this are counted but not drawn
 MIN_STATE_US = 5.0               # on the state lane, waits and idle gaps shorter than this are not drawn
@@ -385,7 +389,7 @@ def class_pieces(signals: Signals, merge_us: float = MERGE_US) -> dict[str, list
         if is_sync(event):
             continue
         klass = runs[signals.classify(event.name)]
-        if klass and event.ts - klass[-1][1] <= merge_us:
+        if klass and event.ts - klass[-1][1] < merge_us:      # a gap of 0 with merge_us 0: one slice per kernel
             klass[-1][1] = max(klass[-1][1], event.end)
             klass[-1][2] += 1
             klass[-1][3] += event.dur
@@ -464,6 +468,18 @@ def collective_pieces(signals: Signals) -> dict[str, list[Piece]]:
             result[lane].append(Piece(event.ts, event.end, comm_type(event.name), {
                 "event": event.name, "span_ms": round(event.dur / MS, 3)}, min(row, MAX_ROWS - 1)))
     return result
+
+
+def restrict(signals: Signals, span: Optional[tuple[float, float]]) -> Signals:
+    """Return the signals with only the events around ``span``: the lanes of a window cost what the window holds.
+
+    Drawing one slice per kernel over a whole trace would build millions of them; a window needs only its own.
+    """
+    if span is None:
+        return signals
+    low, high = span[0] - RESTRICT_MARGIN_US, span[1] + RESTRICT_MARGIN_US
+    return replace(signals, compute=[event for event in signals.compute if event.end >= low and event.ts <= high],
+                   comms=[event for event in signals.comms if event.end >= low and event.ts <= high])
 
 
 def profile_lanes(signals: Signals, merge_us: float = MERGE_US, idle_us: float = IDLE_US) -> dict[str, list[Piece]]:

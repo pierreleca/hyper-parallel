@@ -450,6 +450,19 @@ collectives, the *between modules* lane over *waiting: allGather*. Where they di
 wrong, or the hook sits elsewhere than assumed. A slice of the hooks' lanes carries the layer, the module path and the
 duration in its arguments; the exchange slices also carry the layer's floor and waiting.
 
+Two things to know before judging what you see by eye. A **class is a set of kernel names, not a module**: the
+*attention kernels* lane holds the FlashAttention kernels only, while the hooks' *attention* lane is the whole module,
+its projections and reshapes included, so the first lies *inside* the second and does not coincide with it. And over a
+whole trace a class lane draws a run of same-class kernels within `--merge-us` (100 us) as one slice, which makes a
+slice end later than the kernel under it; `--window-ms` turns the merging off and draws one slice per kernel.
+
+The report's `how tightly the spans bracket their kernels` line measures what the eye is judging: the median distance
+from a span's start to its first kernel and from its last kernel to the span's end, the share of spans that end while a
+kernel is still running, and the shift that would centre them. Both numbers small and positive is a tight bracket;
+equal and opposite means the step is placed slightly off on the trace, and the line says by how much. The durations the
+report quotes do not depend on that placement: they are the time between two events on one stream. Only the picture
+does.
+
 ```bash
 # the profile plan runs it on the nodes by itself; by hand, for a run directory (it holds hetero/ and profile/):
 R=/home/pl/runs/qwen3_vl_30b_perf/$(cat $C/profile_both/run_id)       # the run on the nodes

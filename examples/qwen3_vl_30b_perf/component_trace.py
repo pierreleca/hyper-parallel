@@ -56,6 +56,7 @@ import bisect
 import glob
 import json
 import os
+import statistics
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,10 +65,11 @@ from typing import Any, Optional, Sequence
 
 # Run as a script, Python puts this directory first on the import path.
 from analyze_hetero import build_rows, exchange_cells, spans_of as record_spans
-from ascend_trace import find_rank_traces, trace_rank
+from ascend_trace import find_rank_traces, is_sync, trace_rank
 from profile_components import (
     PROFILE_LANES, Capture, Piece, Signals, clip_events, describe_step, free_pids, inventory, load_capture, merged,
-    parse_rules, process_events, profile_lanes, read_signals, step_numbers, subtract, total, write_integrated,
+    parse_rules, process_events, profile_lanes, read_signals, restrict, step_numbers, subtract, total,
+    write_integrated,
 )
 
 PHASES = ("fwd", "recompute", "bwd")
@@ -112,6 +114,8 @@ MARGIN_BEFORE_US, MARGIN_AFTER_US = 300_000.0, 600_000.0
 # The offsets to search always span at least this much: a recorder step longer than the profiler's range of it would
 # otherwise leave no window at all, and the anchors could not be found.
 MIN_SEARCH_US = 2_000_000.0
+# Kernels before a span's start that are looked at, in case a long one began earlier and runs into it.
+BRACKET_LOOKBACK = 8
 SEPARATE_US = 20_000.0           # peaks closer than this are one peak
 CLEAR_PEAK = 1.3                 # the best alignment must beat any other by this factor
 HOOK_ORDER_WAIT_SHARE = 0.10     # stream waits inside compute slices above this share: the hooks sit elsewhere
@@ -622,6 +626,42 @@ def hook_order(shape: dict[str, dict[str, Any]]) -> Optional[float]:
     return waits / length if length else None
 
 
+def bracketing(lanes: dict[str, list[Piece]], signals: Signals, offset: float,
+               names: Sequence[str] = COMPUTE_LANES) -> dict[str, Any]:
+    """Measure how tightly the hooks' spans bracket the kernels that run inside them.
+
+    A kernel counts for a span when the two OVERLAP, so a kernel that began before the span or ends after it is seen
+    rather than missed. ``lead_in`` is then from the span's start to the first such kernel's start, ``lead_out`` from
+    the last one's end to the span's end. Both should be small and positive: the hook fires just before the module's
+    first kernel and just after its last. A negative ``lead_out`` means the span ends while a kernel still runs.
+
+    A constant error in placing the step on the trace moves the two in opposite directions, so ``shift`` estimates
+    it: half their difference, which is what the lanes would have to move to sit symmetrically on their kernels.
+    """
+    kernels = sorted((event.ts, event.end) for event in signals.compute if not is_sync(event))
+    starts = [start for start, _ in kernels]
+    lead_in: list[float] = []
+    lead_out: list[float] = []
+    straddled = covered = 0
+    for lane in names:
+        for piece in lanes.get(lane, []):
+            low, high = offset + piece.start * 1000.0, offset + piece.end * 1000.0
+            window = kernels[max(bisect.bisect_left(starts, low) - BRACKET_LOOKBACK, 0):
+                             bisect.bisect_right(starts, high)]
+            inside = [(begin, finish) for begin, finish in window if finish > low and begin < high]
+            if not inside:
+                continue
+            covered += 1
+            lead_in.append(inside[0][0] - low)
+            lead_out.append(high - max(finish for _, finish in inside))
+            straddled += lead_out[-1] < 0
+    if not covered:
+        return {"spans": 0}
+    middle_in, middle_out = statistics.median(lead_in), statistics.median(lead_out)
+    return {"spans": covered, "lead_in_us": middle_in, "lead_out_us": middle_out,
+            "straddled": straddled / covered, "shift_us": (middle_out - middle_in) / 2.0}
+
+
 def verdict(checks: list[dict[str, Any]], certain: bool, waiting: Optional[float]) -> str:
     """Say in a few words whether the kernels agree with the labels (``certain``: the clocks are surely aligned)."""
     known = [check for check in checks if check["share"] is not None]
@@ -883,14 +923,20 @@ def hook_part(rank: int, job: Job, signals: Optional[Signals], out: list[str], f
         out.append(f"      {check['what']}: " + ("n/a (none in the step)" if share is None else f"{share:.1%}"))
     if waiting is not None:
         out.append(f"      stream waits inside the attention, expert and vision slices: {waiting:.1%} of their time")
+    brackets = bracketing(lanes, signals, offset)
+    finding["bracketing"] = brackets
+    if brackets["spans"]:
+        out.append(f"      how tightly the spans bracket their kernels, over {brackets['spans']} of them: the span "
+                   f"starts {brackets['lead_in_us']:+.0f} us before the first kernel and ends "
+                   f"{brackets['lead_out_us']:+.0f} us after the last (median); {brackets['straddled']:.0%} end while "
+                   f"a kernel still runs. Moving the lanes by {brackets['shift_us']:+.0f} us would centre them")
     finding["verdict"] = verdict(checks, certain, waiting)
     out.append(f"    {finding['verdict']}")
     return lanes, offset
 
 
-def profile_part(capture: Capture, signals: Signals, job: Job, out: list[str], finding: dict[str, Any]
-                 ) -> dict[str, list[Piece]]:
-    """Describe what the trace holds and each profiled step from the profile alone; return the lanes to draw."""
+def profile_part(capture: Capture, signals: Signals, out: list[str], finding: dict[str, Any]) -> None:
+    """Describe what the trace holds, and each profiled step, from the profile alone."""
     out.append("  THE PROFILE ALONE (no hook record used)")
     out.extend("    " + line for line in inventory(capture, signals))
     steps = signals.steps[-DESCRIBED_STEPS:] or [(-1, signals.extent[0], signals.extent[1])]
@@ -899,7 +945,18 @@ def profile_part(capture: Capture, signals: Signals, job: Job, out: list[str], f
         numbers = step_numbers(signals, number, start, end)
         finding["profile"].append(numbers)
         out.extend("    " + line for line in describe_step(numbers))
-    return profile_lanes(signals, job.args.merge_us, job.args.idle_us)
+
+
+def window_of(args: argparse.Namespace, signals: Optional[Signals], finding: dict[str, Any]
+              ) -> Optional[tuple[float, float]]:
+    """Return the stretch of the trace to write, in microseconds, or None for the whole of it."""
+    if args.window_ms is None or signals is None:
+        return None
+    base = finding.get("offset_us")
+    if base is None:                                  # no hooks: measure from the last profiled step's start
+        base = signals.steps[-1][1] if signals.steps else signals.extent[0]
+    start = base + args.window_ms[0] * 1000.0
+    return start, start + args.window_ms[1] * 1000.0
 
 
 def process_rank(rank: int, job: Job, out: list[str]) -> Optional[dict[str, Any]]:
@@ -911,11 +968,18 @@ def process_rank(rank: int, job: Job, out: list[str]) -> Optional[dict[str, Any]
     if rank in job.traces:
         capture = load_capture(job.traces[rank])
         signals = read_signals(capture.trace, job.rules)
-    profile = profile_part(capture, signals, job, out, finding) if capture and signals else None
+    if capture is not None and signals is not None:
+        profile_part(capture, signals, out, finding)
     hooked = hook_part(rank, job, signals, out, finding) if job.hetero_dir else None
-    if profile is None and hooked is None:
+    if signals is None and hooked is None:
         out.append("  nothing to draw: no trace and no hooks record for this rank")
         return None
+    # The lanes read from the profile are built last: with a window they cost what the window holds, which is what
+    # makes one slice per kernel affordable on a trace of millions of events.
+    window = window_of(args, signals, finding)
+    merge = args.merge_us if args.merge_us is not None else (0.0 if window is not None else 100.0)
+    profile = (profile_lanes(restrict(signals, window), merge, args.idle_us)
+               if signals is not None else None)
     tag = "SYNTHETIC " if finding.get("synthetic") else ""
     new_events: list[dict[str, Any]] = []
     pids = free_pids(capture.events if capture else [], 2, PROCESS_BASE)
@@ -930,11 +994,8 @@ def process_rank(rank: int, job: Job, out: list[str]) -> Optional[dict[str, Any]
         new_events += process_events(pids[1], f"rank {rank} | components from the profile alone (kernel classes, "
                                               "stream state, collectives)", -999, PROFILE_LANES, profile)
     if capture is not None and args.original:
-        window = None
         name = f"rank{rank}_trace_with_components"
-        if args.window_ms is not None:
-            start = finding.get("offset_us", signals.extent[0]) + args.window_ms[0] * 1000.0
-            window = (start, start + args.window_ms[1] * 1000.0)
+        if window is not None:
             new_events = clip_events(new_events, window)
             name += f"_at{args.window_ms[0]:.0f}ms_for{args.window_ms[1]:.0f}ms"
         path = os.path.join(job.full_dir, f"{name}.json")
@@ -1008,8 +1069,9 @@ def parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
                         help="where the record step starts on the trace's timeline, instead of searching (one --rank)")
     parser.add_argument("--search-all", action="store_true",
                         help="search the whole trace for the step, not the profiler step's range (slower)")
-    parser.add_argument("--merge-us", type=float, default=100.0,
-                        help="kernels of one class this close are drawn as one slice in the profile lanes")
+    parser.add_argument("--merge-us", type=float, default=None,
+                        help="kernels of one class this close are drawn as one slice in the profile lanes (default: "
+                             "100 us for a whole trace, 0 with --window-ms, which draws one slice per kernel)")
     parser.add_argument("--idle-us", type=float, default=20.0,
                         help="a gap on the compute stream this long is drawn as idle in the profile lanes")
     parser.add_argument("--window-ms", type=float, nargs=2, default=None, metavar=("OFFSET", "LENGTH"),

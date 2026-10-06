@@ -192,7 +192,8 @@ def test_the_default_ranks_are_the_idlest_and_the_busiest_and_each_gets_its_own_
         assert any("from the hooks" in name and "placed on the profiler's timestamps" in name for name in ours)
         assert any("from the profile alone" in name for name in ours)
         threads = {e["args"]["name"] for e in events if e["ph"] == "M" and e["name"] == "thread_name"}
-        assert "6 MoE exchange: router, all-to-all, wait" in threads and "A attention kernels" in threads
+        assert "6 MoE exchange: router, all-to-all, wait" in threads
+        assert "A attention kernels (FlashAttention only)" in threads
         assert "Stream 7" in threads, "the original threads are still there"
         assert all(e["dur"] >= 0 for e in events if e["ph"] == "X")
 
@@ -310,11 +311,12 @@ def test_the_report_says_what_the_trace_holds_and_how_the_clocks_agree(tmp_path,
     run = _make(tmp_path)
     assert ct.main([str(run), "--rank", "3"]) == 0
     printed = capsys.readouterr().out
-    for expected in ("the trace: ", "streams of the device: ", "attention kernels: ",
+    for expected in ("the trace: ", "streams of the device: ", "attention kernels (FlashAttention only): ",
                      "expert GEMM kernels (grouped matmul)", "collectives (hcom): alltoallv",
                      "event-record tasks on the device", "profiler steps: 6",
                      "computing, by class of kernel: attention", "waiting, by what released it: ",
-                     "each stamp moved onto its own record task: ", "median shift +0.0 us", "wrote "):
+                     "each stamp moved onto its own record task: ", "median shift +0.0 us", "wrote ",
+                     "how tightly the spans bracket their kernels"):
         assert expected in printed, expected
 
 
@@ -534,3 +536,51 @@ def test_the_offsets_searched_never_collapse_to_nothing():
     assert high - low >= ct.MIN_SEARCH_US and low < 1_000_000.0 < high, "the step's own start is searched"
     low, high = ct.search_window((1_000_000.0, 9_000_000.0), 2.0)           # a wide range, a short step
     assert high > 8_000_000.0, "a wide profiler step is searched to its end"
+
+
+def _lane(events: list, cat: str, span: tuple = None) -> list:
+    """The slices of one lane, optionally inside a window."""
+    return [e for e in events if e.get("cat") == cat and e["ph"] == "X"
+            and (span is None or span[0] <= e["ts"] <= span[1])]
+
+
+def test_a_window_draws_one_slice_per_kernel_and_a_whole_trace_merges_them(tmp_path):
+    """With --window-ms the profile lanes are kernel-exact; over a whole trace they are runs, to stay drawable."""
+    run = _make(tmp_path)
+    _run(run, "--rank", "0", "--window-ms", "300", "120")
+    windowed = _read(run / "profile" / "components_full" /
+                     "rank0_trace_with_components_at300ms_for120ms.json")["traceEvents"]
+    _run(run, "--rank", "0")
+    whole = _read(run / "profile" / "components_full" / "rank0_trace_with_components.json")["traceEvents"]
+
+    start = _run(run, "--rank", "0", "--no-original")[0]["offset_us"] + 300_000.0
+    span = (start, start + 120_000.0)
+    exact = _lane(windowed, "class:experts")
+    merged_ = _lane(whole, "class:experts", span)
+    assert exact and len(exact) > len(merged_), "one slice per kernel, not one per run of them"
+    kernels = [e for e in windowed if e["ph"] == "X" and e["pid"] < ct.PROCESS_BASE
+               and "GroupedMatmul" in str(e["name"]) and e["ts"] + e["dur"] <= span[1]]
+    assert kernels, "the window holds expert kernels"
+    for kernel in kernels:
+        assert any(abs(slice_["ts"] - kernel["ts"]) < 1e-6 and abs(slice_["dur"] - kernel["dur"]) < 1e-6
+                   for slice_ in exact), "a slice of the class lane is exactly one kernel"
+
+
+def test_the_bracketing_says_how_tightly_a_span_holds_its_kernels():
+    """Lead-in and lead-out of each span, the share that end mid-kernel, and the shift that would centre them."""
+    lanes = {"attention": [ct.Piece(0.0, 1.0, "attention fwd"), ct.Piece(2.0, 3.0, "attention fwd")]}
+    # Kernels at 100-900 us and 2100-2900 us: the span leads by 100 us at each end, nothing straddles.
+    kernels = SimpleNamespace(compute=[
+        SimpleNamespace(ts=100.0, end=900.0, dur=800.0, name="aclnnFlashAttentionScore"),
+        SimpleNamespace(ts=2100.0, end=2900.0, dur=800.0, name="aclnnFlashAttentionScore"),
+    ])
+    tight = ct.bracketing(lanes, kernels, 0.0, names=("attention",))
+    assert tight == {"spans": 2, "lead_in_us": 100.0, "lead_out_us": 100.0, "straddled": 0.0, "shift_us": 0.0}
+    # The same kernels with the lanes drawn 150 us late: the spans start late and end while a kernel still runs.
+    late = ct.bracketing(lanes, kernels, 150.0, names=("attention",))
+    assert late["lead_in_us"] == -50.0 and late["lead_out_us"] == 250.0
+    assert late["straddled"] == 0.0 and late["shift_us"] == pytest.approx(150.0), "the shift that would centre them"
+    early = ct.bracketing(lanes, kernels, -150.0, names=("attention",))
+    assert early["straddled"] == 1.0, "drawn early, every span ends while its kernel is still running"
+    assert early["lead_out_us"] == -50.0 and early["shift_us"] == pytest.approx(-150.0)
+    assert ct.bracketing({"attention": []}, kernels, 0.0, names=("attention",)) == {"spans": 0}
