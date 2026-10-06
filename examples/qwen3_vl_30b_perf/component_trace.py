@@ -66,8 +66,8 @@ from typing import Any, Optional, Sequence
 from analyze_hetero import build_rows, exchange_cells, spans_of as record_spans
 from ascend_trace import find_rank_traces, trace_rank
 from profile_components import (
-    PROFILE_LANES, Capture, Piece, Signals, describe_step, free_pids, inventory, load_capture, merged, parse_rules,
-    process_events, profile_lanes, read_signals, step_numbers, subtract, total, write_integrated,
+    PROFILE_LANES, Capture, Piece, Signals, clip_events, describe_step, free_pids, inventory, load_capture, merged,
+    parse_rules, process_events, profile_lanes, read_signals, step_numbers, subtract, total, write_integrated,
 )
 
 PHASES = ("fwd", "recompute", "bwd")
@@ -109,6 +109,9 @@ PROCESS_BASE = 9_000_000
 MIN_SLICE_MS = 0.001             # slices shorter than this are counted in the lanes but not drawn (1 us)
 COARSE_US, WIDE_US, FINE_US, POLISH_US = 2000.0, 10_000.0, 100.0, 10.0
 MARGIN_BEFORE_US, MARGIN_AFTER_US = 300_000.0, 600_000.0
+# The offsets to search always span at least this much: a recorder step longer than the profiler's range of it would
+# otherwise leave no window at all, and the anchors could not be found.
+MIN_SEARCH_US = 2_000_000.0
 SEPARATE_US = 20_000.0           # peaks closer than this are one peak
 CLEAR_PEAK = 1.3                 # the best alignment must beat any other by this factor
 HOOK_ORDER_WAIT_SHARE = 0.10     # stream waits inside compute slices above this share: the hooks sit elsewhere
@@ -443,7 +446,7 @@ def refine(aligner: Aligner, totals: dict[str, float], coarse: list[tuple[float,
 def search_window(window: tuple[float, float], step_ms: float) -> tuple[float, float]:
     """Return the offsets in which the step can start, given the profiler step's range (microseconds)."""
     low = window[0] - MARGIN_BEFORE_US
-    return low, max(window[1] - step_ms * 1000.0 + MARGIN_AFTER_US, low + COARSE_US)
+    return low, max(window[1] - step_ms * 1000.0 + MARGIN_AFTER_US, low + MIN_SEARCH_US)
 
 
 def spread(values: Sequence[float], count: int) -> list[float]:
@@ -927,11 +930,20 @@ def process_rank(rank: int, job: Job, out: list[str]) -> Optional[dict[str, Any]
         new_events += process_events(pids[1], f"rank {rank} | components from the profile alone (kernel classes, "
                                               "stream state, collectives)", -999, PROFILE_LANES, profile)
     if capture is not None and args.original:
-        path = os.path.join(job.full_dir, f"rank{rank}_trace_with_components.json")
-        size = write_integrated(capture, new_events, path)
+        window = None
+        name = f"rank{rank}_trace_with_components"
+        if args.window_ms is not None:
+            start = finding.get("offset_us", signals.extent[0]) + args.window_ms[0] * 1000.0
+            window = (start, start + args.window_ms[1] * 1000.0)
+            new_events = clip_events(new_events, window)
+            name += f"_at{args.window_ms[0]:.0f}ms_for{args.window_ms[1]:.0f}ms"
+        path = os.path.join(job.full_dir, f"{name}.json")
+        size = write_integrated(capture, new_events, path, window)
         processes = int(hooked is not None) + int(profile is not None)
-        out.append(f"  wrote {path}: {size / 2 ** 20:,.0f} MiB, the {len(capture.events):,} original events untouched, "
-                   f"then {len(new_events):,} new ones in {processes} process(es)")
+        kept = ("the whole trace" if window is None else
+                f"{args.window_ms[1]:.0f} ms of the step, {args.window_ms[0]:.0f} ms after its start")
+        out.append(f"  wrote {path}: {size / 2 ** 20:,.1f} MiB, {kept}, the original events untouched, then "
+                   f"{len(new_events):,} new ones in {processes} process(es)")
         finding["trace_file"] = path
     elif capture is None and hooked is not None:
         path = os.path.join(job.out_dir, f"rank{rank}_lanes.json")
@@ -1000,6 +1012,10 @@ def parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
                         help="kernels of one class this close are drawn as one slice in the profile lanes")
     parser.add_argument("--idle-us", type=float, default=20.0,
                         help="a gap on the compute stream this long is drawn as idle in the profile lanes")
+    parser.add_argument("--window-ms", type=float, nargs=2, default=None, metavar=("OFFSET", "LENGTH"),
+                        help="write only this stretch of the step into the trace file: OFFSET ms after the step's "
+                             "start, LENGTH ms long. A trace of gigabytes becomes a file a viewer opens at once; "
+                             "without it the whole trace is written")
     parser.add_argument("--out", default=None, help="small files: report and summary (<run>/profile/components)")
     parser.add_argument("--full-out", default=None,
                         help="large files: the trace of each rank with the components (<run>/profile/components_full)")

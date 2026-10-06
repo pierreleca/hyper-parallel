@@ -515,14 +515,51 @@ def process_events(pid: Any, name: str, sort_index: int, lanes: Sequence[tuple[s
     return events
 
 
-def write_integrated(capture: Capture, extra: Sequence[dict], path: str) -> int:
+def clip_events(events: Sequence[dict], span: tuple[float, float]) -> list[dict]:
+    """Return the events of a window: the metadata whole, a slice clipped to it, anything else dropped.
+
+    Used for the events this module adds, whose slices (a step, a layer) are longer than the window one wants to
+    look at; clipping them keeps the view as narrow as the window instead of as wide as the step.
+    """
+    kept: list[dict] = []
+    for event in events:
+        if event.get("ph") != "X":
+            kept.append(event)
+            continue
+        start = float(event["ts"])
+        end = start + float(event.get("dur", 0.0))
+        if end < span[0] or start > span[1]:
+            continue
+        low, high = max(start, span[0]), min(end, span[1])
+        kept.append({**event, "ts": low, "dur": high - low})
+    return kept
+
+
+def in_window(events: Sequence[dict], span: tuple[float, float]) -> list[dict]:
+    """Return the metadata events and the events that start inside a window, each exactly as it was written."""
+    return [event for event in events
+            if event.get("ph") == "M" or span[0] <= float(event.get("ts", 0.0)) <= span[1]]
+
+
+def write_integrated(capture: Capture, extra: Sequence[dict], path: str,
+                     span: Optional[tuple[float, float]] = None) -> int:
     """Write the original events untouched, then ``extra``, in the original container; return the file's size.
 
     A trace that is a bare list of events (what the Ascend exporter writes) is extended in the text of the file, so the
     original stays byte for byte and a trace of hundreds of megabytes is not serialized again; a trace in an object
     with a ``traceEvents`` key is written again with the new events added to that list.
+
+    With ``span`` (microseconds on the trace's timeline) only the original events that START inside it are written,
+    each still exactly as it was: a trace of gigabytes becomes a file a viewer opens at once, holding the stretch of
+    the step one wants to look at.
     """
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    if span is not None:
+        events = in_window(capture.events, span) + list(extra)
+        data: Any = {**capture.container, "traceEvents": events} if isinstance(capture.container, dict) else events
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, separators=(",", ":"))
+        return os.path.getsize(path)
     if isinstance(capture.container, list):
         with open(capture.path, encoding="utf-8") as source:
             text = source.read().rstrip()

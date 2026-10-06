@@ -455,7 +455,10 @@ duration in its arguments; the exchange slices also carry the layer's floor and 
 R=/home/pl/runs/qwen3_vl_30b_perf/$(cat $C/profile_both/run_id)       # the run on the nodes
 cluster exec -p "python examples/qwen3_vl_30b_perf/component_trace.py $R"              # the idlest and busiest rank of each node
 cluster exec -p "python examples/qwen3_vl_30b_perf/component_trace.py $R --rank 6"     # one rank (the node that has it)
-cluster gather $R/profile/components_full/rank6_trace_with_components.json /home/pl/a3_runs/traces   # as large as the original
+# a trace of this model is over 1 GB per rank, which a viewer struggles with: --window-ms writes one stretch of the
+# step instead (here 400 ms, 2 s after the step starts), a few MB that opens at once
+cluster exec -p "python examples/qwen3_vl_30b_perf/component_trace.py $R --rank 6 --window-ms 2000 400"
+cluster gather $R/profile/components_full/rank6_trace_with_components_at2000ms_for400ms.json /home/pl/a3_runs/traces
 # the profile alone, for any trace_view.json (no records needed), on the machine that has it:
 python3 examples/qwen3_vl_30b_perf/component_trace.py path/to/trace_view.json --rank 6
 ```

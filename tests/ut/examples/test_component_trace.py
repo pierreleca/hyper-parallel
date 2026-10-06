@@ -497,3 +497,40 @@ def test_an_ep_group_that_is_not_whole_is_reported_not_guessed(tmp_path, capsys)
     finding = _run(run, "--rank", "0", "--no-trace")[0]
     assert "ep_wait" not in finding
     assert "EP wait not computed" in capsys.readouterr().out
+
+
+def test_a_window_writes_a_small_file_that_still_holds_both_processes_and_the_real_events(tmp_path):
+    """--window-ms keeps the stretch asked for: the originals that start in it, the lanes clipped to it."""
+    run = _make(tmp_path)
+    whole = _run(run, "--rank", "0")[0]
+    whole_events = _read(whole["trace_file"])["traceEvents"]
+    findings = _run(run, "--rank", "0", "--window-ms", "300", "120")
+    path = findings[0]["trace_file"]
+    assert path.endswith("rank0_trace_with_components_at300ms_for120ms.json"), "the window is named in the file"
+    events = _read(path)["traceEvents"]
+    assert len(events) < len(whole_events) / 3, "a window of the step is a fraction of the file"
+    slices = [e for e in events if e["ph"] == "X"]
+    start = whole["offset_us"] + 300_000.0
+    window = (start, start + 120_000.0)
+    assert slices, "the window is not empty"
+    for event in slices:
+        assert event["ts"] >= window[0] - 1e-6 and event["ts"] <= window[1] + 1e-6, "nothing starts outside it"
+        if event["pid"] >= ct.PROCESS_BASE:
+            assert event["ts"] + event["dur"] <= window[1] + 1e-6, "an added slice is clipped to the window"
+    pids = {e["pid"] for e in slices}
+    assert len([p for p in pids if p >= ct.PROCESS_BASE]) == 2, "both component processes are still there"
+    assert any(p < ct.PROCESS_BASE for p in pids), "and the rank's own streams"
+    names = {e["name"] for e in slices if e["pid"] < ct.PROCESS_BASE}
+    assert any(name.startswith("aclnn") for name in names), "real kernels, not only the lanes"
+    originals = {(e["pid"], e["tid"], e["ts"], e["name"]) for e in whole_events if e["ph"] == "X"
+                 and e["pid"] < ct.PROCESS_BASE and window[0] <= e["ts"] <= window[1]}
+    kept = {(e["pid"], e["tid"], e["ts"], e["name"]) for e in slices if e["pid"] < ct.PROCESS_BASE}
+    assert kept == originals, "every original event of the window, and only those, kept as written"
+
+
+def test_the_offsets_searched_never_collapse_to_nothing():
+    """A recorder step longer than the profiler's range of it still leaves a window the anchors can be found in."""
+    low, high = ct.search_window((1_000_000.0, 1_020_000.0), 25.0)          # a 20 ms range, a 25 ms step
+    assert high - low >= ct.MIN_SEARCH_US and low < 1_000_000.0 < high, "the step's own start is searched"
+    low, high = ct.search_window((1_000_000.0, 9_000_000.0), 2.0)           # a wide range, a short step
+    assert high > 8_000_000.0, "a wide profiler step is searched to its end"
