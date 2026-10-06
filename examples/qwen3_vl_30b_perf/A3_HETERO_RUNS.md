@@ -456,11 +456,17 @@ its projections and reshapes included, so the first lies *inside* the second and
 whole trace a class lane draws a run of same-class kernels within `--merge-us` (100 us) as one slice, which makes a
 slice end later than the kernel under it; `--window-ms` turns the merging off and draws one slice per kernel.
 
-How well the two sides can be made to agree is itself a measurement, and the first real traces gave it: the
-recorder's stamps sit on the profiler's event-record tasks to **3.5 us** on one node and to about **30 us** on the
-other, and a hook span brackets the kernels it contains to a few tens of microseconds. That is the resolution of the
-method: good to a kernel boundary, not to a kernel. It is immaterial for attributing seconds over 48 layers and three
-passes, and useless for reasoning about one 20 us kernel, which is what the trace itself is for.
+How well the two sides can be made to agree is itself a measurement, and the first real traces gave it. **Where the
+step is anchored on the recorder's own event-record tasks, the hooks are exact**: every one of a rank's 1,152 stamps
+matched its task, median shift **-0.5 us**, largest 1.0 us, no drift, and the spans then bracket their kernels to
+**+1 us** at the start and **+0 us** at the end, with 9% ending while a kernel still runs. Where no constant offset
+puts the stamps on the tasks (half of them lay more than 50 us away on one node's ranks, which means the two clocks
+drift or some tasks are missing rather than that the stamps are elsewhere), the step is placed by its kernels instead
+and the spans sit some 30 to 120 us inside them, which is what makes 83% of them appear to end mid-kernel.
+
+So the method's own resolution is about a microsecond, and the fallback's is about a hundred. Neither moves a
+component total: the lanes and the report agree to 0.0000 ms in every case, because a span's duration is the time
+between two events on one stream and does not depend on where the step is placed on the trace. Only the picture does.
 
 The report's `how tightly the spans bracket their kernels` line measures what the eye is judging: the median distance
 from a span's start to its first kernel and from its last kernel to the span's end, the share of spans that end while a

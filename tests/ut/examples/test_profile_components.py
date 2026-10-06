@@ -156,7 +156,7 @@ def test_the_inventory_names_the_streams_the_classes_and_the_collectives(tmp_pat
     capture, signals = _signals(tmp_path)
     text = "\n".join(pc.inventory(capture, signals))
     assert "Stream 5" in text and "(compute)" in text and "EVENT_WAIT, aclnnFlashAttentionScore" in text
-    assert "aclnn kernels outside the compute stream: 0 of 5 (0.0%)" in text, "nothing of the model's compute is missed"
+    assert "aclnn kernels outside the compute stream: 0 of 5 (0.0% of them)" in text, "no compute is missed"
     assert "attention kernels (FlashAttention only): 1 kernels" in text and "aclnnFlashAttentionScore" in text
     assert "expert GEMM kernels (grouped matmul): 1 kernels" in text
     assert "collectives (hcom): alltoallv x2, allGather x1" in text
@@ -247,5 +247,6 @@ def test_compute_kernels_on_another_stream_are_counted_as_missed(tmp_path):
     path.write_text(json.dumps(events))
     capture = pc.load_capture(str(path))
     text = "\n".join(pc.inventory(capture, pc.read_signals(capture.trace)))
-    assert "aclnn kernels outside the compute stream: 1 of 6 (16.7%), 0 ms" in text
+    assert "aclnn kernels outside the compute stream: 1 of 6 (16.7% of them), 0 ms against" in text
+    assert "of its busy time)" in text, "the share of the time, which is the one that matters"
     assert "Stream 9" in text and "NOTIFY_WAIT" in text, "the stream is named with what it holds"

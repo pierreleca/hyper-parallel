@@ -356,10 +356,14 @@ def inventory(capture: Capture, signals: Signals, limit: int = 6) -> list[str]:
                          f"{row['busy_us'] / MS:9,.0f} ms  " + ", ".join(name for name, _ in common)
                          + ("   (compute)" if row["label"] == compute_label else ""))
         inside = sum(1 for event in signals.compute if event.name.startswith(KERNEL_PREFIX))
+        busy = next((row["busy_us"] for row in streams if row["label"] == compute_label), 0.0)
         share = outside_count / (outside_count + inside) if outside_count + inside else 0.0
+        # The share of the TIME is the one that matters: many short copies on another stream are a large share of the
+        # kernel count and a small share of the work, and being on another stream they overlap the compute anyway.
         lines.append(f"  aclnn kernels outside the compute stream: {outside_count:,.0f} of "
-                     f"{outside_count + inside:,.0f} ({share:.1%}), {outside_us / MS:,.0f} ms; the compute split "
-                     "below reads the compute stream, so anything there is work it does not count")
+                     f"{outside_count + inside:,.0f} ({share:.1%} of them), {outside_us / MS:,.0f} ms against the "
+                     f"compute stream's {busy / MS:,.0f} ms ({outside_us / busy if busy else 0.0:.1%} of its busy "
+                     "time); the compute split below reads the compute stream, so that time is work it does not count")
     per_class: dict[str, Counter] = defaultdict(Counter)
     time_of: dict[str, float] = defaultdict(float)
     count_of: dict[str, int] = defaultdict(int)
