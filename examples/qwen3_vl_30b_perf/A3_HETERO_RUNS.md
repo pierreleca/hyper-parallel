@@ -69,8 +69,10 @@ sed -n '/^CEILINGS/,/data loading/p' $C/both/report.txt $C/fixed/report.txt
 
 # 6. optional: balanced order measured; kernel-level check (then delete the traces)
 examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_balance_32dev.sh
+cluster exec 'df -h /home/pl | tail -1'      # the traces are gigabytes per profiled rank: check the disk first
 examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_profile_32dev.sh
 C=$(ls -dt /home/pl/a3_runs/hetero_profile_32dev_* | head -1)
+cluster exec 'du -sh /home/pl/runs/qwen3_vl_30b_perf/*_profile_*/profile 2>/dev/null; df -h /home/pl | tail -1'
 grep -E "^rank [0-9]+:|EP wait|last to arrive|starts at|lanes against|stream busy|GroupedMatmul|attention kernels|all-to-all coll|stream waits|AGREE|DISAGREE|UNCERTAIN" $C/profile_both/components.txt | cut -c1-230
 grep -E "^MATCHED|sum over" $C/profile_both/trace.txt     # the k-th all-to-all across the group: waiting for the last rank vs the transfer
 ls $C/profile_both/components/              # <node>_components.txt and _summary.json: the report
@@ -79,7 +81,7 @@ R=/home/pl/runs/qwen3_vl_30b_perf/$(cat $C/profile_both/run_id)    # the run on 
 N=6                                                                  # one of those ranks
 cluster gather $R/profile/components_full/rank${N}_trace_with_components.json /home/pl/a3_runs/traces   # its trace, with the components
 # open it in https://ui.perfetto.dev (How each component is detected, and how to check it)
-cluster exec 'rm -rf /home/pl/runs/qwen3_vl_30b_perf/hetero_profile_32dev_*/profile'
+cluster exec 'rm -rf /home/pl/runs/qwen3_vl_30b_perf/hetero_profile_32dev_*/profile'   # free the disk once read
 
 # 7. certify an idea: the flags that switch it on, and the dataset where it should win
 IDEA="<flags of the data idea>"  DATASET=both  examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_ab_32dev.sh
@@ -97,7 +99,8 @@ cluster status; cluster logs; cluster kill
 
 Runs per plan: `hetero_smoke_32dev.sh` 1 (8 steps); `hetero_baseline_32dev.sh` 6 (20 steps each, in the order
 `both_a`, `fixed_a`, `both_b`, `fixed_b`, `both_hooks`, `both_off`) and 4 comparisons made afterwards on the control
-node; `hetero_data_32dev.sh` 6 (14 steps); `hetero_balance_32dev.sh` 6 (20 and 10 steps); `hetero_profile_32dev.sh` 2;
+node; `hetero_data_32dev.sh` 6 (14 steps); `hetero_balance_32dev.sh` 6 (20 and 10 steps); `hetero_profile_32dev.sh` 2
+(8 steps, of which 2 are profiled);
 `hetero_probe_32dev.sh` 4; `hetero_ab_32dev.sh` 6 (20 steps). They run one after the other, and **all the runs go
 first, the analysis afterwards**: the devices are busy only while a run trains, and the analysis (the trace reports of
 a profiled run are slow) never delays the next run or keeps the devices from somebody else. The terminal prints
@@ -221,7 +224,7 @@ examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/h
 | `hetero_probe_32dev.sh` | recompute `full` / `selective` / `off` at 48, 24, 12 layers | `hetero_both_n640` |
 | `hetero_data_32dev.sh` | the six datasets, 14 steps each | all six |
 | `hetero_balance_32dev.sh` | `both` and `longtail` in random and balanced order, and with two micro-batches per rank | `both`, `longtail` |
-| `hetero_profile_32dev.sh` | the Ascend profiler on every rank for two steps, on `fixed` and `both` | `fixed`, `both` |
+| `hetero_profile_32dev.sh` | the Ascend profiler for two steps on four ranks (two per node), on `fixed` and `both` | `fixed`, `both` |
 | `hetero_baseline_32dev.sh` | twin runs of `fixed` and `both` (the noise floor), with module hooks on, and with the recorder off | `fixed`, `both` |
 | `hetero_ab_32dev.sh` | base, candidate, base, candidate with the light recorder, then one hooked pair; `IDEA=<flags>` | the dataset you pass |
 
@@ -412,6 +415,15 @@ measured and what is derived from it:
 | EP wait | per layer, pass and EP group, a rank's exchange minus the smallest exchange of the group (the floor) | derived across ranks |
 | layer glue | a layer's span minus attention, experts and exchange: norms, residuals | derived |
 | gaps | from one module's exit to the next one's entry: the wait for the weights, launch gaps | derived |
+
+**What a profiled run costs, and what it is good for.** The profiler writes a trace per profiled rank, and one step of
+this model takes gigabytes, so `plans/hetero_profile_32dev.sh` names four ranks (`profiling.ranks=[6,13,22,29]`: two per
+node, two per expert-parallel group) and lets the profiler drop its raw collection directory once parsed
+(`profiling.data_simplification`, in the YAML). `profiling.ranks=[]` with `profiling.rank=-1` profiles all 32 instead,
+which fills a node's disk. Because only some ranks carry the profiler's overhead, **the timing of a profiled run is not
+a measurement**: the profiled ranks are slower, so they are the last to arrive at every collective and the others wait
+for them. Read the structure from it (which kernels run inside which span, what the stream does there), and the timings
+from the unprofiled runs. Check `df -h` before, and delete the traces once read.
 
 `component_trace.py` gives the profiler's own trace of a rank back with those components added, to check them by eye.
 For each rank it writes **one file: the original `trace_view.json` with every event untouched** (host and device,

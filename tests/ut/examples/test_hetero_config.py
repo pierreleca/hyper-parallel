@@ -45,6 +45,8 @@ _SCRIPT = textwrap.dedent("""
     print(config.model._target_path)
     print(config.hetero_profile.hooks, config.hetero_profile.enabled, config.ep_instrument.enabled,
           config.training.train_iters, config.training.global_batch_size)
+    print(config.profiling.enabled, config.profiling.ranks, config.profiling.start_step,
+          config.profiling.end_step, config.profiling.data_simplification)
 """)
 
 
@@ -56,7 +58,7 @@ def _resolve(*overrides: str) -> list:
         text=True, timeout=300, check=False,
     )
     assert result.returncode == 0, result.stderr[-2000:]
-    return result.stdout.strip().splitlines()[-7:]
+    return result.stdout.strip().splitlines()[-8:]
 
 
 def test_configuration_resolves_with_the_defaults():
@@ -88,3 +90,12 @@ def test_the_flags_of_the_plans_are_accepted():
     off = _resolve("--hetero_profile.enabled=false", "--ep_instrument.enabled=false",
                    "--training.global_batch_size=64", "--training.train_iters=10")
     assert off[6] == "True False False 10 64"
+
+
+def test_the_profile_plan_names_the_ranks_it_profiles():
+    """A trace per rank is gigabytes, so the profile plan profiles four ranks, two per node, and keeps no raw data."""
+    default = _resolve()
+    assert default[7] == "False [] 6 8 True", "off by default, no rank named, the raw collection dropped"
+    lines = _resolve("--profiling.enabled=true", "--profiling.ranks=[6,13,22,29]",
+                     "--profiling.start_step=6", "--profiling.end_step=8")
+    assert lines[7] == "True [6, 13, 22, 29] 6 8 True"

@@ -12,7 +12,7 @@
 # - the MoE: routed counts per layer and EP rank, the phases of each block (router, dispatch
 #   all-to-all, experts, combine all-to-all), and the experts the image tokens and the text tokens choose.
 # Reports: analyze_hetero.py (the heterogeneity report), analyze_ep_instrument.py (the EP phases),
-# analyze_npu_trace.py (the Ascend profiler, with profiling.enabled and profiling.rank=-1).
+# analyze_npu_trace.py (the Ascend profiler, with profiling.enabled and profiling.ranks).
 #
 # Data: one directory per scenario, built per node by prepare_hetero_data.py (A3_HETERO_RUNS.md): fixed,
 # text, vision, both, longtail, natural, all with the same mean tokens, so a scenario differs from
@@ -197,9 +197,14 @@ debug:
   check_nan_inf: false
   check_dataset: null
 
+# The Ascend profiler, for the two steps of the profile plan. A trace of one step of this model takes
+# gigabytes per rank, so the plan names the ranks it compares instead of profiling all 32 (rank: -1), and
+# the profiler drops its raw collection directory once it has parsed it into ASCEND_PROFILER_OUTPUT, which
+# is what the reports read (trace_view.json). Traces stay on the nodes; delete them once read.
 profiling:
   enabled: false
   rank: 0
+  ranks: []
   start_step: 6
   end_step: 8
   trace_dir: /home/pl/runs/qwen3_vl_30b_perf/a3_32dev_hetero/profile
@@ -207,6 +212,7 @@ profiling:
   profile_memory: false
   with_stack: false
   with_modules: false
+  data_simplification: true
 
 # Expert-parallel imbalance recording. start_step skips the warm-up steps, whose
 # allocator growth and first-touch HCCL links say nothing about the steady state;

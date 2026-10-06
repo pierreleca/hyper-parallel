@@ -21,6 +21,13 @@ from hyper_parallel.trainer.runtime.profiling import create_profiler
 from .base import Callback, TrainerState
 
 
+def profiled_ranks(config: Any, world_size: int) -> set:
+    """Return the ranks that record a trace: ``ranks`` when it is set, else ``rank`` (-1 meaning every rank)."""
+    if config.ranks:
+        return set(config.ranks)
+    return set(range(world_size)) if config.rank == -1 else {config.rank}
+
+
 class ProfilingCallback(Callback):
     """Record a bounded CPU and accelerator trace on one distributed rank, or on all of them."""
 
@@ -35,8 +42,8 @@ class ProfilingCallback(Callback):
         """
         super().__init__(trainer)
         config = trainer.config.profiling
-        # rank -1 profiles every rank, to compare their timelines (EP imbalance, collective skew).
-        self.enabled = config.enabled and config.rank in (-1, trainer.global_rank)
+        # rank -1 profiles every rank, to compare their timelines (EP imbalance, collective skew); ranks names a few.
+        self.enabled = config.enabled and trainer.global_rank in profiled_ranks(config, trainer.world_size)
         self.config = config
         self.profiler = None
         if not config.enabled:
@@ -45,7 +52,12 @@ class ProfilingCallback(Callback):
             raise ValueError("profiling.start_step must be at least 1")
         if config.end_step <= config.start_step:
             raise ValueError("profiling.end_step must be greater than profiling.start_step")
-        if config.rank < -1 or config.rank >= trainer.world_size:
+        outside = [rank for rank in config.ranks if rank < 0 or rank >= trainer.world_size]
+        if outside:
+            raise ValueError(
+                f"profiling.ranks must be ranks of the job, in [0, {trainer.world_size}), but got {outside}"
+            )
+        if not config.ranks and (config.rank < -1 or config.rank >= trainer.world_size):
             raise ValueError(
                 f"profiling.rank must be -1 (every rank) or in [0, {trainer.world_size}), but got {config.rank}"
             )
@@ -63,6 +75,7 @@ class ProfilingCallback(Callback):
             profile_memory=self.config.profile_memory,
             with_stack=self.config.with_stack,
             with_modules=self.config.with_modules,
+            data_simplification=self.config.data_simplification,
             global_rank=self.trainer.global_rank,
         )
         self.profiler.start()

@@ -32,7 +32,7 @@ Reports, for one profiled step or all of them:
 
     python examples/qwen3_vl_30b_perf/analyze_npu_trace.py <trace dir or trace_view.json>
 
-With the traces of every rank (profiling.rank: -1), ``--ranks`` compares them:
+With the traces of several ranks (profiling.ranks, or profiling.rank: -1), ``--ranks`` compares them:
 per-rank step breakdown and routed-token work, and the k-th alltoallv matched
 across ranks, split into the wait for the last rank to arrive and the transfer.
 """
@@ -444,7 +444,7 @@ def parse_args() -> argparse.Namespace:
                         help="a stream is a swap stream when MEMCPY_ASYNC tasks exceed this share of its"
                              " non-sync tasks (and number at least 4)")
     parser.add_argument("--ranks", action="store_true",
-                        help="compare the traces of every rank under the path (profiling.rank: -1)")
+                        help="compare the traces of every rank under the path (profiling.ranks, or profiling.rank: -1)")
     parser.add_argument("--match", nargs="+", default=["alltoallv", "alltoall"],
                         help="collective types matched across ranks in --ranks mode")
     parser.add_argument("--list-matched", action="store_true", help="list every matched collective")

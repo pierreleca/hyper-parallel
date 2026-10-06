@@ -152,3 +152,9 @@ class ProfilingConfig:
     with_modules: bool = False
     # The rank to profile, or -1 for every rank (one rank<N>_<time>_ascend_pt directory each).
     rank: int = 0
+    # The ranks to profile, when given: ``rank`` is then ignored. A trace of one step of a large model takes
+    # gigabytes per rank, so naming the few ranks a study compares keeps a profiled run off the disk's limit.
+    ranks: List[int] = field(default_factory=list)
+    # Delete the profiler's raw collection directory once it has been parsed into ASCEND_PROFILER_OUTPUT
+    # (trace_view.json and the CSVs). The raw data is several times that output and only msprof reads it.
+    data_simplification: bool = False

@@ -112,8 +112,12 @@ class _ProfilerBackend(NamedTuple):
     experimental_config: Any
 
 
-def _create_profiler_backend(trace_dir: str, global_rank: int) -> _ProfilerBackend:
-    """Create backend-specific profiler objects."""
+def _create_profiler_backend(trace_dir: str, global_rank: int, data_simplification: bool = False) -> _ProfilerBackend:
+    """Create backend-specific profiler objects.
+
+    ``data_simplification`` lets the Ascend profiler delete its raw collection directory once it has parsed it into
+    ASCEND_PROFILER_OUTPUT, which is what the trace readers use; the raw data is several times larger.
+    """
     if IS_NPU_AVAILABLE:
         profiler_module = torch_npu.profiler
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.NPU]
@@ -125,7 +129,7 @@ def _create_profiler_backend(trace_dir: str, global_rank: int) -> _ProfilerBacke
         experimental_config = torch_npu.profiler._ExperimentalConfig(  # pylint: disable=protected-access
             aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
             profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-            data_simplification=False,
+            data_simplification=data_simplification,
         )
     else:
         profiler_module = torch.profiler
@@ -160,6 +164,7 @@ def create_profiler(
     with_stack: bool,
     with_modules: bool,
     global_rank: int,
+    data_simplification: bool = False,
 ) -> Any:
     """
     Creates a profiler to record the CPU and CUDA activities. Default export to trace.json.
@@ -174,6 +179,8 @@ def create_profiler(
         record_shapes (bool): Whether to record the shapes of the tensors.
         profile_memory (bool): Whether to profile the memory usage.
         with_stack (bool): Whether to include the stack trace.
+        data_simplification (bool): Whether the Ascend profiler deletes its raw
+            collection directory once parsed (it is several times the parsed output).
     """
     copy = None
     if trace_dir.startswith("hdfs://"):
@@ -219,7 +226,7 @@ def create_profiler(
             copy(trace_file, trace_dir)
             logger.info(f"Profiling result uploaded to {trace_dir}.")  # pylint: disable=logging-fstring-interpolation
 
-    profiler_backend = _create_profiler_backend(trace_dir, global_rank)
+    profiler_backend = _create_profiler_backend(trace_dir, global_rank, data_simplification)
     schedule = _create_profiler_schedule(profiler_backend.module, start_step, end_step)
     base_profiler = profiler_backend.module.profile(
         activities=profiler_backend.activities,
