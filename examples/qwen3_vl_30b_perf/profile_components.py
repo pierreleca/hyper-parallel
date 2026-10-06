@@ -46,8 +46,8 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 
 # Run as a script, Python puts this directory first on the import path.
 from ascend_trace import (
-    SYNC_PATTERN, Event, Trace, attribute_waits, base_name, category, comm_exposure, comm_type, find_trace_files,
-    is_sync, step_breakdown, window,
+    KERNEL_PREFIX, SYNC_PATTERN, Event, Trace, attribute_waits, base_name, category, comm_exposure, comm_type,
+    find_trace_files, is_sync, step_breakdown, window,
 )
 
 # The classes of kernels, as (key, title); the first is drawn first.
@@ -95,6 +95,7 @@ MIN_DRAW_US = 1.0                # slices shorter than this are counted but not 
 MIN_STATE_US = 5.0               # on the state lane, waits and idle gaps shorter than this are not drawn
 MAX_ROWS = 8                     # overlapping collectives of one kind are spread over this many rows
 MS = 1e3
+STREAMS_LISTED = 8               # device streams named in the inventory, busiest first
 
 
 # -- intervals --------------------------------------------------------------------------------------------
@@ -341,9 +342,24 @@ def inventory(capture: Capture, signals: Signals, limit: int = 6) -> list[str]:
     streams = trace.streams()
     if streams:
         compute_label = trace.thread_label(signals.compute_key)
-        lines.append("  streams of the device: " + "; ".join(
-            f"{row['label'].split(' / ')[-1]} {row['events']:,} tasks" + (" (compute)" if row["label"] == compute_label
-                                                                          else "") for row in streams[:6]))
+        grouped = trace.by_thread()
+        lines.append("  streams of the device (tasks, aclnn kernels, busy, the task names they hold most):")
+        outside_count = outside_us = 0.0
+        for row in streams[:STREAMS_LISTED]:
+            events = grouped.get(row["key"], [])
+            common = Counter(base_name(event.name) for event in events).most_common(3)
+            aclnn = [event for event in events if event.name.startswith(KERNEL_PREFIX)]
+            if row["label"] != compute_label:
+                outside_count += len(aclnn)
+                outside_us += sum(event.dur for event in aclnn)
+            lines.append(f"    {row['label'].split(' / ')[-1]:<10} {row['events']:8,} {row['kernels']:8,} "
+                         f"{row['busy_us'] / MS:9,.0f} ms  " + ", ".join(name for name, _ in common)
+                         + ("   (compute)" if row["label"] == compute_label else ""))
+        inside = sum(1 for event in signals.compute if event.name.startswith(KERNEL_PREFIX))
+        share = outside_count / (outside_count + inside) if outside_count + inside else 0.0
+        lines.append(f"  aclnn kernels outside the compute stream: {outside_count:,.0f} of "
+                     f"{outside_count + inside:,.0f} ({share:.1%}), {outside_us / MS:,.0f} ms; the compute split "
+                     "below reads the compute stream, so anything there is work it does not count")
     per_class: dict[str, Counter] = defaultdict(Counter)
     time_of: dict[str, float] = defaultdict(float)
     count_of: dict[str, int] = defaultdict(int)

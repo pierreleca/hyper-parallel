@@ -312,7 +312,8 @@ def test_the_report_says_what_the_trace_holds_and_how_the_clocks_agree(tmp_path,
     run = _make(tmp_path)
     assert ct.main([str(run), "--rank", "3"]) == 0
     printed = capsys.readouterr().out
-    for expected in ("the trace: ", "streams of the device: ", "attention kernels (FlashAttention only): ",
+    for expected in ("the trace: ", "streams of the device (", "aclnn kernels outside the compute stream: ",
+                     "attention kernels (FlashAttention only): ",
                      "expert GEMM kernels (grouped matmul)", "collectives (hcom): alltoallv",
                      "event-record tasks: ", "profiler steps: 6",
                      "computing, by class of kernel: attention", "waiting, by what released it: ",

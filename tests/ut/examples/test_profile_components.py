@@ -155,7 +155,8 @@ def test_the_inventory_names_the_streams_the_classes_and_the_collectives(tmp_pat
     """What the trace holds, with the kernels that fell in each class, so a wrong class is easy to see."""
     capture, signals = _signals(tmp_path)
     text = "\n".join(pc.inventory(capture, signals))
-    assert "Stream 5 8 tasks (compute)" in text
+    assert "Stream 5" in text and "(compute)" in text and "EVENT_WAIT, aclnnFlashAttentionScore" in text
+    assert "aclnn kernels outside the compute stream: 0 of 5 (0.0%)" in text, "nothing of the model's compute is missed"
     assert "attention kernels (FlashAttention only): 1 kernels" in text and "aclnnFlashAttentionScore" in text
     assert "expert GEMM kernels (grouped matmul): 1 kernels" in text
     assert "collectives (hcom): alltoallv x2, allGather x1" in text
@@ -233,3 +234,18 @@ def test_the_integrated_trace_keeps_the_container_and_every_original_event(tmp_p
     pc.write_integrated(wrapped, extra, str(tmp_path / "out" / "dict.json"))
     assert _read(tmp_path / "out" / "dict.json") == {
         "traceEvents": _events() + extra, "schema": 1}
+
+
+def test_compute_kernels_on_another_stream_are_counted_as_missed(tmp_path):
+    """A stream that holds model kernels is work the compute split does not count, and the inventory says how much."""
+    events = _events() + [
+        _meta("thread_name", 2, "Stream 9", 9),
+        _x("aclnnMatmul_MatMulV2", 500, 40, 2, 9),
+        _x("NOTIFY_WAIT", 600, 200, 2, 9),
+    ]
+    path = tmp_path / "trace_view.json"
+    path.write_text(json.dumps(events))
+    capture = pc.load_capture(str(path))
+    text = "\n".join(pc.inventory(capture, pc.read_signals(capture.trace)))
+    assert "aclnn kernels outside the compute stream: 1 of 6 (16.7%), 0 ms" in text
+    assert "Stream 9" in text and "NOTIFY_WAIT" in text, "the stream is named with what it holds"

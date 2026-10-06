@@ -482,6 +482,12 @@ cluster gather $R/profile/components_full/rank6_trace_with_components_at2000ms_f
 python3 examples/qwen3_vl_30b_perf/component_trace.py path/to/trace_view.json --rank 6
 ```
 
+The device runs several streams and the compute split reads one of them, the one with the aclnn kernels. The others
+hold stream synchronisation (`NOTIFY_WAIT`, `NOTIFY_WAIT_SQE`, `EVENT_WAIT`), HCCL's own driver kernels
+(`allGatherAicpuKernel`, whose collectives are counted separately in the Communication process) and overlapped copies,
+so they carry no model compute: the inventory lists each stream with the task names it holds most and states how many
+aclnn kernels lie outside the compute stream, which should be none or nearly none.
+
 `components.txt` has two parts per rank. **THE PROFILE ALONE** says what the trace holds (the device's streams, the
 kernels that fell in each class with the names of the largest, and of the *other* class so that a name in the wrong
 class is easy to spot, the collectives, the sync tasks, the event-record tasks, the profiler steps) and, per profiled
