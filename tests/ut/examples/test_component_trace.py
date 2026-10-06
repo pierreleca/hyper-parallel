@@ -313,7 +313,7 @@ def test_the_report_says_what_the_trace_holds_and_how_the_clocks_agree(tmp_path,
     printed = capsys.readouterr().out
     for expected in ("the trace: ", "streams of the device: ", "attention kernels (FlashAttention only): ",
                      "expert GEMM kernels (grouped matmul)", "collectives (hcom): alltoallv",
-                     "event-record tasks on the device", "profiler steps: 6",
+                     "event-record tasks: ", "profiler steps: 6",
                      "computing, by class of kernel: attention", "waiting, by what released it: ",
                      "each stamp moved onto its own record task: ", "median shift +0.0 us", "wrote ",
                      "how tightly the spans bracket their kernels"):
@@ -584,3 +584,31 @@ def test_the_bracketing_says_how_tightly_a_span_holds_its_kernels():
     assert early["straddled"] == 1.0, "drawn early, every span ends while its kernel is still running"
     assert early["lead_out_us"] == -50.0 and early["shift_us"] == pytest.approx(-150.0)
     assert ct.bracketing({"attention": []}, kernels, 0.0, names=("attention",)) == {"spans": 0}
+
+
+def test_a_kernel_placed_step_says_how_near_its_stamps_fall_to_the_record_tasks(tmp_path, capsys):
+    """Without anchors the report measures why: the share of stamps near a record task, and the median distance.
+
+    A uniform shift of the tasks would simply move the offset the anchors find, so the tasks are jittered: no offset
+    then puts the stamps on them, which is the case the line has to explain.
+    """
+    run = _make(tmp_path)
+    jitter = random.Random(3)
+    _edit_traces(run, lambda event: {**event, "ts": float(event["ts"]) + jitter.uniform(-300.0, 300.0)}
+                 if event.get("name") == "EVENT_RECORD" else event)
+    finding = _run(run, "--rank", "0")[0]
+    assert "alignment" in finding and "anchored" not in finding, "the kernels had to place it"
+    near = finding["nearest_record"]["the compute stream"]
+    assert near["stamps"] > 20 and near["share"] < 0.5, "the stamps no longer are the record tasks"
+    assert near["median_us"] is not None
+    assert "why no anchor:" in capsys.readouterr().out
+
+
+def test_the_nearest_record_of_stamps_that_are_the_tasks():
+    """Stamps that are the record tasks: every one within the tolerance, a median distance of zero."""
+    marks = [[1, "fwd", 0, "in", float(t), 0] for t in range(40)]
+    tasks = [1000.0 + t * 1000.0 for t in range(40)]
+    exact = ct.nearest_record({"marks": marks}, tasks, 1000.0)
+    assert exact == {"stamps": 40, "share": 1.0, "median_us": 0.0}
+    assert ct.nearest_record({"marks": marks}, [], 1000.0)["median_us"] is None
+    assert ct.nearest_record({"marks": []}, tasks, 0.0) == {"stamps": 0, "share": 0.0, "median_us": None}

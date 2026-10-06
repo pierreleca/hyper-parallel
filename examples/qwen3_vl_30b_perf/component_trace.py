@@ -510,6 +510,30 @@ def anchor_search(record: dict, signals: Signals, low: float, high: float) -> Op
     return Anchor(best, anchored_share(stamps, records, best), len(stamps))
 
 
+def nearest_record(record: dict, records: Sequence[float], offset: float) -> dict[str, Any]:
+    """How near the recorder's stamps fall to the trace's event-record tasks at one offset.
+
+    ``share`` is the part of them within ``ANCHOR_US``; ``median_us`` the median distance to the nearest task, signed
+    by where the task sits. A share near 1 with a tiny median means the stamps ARE those tasks. A small constant
+    median with a low share means a systematic shift to correct; a large, random median means the stamps do not
+    correspond to the record tasks of this trace at all, and only the kernels can place them.
+    """
+    stamps = sorted({mark[4] * 1000.0 for mark in record["marks"]})
+    if not stamps or not records:
+        return {"stamps": len(stamps), "share": 0.0, "median_us": None}
+    distances = []
+    for stamp in stamps:
+        at = offset + stamp
+        index = bisect.bisect_left(records, at)
+        near = [records[position] - at for position in (index - 1, index) if 0 <= position < len(records)]
+        if near:
+            distances.append(min(near, key=abs))
+    if not distances:
+        return {"stamps": len(stamps), "share": 0.0, "median_us": None}
+    return {"stamps": len(stamps), "median_us": statistics.median(distances),
+            "share": sum(abs(value) <= ANCHOR_US for value in distances) / len(distances)}
+
+
 @dataclass
 class Placement:
     """A step record whose stamps were moved onto the profiler's timestamps, and how far they moved."""
@@ -880,6 +904,13 @@ def hook_part(rank: int, job: Job, signals: Optional[Signals], out: list[str], f
             out.append(f"    the step starts at {offset / 1000.0:.3f} ms on the trace (profiler step {number}), found "
                        f"on the kernels alone: score {choice.fit.score:.2f}, best elsewhere {choice.fit.elsewhere:.2f}"
                        "; the lanes are placed by that offset, not stamp by stamp")
+            for what, tasks in (("the compute stream", signals.compute_records), ("the device", signals.records)):
+                near = nearest_record(record, tasks, offset)
+                finding.setdefault("nearest_record", {})[what] = near
+                middle = "none found" if near["median_us"] is None else f"{near['median_us']:+.1f} us"
+                out.append(f"      why no anchor: of its {near['stamps']} stamps, {near['share']:.0%} fall within "
+                           f"{ANCHOR_US:g} us of an event-record task of {what} ({len(tasks):,} of them), median "
+                           f"distance {middle}")
     waits = ep_group_waits(hetero_dir, rank, step, args.ep_size)
     group = f"{rank // args.ep_size * args.ep_size}-{rank // args.ep_size * args.ep_size + args.ep_size - 1}"
     if waits is None:

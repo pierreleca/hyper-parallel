@@ -230,7 +230,10 @@ class Signals:
     all_to_all: Busy
     steps: list[tuple[int, float, float]]
     extent: tuple[float, float]
+    # Event-record tasks: the recorder's stamps are events it records on the compute stream, so those are the ones
+    # that should correspond to them one for one; the device's other streams record many more, of other events.
     records: list[float] = field(default_factory=list)
+    compute_records: list[float] = field(default_factory=list)
 
 
 def read_signals(trace: Trace, rules: Sequence[tuple[str, re.Pattern]] = ()) -> Signals:
@@ -259,9 +262,11 @@ def read_signals(trace: Trace, rules: Sequence[tuple[str, re.Pattern]] = ()) -> 
     hardware = set(trace.find_processes("Ascend Hardware"))
     record_pattern = re.compile(r"^(EVENT|NOTIFY)[ _]?RECORD", re.IGNORECASE)
     records = sorted(event.ts for event in trace.events if event.pid in hardware and record_pattern.match(event.name))
+    own = sorted(event.ts for event in compute if record_pattern.match(event.name))
     return Signals(trace, classify, key, compute, comms, {name: Busy(items) for name, items in classes.items()},
                    {name: Busy(items) for name, items in categories.items()}, Busy(busy), Busy(waits),
-                   {name: Busy(items) for name, items in comm.items()}, all_to_all, trace.steps(), extent, records)
+                   {name: Busy(items) for name, items in comm.items()}, all_to_all, trace.steps(), extent, records,
+                   own)
 
 
 # -- the numbers of a profiled step -----------------------------------------------------------------------
@@ -363,7 +368,8 @@ def inventory(capture: Capture, signals: Signals, limit: int = 6) -> list[str]:
     sync_names = Counter(re.sub(r"[ _]", "_", event.name.upper()) for event in signals.compute if is_sync(event))
     lines.append("  sync tasks on the compute stream: " + (", ".join(
         f"{name} x{count:,}" for name, count in sync_names.most_common(4)) or "none")
-        + f"; event-record tasks on the device: {len(signals.records):,}")
+        + f"; event-record tasks: {len(signals.compute_records):,} on the compute stream, "
+          f"{len(signals.records):,} on the device")
     lines.append("  profiler steps: " + (", ".join(
         f"{number} ({(end - start) / MS:,.0f} ms)" for number, start, end in signals.steps) or "none found"))
     return lines

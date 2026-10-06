@@ -159,7 +159,8 @@ def test_the_inventory_names_the_streams_the_classes_and_the_collectives(tmp_pat
     assert "attention kernels (FlashAttention only): 1 kernels" in text and "aclnnFlashAttentionScore" in text
     assert "expert GEMM kernels (grouped matmul): 1 kernels" in text
     assert "collectives (hcom): alltoallv x2, allGather x1" in text
-    assert "EVENT_WAIT x2" in text and "EVENT_RECORD x1" in text and "event-record tasks on the device: 1" in text
+    assert "EVENT_WAIT x2" in text and "EVENT_RECORD x1" in text
+    assert "event-record tasks: 1 on the compute stream, 1 on the device" in text
     assert "profiler steps: 3 (1 ms)" in text
     (tmp_path / "ruled").mkdir()
     capture, ruled = _signals(tmp_path / "ruled", pc.parse_rules(["other=FlashAttention"]))
