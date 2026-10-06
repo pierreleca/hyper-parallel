@@ -22,7 +22,9 @@
 # The runs go first, back to back, and are analysed afterwards: the devices are busy
 # only while a run trains, so the analysis (slow with profiler traces) never keeps
 # them from the next run or from somebody else. TRAIN_ONLY=1 stops after the last run;
-# --resume then does the analysis whenever it suits.
+# --resume then does the analysis whenever it suits. ANALYSE_EACH=1 does the opposite,
+# analysing every run before the next one trains: the devices idle meanwhile, but only
+# one run's traces sit on the nodes at a time, which a profiled campaign may need.
 #
 # --resume carries on a campaign that was interrupted: a run with a recorded state
 # (<run>/state: trained, finished or FAILED) is kept (a trained one is analysed);
@@ -68,6 +70,7 @@
 #   OUT_BASE [/home/pl/a3_runs]   RUNS_DIR [/home/pl/runs/qwen3_vl_30b_perf]
 #   INTERVAL [30]   RUN_TIMEOUT [7200]   CLUSTER [cluster], e.g. "cluster -c other.env"
 #   TRAIN_ONLY [0]: 1 stops after the last run has trained; analyse later with --resume
+#   ANALYSE_EACH [0]: 1 analyses each run before the next one trains (one run's traces at a time)
 #   LOG_WAIT [45]: seconds of `cluster logs` captured per run into <run>/log.txt (the kit
 #   follows the logs from their first line and never stops on its own); the summary
 #   quotes their first error and, with debug.check_nan_inf, the first non-finite gradient.
@@ -266,6 +269,11 @@ if [[ "$MODE" != summarize ]]; then
       echo "=== ${words[0]}: kept ($(run_state "${words[0]}" | cut -c1-80))"; continue
     fi
     train_run "${words[@]}"
+    # The traces of a profiled run are gigabytes per rank: analysing it now leaves only one run's traces on
+    # the nodes, at the price of the devices idling until the next run starts.
+    if [[ "${ANALYSE_EACH:-0}" == 1 && "$(run_state "${words[0]}")" == trained ]]; then
+      analyse_run "${words[0]}"
+    fi
   done
   if [[ "${TRAIN_ONLY:-0}" == 1 ]]; then
     echo "TRAIN_ONLY: the devices are free; analyse with: $0 --resume $OUT"

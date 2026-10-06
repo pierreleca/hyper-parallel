@@ -69,7 +69,8 @@ sed -n '/^CEILINGS/,/data loading/p' $C/both/report.txt $C/fixed/report.txt
 
 # 6. optional: balanced order measured; kernel-level check (then delete the traces)
 examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_balance_32dev.sh
-cluster exec 'df -h /home/pl | tail -1'      # the traces are gigabytes per profiled rank: check the disk first
+cluster exec 'df -h /home/pl | tail -1'      # a trace per rank, gigabytes each: check the disk first
+# ANALYSE_EACH=1 keeps one run's traces on the nodes at a time, if the disk is short
 examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_profile_32dev.sh
 C=$(ls -dt /home/pl/a3_runs/hetero_profile_32dev_* | head -1)
 cluster exec 'du -sh /home/pl/runs/qwen3_vl_30b_perf/*_profile_*/profile 2>/dev/null; df -h /home/pl | tail -1'
@@ -107,7 +108,8 @@ a profiled run are slow) never delays the next run or keeps the devices from som
 `=== <run> ...` for each run as it starts, then `=== analysing <run>` for each once they have all trained. The analysis
 needs the nodes of the runs (the traces stay there), not their devices. `TRAIN_ONLY=1 hetero_campaign.sh <plan>` stops
 after the last run, with each run recorded as `trained`; `hetero_campaign.sh --resume $C` then does the analysis
-whenever it suits.
+whenever it suits. `ANALYSE_EACH=1` does the opposite and analyses each run before the next one trains: the devices
+idle meanwhile, but only one run's traces sit on the nodes, which a profiled campaign may need.
 
 The campaign's own terminal prints `=== <run> (<run id>): <overrides>` when a run starts, then nothing until it ends
 (it waits for the devices to be free, then polls the run every 30 s); the same text goes to `$C/campaign.log`. From a
@@ -224,7 +226,7 @@ examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/h
 | `hetero_probe_32dev.sh` | recompute `full` / `selective` / `off` at 48, 24, 12 layers | `hetero_both_n640` |
 | `hetero_data_32dev.sh` | the six datasets, 14 steps each | all six |
 | `hetero_balance_32dev.sh` | `both` and `longtail` in random and balanced order, and with two micro-batches per rank | `both`, `longtail` |
-| `hetero_profile_32dev.sh` | the Ascend profiler for two steps on four ranks (two per node), on `fixed` and `both` | `fixed`, `both` |
+| `hetero_profile_32dev.sh` | the Ascend profiler on every rank for two steps, on `fixed` and `both` | `fixed`, `both` |
 | `hetero_baseline_32dev.sh` | twin runs of `fixed` and `both` (the noise floor), with module hooks on, and with the recorder off | `fixed`, `both` |
 | `hetero_ab_32dev.sh` | base, candidate, base, candidate with the light recorder, then one hooked pair; `IDEA=<flags>` | the dataset you pass |
 
@@ -416,14 +418,20 @@ measured and what is derived from it:
 | layer glue | a layer's span minus attention, experts and exchange: norms, residuals | derived |
 | gaps | from one module's exit to the next one's entry: the wait for the weights, launch gaps | derived |
 
-**What a profiled run costs, and what it is good for.** The profiler writes a trace per profiled rank, and one step of
-this model takes gigabytes, so `plans/hetero_profile_32dev.sh` names four ranks (`profiling.ranks=[6,13,22,29]`: two per
-node, two per expert-parallel group) and lets the profiler drop its raw collection directory once parsed
-(`profiling.data_simplification`, in the YAML). `profiling.ranks=[]` with `profiling.rank=-1` profiles all 32 instead,
-which fills a node's disk. Because only some ranks carry the profiler's overhead, **the timing of a profiled run is not
-a measurement**: the profiled ranks are slower, so they are the last to arrive at every collective and the others wait
-for them. Read the structure from it (which kernels run inside which span, what the stream does there), and the timings
-from the unprofiled runs. Check `df -h` before, and delete the traces once read.
+**What a profiled run costs.** The profiler writes one trace per profiled rank on the node that holds it, and one step
+of this model takes gigabytes, so `plans/hetero_profile_32dev.sh` (`profiling.rank=-1`, every rank) leaves 16 traces per
+node per run. It profiles every rank on purpose: the data-imbalance question is a comparison between ranks, and the
+matched all-to-alls of an expert-parallel group and the per-rank compute and wait of `trace.txt` need all of them. The
+overhead is then the same on every rank, so **the ranks stay comparable with each other**, while the absolute step time
+is inflated and is not comparable with an unprofiled run; take the step times from the unprofiled plans.
+
+Three levers when the disk is short, in the order to reach for them: `profiling.data_simplification` (already on in the
+YAML) lets the profiler delete its raw collection directory once it has parsed it into `ASCEND_PROFILER_OUTPUT`, which
+is all the reports read; `ANALYSE_EACH=1` makes the campaign analyse each run before the next one trains, so only one
+run's traces are on the nodes at a time; `--profiling.ranks=[6,13,22,29]` profiles those four ranks instead of all 32
+(two per node, two per expert-parallel group: the trace report can still match their all-to-alls and the component
+trace still draws two per node), at the cost of the cross-rank picture and of a run whose ranks no longer carry the
+same overhead. Check `df -h /home/pl` before launching, `du -sh` after, and delete the traces once read.
 
 `component_trace.py` gives the profiler's own trace of a rank back with those components added, to check them by eye.
 For each rank it writes **one file: the original `trace_view.json` with every event untouched** (host and device,
