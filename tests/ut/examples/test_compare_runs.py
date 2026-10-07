@@ -76,7 +76,8 @@ def test_a_20_percent_faster_candidate_on_the_same_samples_meets_the_target(tmp_
     assert summary["paired"]["steps"] == 11
     assert summary["paired"]["speedup"] == pytest.approx(0.2822, abs=0.03)
     assert summary["verdict"] == "MET"
-    assert summary["numerics"]["loss"]["ok"] and summary["numerics"]["grad_norm"]["ok"]
+    assert summary["numerics"]["loss"]["ok"]
+    assert summary["numerics"]["grad_norm"]["ok"] is None, "the gradient norm is reported, not judged"
     assert any("verdict against +20%" in line for line in lines)
 
 
@@ -158,3 +159,20 @@ def test_components_are_compared_when_both_arms_hooked_the_modules(tmp_path):
     assert "components" in summary
     assert any("where the time moved" in line for line in lines)
     assert summary["components"]["baseline"]["per_1k"]["text_layer"] > 0
+
+
+def test_the_gradient_norm_is_reported_but_never_fails_a_candidate(tmp_path):
+    """Two runs of one configuration differ by about 10% on it, so it informs and does not judge."""
+    base = _write(tmp_path / "base")
+    cand = _write(tmp_path / "cand", scale=0.78)
+    for path in (cand / "rank000.jsonl",):                      # move the candidate's gradient norms far apart
+        lines = [json.loads(line) for line in path.read_text().splitlines()]
+        for record in lines[1:]:
+            record["grad_norm"] = 1.5
+        path.write_text("\n".join(json.dumps(line) for line in lines) + "\n")
+    lines, summary = compare.compare(compare.Arm([str(base)], 1), compare.Arm([str(cand)], 1), draws=100)
+    assert summary["numerics"]["grad_norm"]["mean"] > 0.1, "a 50% difference is seen"
+    assert summary["numerics"]["grad_norm"]["ok"] is None
+    assert any("information only" in line for line in lines)
+    assert not any("gradient norm" in line and "DIFFERS" in line for line in lines)
+    assert summary["verdict"] == "MET", "the speedup still stands on its own"

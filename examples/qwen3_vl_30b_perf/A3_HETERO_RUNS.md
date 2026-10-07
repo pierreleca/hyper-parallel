@@ -363,9 +363,11 @@ with module hooks. `compare_runs.py` pools the repeats and prints
 - the *paired* speedup when both arms ran the same samples in the same steps (matched by each micro-batch's
   fingerprint): the variance the data itself brings drops out, and this interval decides the verdict against +20%:
   **MET** if its lower end clears the target, **NOT MET** if its upper end falls short, **INCONCLUSIVE** otherwise;
-- the loss and gradient norm of the paired steps (a speedup that moved them is not a speedup), the memory peak, and
-  with the hooked pair the change of every component per 1k tokens, the custom components the idea added, and the
-  busiest-over-mean of the ranks before and after.
+- the loss of the paired steps, which a speedup must not move, the memory peak, and with the hooked pair the change
+  of every component per 1k tokens, the custom components the idea added, and the busiest-over-mean of the ranks
+  before and after. The gradient norm is printed beside the loss and **decides nothing**: the twin runs of
+  `hetero_baseline_32dev.sh` differ by 9-13% on it on average and up to 96% on a step, while their loss differs by
+  0.2-0.5%, because the MoE routing and the reduction order are not deterministic (`enable_full_determinism: false`).
 
 An idea that regroups samples (a different order) changes which samples share a step: the arms are then unpaired, the
 comparison rests on work per second, and the loss is compared as a curve over consumed samples, not step by step.

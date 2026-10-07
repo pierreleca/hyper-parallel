@@ -26,7 +26,9 @@ pools the repeats of each arm, and reports
   visual_tokens``, so an arm that was handed other samples (a regrouped order) is not credited for lighter ones;
 - **where the time went:** with module hooks on in both arms, each component's cost per 1k tokens (per 1k patches
   for the vision tower), the imbalance between ranks, and what the new design adds (the ``custom`` part);
-- **numerics:** the loss and the gradient norm of the paired steps; a speedup that moved them is not a speedup;
+- **numerics:** the loss of the paired steps, which a speedup must not move; the gradient norm is reported beside it
+  but decides nothing, because two runs of one configuration differ by about 10% on it (the MoE routing and the
+  reduction order are not deterministic), measured by the twin runs of ``plans/hetero_baseline_32dev.sh``;
 - **memory:** the peak allocated bytes.
 
 A log of the trainer (``log.txt`` of a campaign run) stands in for an arm that ran without the recorder: it gives
@@ -281,6 +283,11 @@ def _component_costs(arm: Arm, skip: int) -> Optional[dict[str, Any]]:
             "excess_share": mean([i["excess_share_of_step"] for i in imbalance])}
 
 
+# (field, label, whether it decides the verdict). The gradient norm varies by about 10% between two runs of one
+# configuration on a MoE model, so it is reported and not judged.
+QUANTITIES = (("loss", "loss", True), ("grad_norm", "gradient norm", False))
+
+
 def _numerics(baseline: Arm, candidate: Arm, tolerance: float, out: list[str]) -> dict[str, Any]:
     """Compare loss and gradient norm over the steps both arms ran on the same samples."""
     def lookup(arm: Arm) -> dict[Any, list[dict]]:
@@ -298,19 +305,25 @@ def _numerics(baseline: Arm, candidate: Arm, tolerance: float, out: list[str]) -
         out.append("  numerics: the arms ran no step on the same samples, so loss and gradient norm are not "
                    "comparable step by step; compare the loss curves over consumed samples")
         return summary
-    for quantity, label in (("loss", "loss"), ("grad_norm", "gradient norm")):
+    for quantity, label, decides in QUANTITIES:
         differences = []
         for key in shared:
             base = [s[quantity] for s in first[key] if s[quantity] is not None]
             cand = [s[quantity] for s in second[key] if s[quantity] is not None]
             if base and cand:
                 differences.append(abs(mean(cand) - mean(base)) / max(abs(mean(base)), 1e-12))
-        if differences:
-            worst, average = max(differences), mean(differences)
-            verdict = "ok" if worst <= tolerance else "DIFFERS"
-            out.append(f"  numerics, {label}: {len(differences)} paired steps, relative difference mean "
-                       f"{average:.2%}, worst {worst:.2%} (tolerance {tolerance:.0%}) -> {verdict}")
+        if not differences:
+            continue
+        worst, average = max(differences), mean(differences)
+        head = (f"  numerics, {label}: {len(differences)} paired steps, relative difference mean "
+                f"{average:.2%}, worst {worst:.2%}")
+        if decides:
+            out.append(f"{head} (tolerance {tolerance:.0%}) -> {'ok' if worst <= tolerance else 'DIFFERS'}")
             summary[quantity] = {"mean": average, "worst": worst, "ok": worst <= tolerance}
+        else:
+            out.append(f"{head} (information only: two runs of one configuration differ about as much on this "
+                       "model, so it cannot certify equivalence; the loss is the check)")
+            summary[quantity] = {"mean": average, "worst": worst, "ok": None}
     return summary
 
 
