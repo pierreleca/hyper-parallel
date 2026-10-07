@@ -90,14 +90,21 @@ MS_PER_TOKEN_UNIT = 1e3
 class Run:
     """The per-rank records of one run."""
 
-    def __init__(self, directory: str, skip: int = 0) -> None:
-        """Read every ``rank*.jsonl`` under ``directory``, dropping the first ``skip`` steps of each rank."""
+    def __init__(self, directory: str, skip: int = 0,
+                 steps_range: tuple[int, int] | None = None) -> None:
+        """Read every ``rank*.jsonl`` under ``directory``, keeping part of each rank's steps.
+
+        ``steps_range`` keeps the recorded steps whose own index is in it, both ends included, which
+        is what naming a range of training steps means and does not depend on the recorder's
+        ``start_step``; ``skip`` drops that many steps from the start of each rank instead.
+        """
         paths = sorted(glob.glob(os.path.join(directory, "rank*.jsonl")))
         if not paths:
             raise SystemExit(f"no rank*.jsonl files in {directory}")
         self.directory = directory
         self.headers: dict[int, dict] = {}
         self.steps: dict[int, list[dict]] = {}
+        recorded: set[int] = set()
         for path in paths:
             with open(path, encoding="utf-8") as stream:
                 lines = [json.loads(line) for line in stream if line.strip()]
@@ -112,8 +119,16 @@ class Run:
                     if module["id"] not in known:
                         lines[0]["modules"].append(module)
                         known.add(module["id"])
-            self.steps[rank] = steps[skip:]
+            recorded.update(record["step"] for record in steps)
+            if steps_range is None:
+                self.steps[rank] = steps[skip:]
+            else:
+                first, last = steps_range
+                self.steps[rank] = [record for record in steps if first <= record["step"] <= last]
         self.ranks = sorted(self.headers)
+        if steps_range is not None and not any(self.steps.values()):
+            have = f"recorded {min(recorded)} to {max(recorded)}" if recorded else "nothing recorded"
+            raise SystemExit(f"{directory}: no step in {steps_range[0]}:{steps_range[1]} ({have})")
         self.synthetic = any(header.get("time_source") == "synthetic" for header in self.headers.values())
 
     @property
@@ -1347,15 +1362,17 @@ def write_csv(path: str, rows: list[dict], models: dict[str, dict]) -> None:
 
 
 def analyse(directory: str, skip: int, ep_size: int, stages: Sequence[int], top: int,
-            out_dir: Optional[str], ep_dir: Optional[str] = None) -> tuple[list[str], dict[str, Any]]:
+            out_dir: Optional[str], ep_dir: Optional[str] = None,
+            steps_range: tuple[int, int] | None = None) -> tuple[list[str], dict[str, Any]]:
     """Run every report on one run; return the text lines and the JSON-friendly summary.
 
     ``ep_dir`` is the EP instrument's record directory; it adds the all-to-all and expert-balance ceilings.
     """
-    run = Run(directory, skip)
+    run = Run(directory, skip, steps_range)
     rows = build_rows(run)
     if not rows:
-        raise SystemExit(f"{directory}: no micro-batch record after skipping {skip} steps")
+        kept = f"in steps {steps_range[0]}:{steps_range[1]}" if steps_range else f"after skipping {skip} steps"
+        raise SystemExit(f"{directory}: no micro-batch record {kept}")
     out: list[str] = []
     if run.synthetic:
         out += ["*" * 100,
@@ -1447,6 +1464,9 @@ def main() -> int:
     parser.add_argument("run", nargs="*",
                         help="run directories (each holds rank*.jsonl, or a hetero/ directory of them)")
     parser.add_argument("--skip", type=int, default=0, help="recorded steps to drop from the start of each rank")
+    parser.add_argument("--steps", default=None, metavar="FIRST[:LAST]",
+                        help="keep the training steps in this range, both ends included, instead of --skip; "
+                             "a step is numbered from 1, so the epochs of a two-epoch run are 1:20 and 21:40")
     parser.add_argument("--ep-size", type=int, default=16, help="ranks per expert-parallel group (consecutive ranks)")
     parser.add_argument("--pp-stages", type=int, nargs="+", default=[2, 4, 8],
                         help="stage counts of the pipeline what-if")
@@ -1458,12 +1478,23 @@ def main() -> int:
     args = parser.parse_args()
     if not args.run:
         parser.error("give at least one run directory")
+    steps_range = None
+    if args.steps is not None:
+        first, _, last = args.steps.partition(":")
+        try:
+            steps_range = (int(first), int(last) if last else int(first))
+        except ValueError:
+            parser.error(f"--steps takes FIRST[:LAST] of integers, not {args.steps!r}")
+        if steps_range[0] > steps_range[1]:
+            parser.error(f"--steps {args.steps}: the first step is after the last")
+        if args.skip:
+            parser.error("give --steps or --skip, not both")
     if args.sweep:
         summaries = []
         for directory in args.run:
             records = _resolve(directory)
             _, summary = analyse(records, args.skip, args.ep_size, args.pp_stages, args.top, None,
-                                 args.ep_dir or default_ep_dir(records))
+                                 args.ep_dir or default_ep_dir(records), steps_range)
             summaries.append(summary)
         lines: list[str] = []
         report_sweep(summaries, lines)
@@ -1473,7 +1504,7 @@ def main() -> int:
         records = _resolve(directory)
         out_dir = args.out_dir or default_out_dir(records)
         lines, _ = analyse(records, args.skip, args.ep_size, args.pp_stages, args.top, out_dir,
-                           args.ep_dir or default_ep_dir(records))
+                           args.ep_dir or default_ep_dir(records), steps_range)
         print("\n".join(lines))
     return 0
 

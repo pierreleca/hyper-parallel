@@ -63,6 +63,8 @@ C=$(ls -dt /home/pl/a3_runs/hetero_baseline_32dev_* | head -1); sed -n '/^A\/B/,
 
 # 5. data ladder: size the imbalance, read the ceilings
 examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_data_32dev.sh
+# or, for equal consumed work and a warm-up that can be measured ("Two epochs"), ~40 min longer:
+# examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/hetero_data2ep_32dev.sh
 C=$(ls -dt /home/pl/a3_runs/hetero_data_32dev_* | head -1)
 sed -n '/^SWEEP/,/^$/p' $C/SUMMARY.txt
 sed -n '/^CEILINGS/,/data loading/p' $C/both/report.txt $C/fixed/report.txt
@@ -100,7 +102,8 @@ cluster status; cluster logs; cluster kill
 
 Runs per plan: `hetero_smoke_32dev.sh` 1 (8 steps); `hetero_baseline_32dev.sh` 6 (20 steps each, in the order
 `both_a`, `fixed_a`, `both_b`, `fixed_b`, `both_hooks`, `both_off`) and 4 comparisons made afterwards on the control
-node; `hetero_data_32dev.sh` 6 (14 steps); `hetero_balance_32dev.sh` 6 (20 and 10 steps); `hetero_profile_32dev.sh` 2
+node; `hetero_data_32dev.sh` 6 (14 steps); `hetero_data2ep_32dev.sh` 6 (40 steps, two epochs);
+`hetero_balance_32dev.sh` 6 (20 and 10 steps); `hetero_profile_32dev.sh` 2
 (8 steps, of which 2 are profiled);
 `hetero_probe_32dev.sh` 4; `hetero_ab_32dev.sh` 6 (20 steps). They run one after the other, and **all the runs go
 first, the analysis afterwards**: the devices are busy only while a run trains, and the analysis (the trace reports of
@@ -225,6 +228,7 @@ examples/qwen3_vl_30b_perf/hetero_campaign.sh examples/qwen3_vl_30b_perf/plans/h
 | `hetero_smoke_32dev.sh` | one 8-step run, the whole model, the `both` dataset | `hetero_both_n640` |
 | `hetero_probe_32dev.sh` | recompute `full` / `selective` / `off` at 48, 24, 12 layers | `hetero_both_n640` |
 | `hetero_data_32dev.sh` | the six datasets, 14 steps each | all six |
+| `hetero_data2ep_32dev.sh` | the six datasets, two whole epochs each, the second reported | all six |
 | `hetero_balance_32dev.sh` | `both` and `longtail` in random and balanced order, and with two micro-batches per rank | `both`, `longtail` |
 | `hetero_profile_32dev.sh` | the Ascend profiler on every rank for two steps, on `fixed` and `both` | `fixed`, `both` |
 | `hetero_baseline_32dev.sh` | twin runs of `fixed` and `both` (the noise floor), with module hooks on, and with the recorder off | `fixed`, `both` |
@@ -237,18 +241,75 @@ decides how large a difference counts), then the data ladder.
 
 The same run by hand, for one configuration (the campaign passes the three output directories for you):
 
+Nothing is written into the checkout: the code travels there as a zip and a deploy deletes the directory
+first, so a record or a report left inside it is lost on the next deploy and dirties the branch meanwhile.
+Records stay on the nodes under `RUNS_DIR` (`/home/pl/runs/qwen3_vl_30b_perf`), gathered records and reports
+go on the control node under `OUT_BASE` (`/home/pl/a3_runs`), and both paths are absolute. The scripts follow:
+`analyze_hetero.py` writes `analysis_hetero` beside the records it was given, and `--sweep` writes nothing.
+
 ```bash
-R=/home/pl/runs/qwen3_vl_30b_perf/mine
+R=/home/pl/runs/qwen3_vl_30b_perf/mine    # the records, on the nodes
+L=/home/pl/a3_runs/mine                   # where they are read, on the control node, outside the checkout
 cluster torchrun scripts/train_vl.py examples/qwen3_vl_30b_perf/train_32dev_a3_hetero.yaml \
   --hetero_profile.output_dir=$R/hetero --ep_instrument.output_dir=$R/instrument --training.train_iters=14
-cluster gather $R/hetero $R/instrument ./a3_runs
-mkdir -p ./a3_runs/mine/hetero && cp ./a3_runs/node*/hetero/rank*.jsonl ./a3_runs/mine/hetero/
-python examples/qwen3_vl_30b_perf/analyze_hetero.py ./a3_runs/mine/hetero
-python examples/qwen3_vl_30b_perf/analyze_hetero.py --sweep ./a3_runs/*/hetero      # one row per run
+cluster gather $R/hetero $R/instrument $L                                  # one directory per node
+mkdir -p $L/hetero && cp $L/node*/hetero/rank*.jsonl $L/hetero/            # the 32 ranks in one directory
+python3 examples/qwen3_vl_30b_perf/analyze_hetero.py $L/hetero
+python3 examples/qwen3_vl_30b_perf/analyze_hetero.py --sweep /home/pl/a3_runs/*/hetero   # one row per run
 ```
 
 `analyze_hetero.py` needs nothing beyond the standard library and writes `microbatches.csv` (one line per
 rank, step and micro-batch: the sample's workload and the time of each component) next to its JSON, for plots.
+
+### Two epochs, and why the ladder is worth running that way
+
+A dataset holds 640 samples, 20 steps of 32. `hetero_data_32dev.sh` runs 14 steps, so it consumes 448 of them
+and the six scenarios do not consume the same work: measured, their means span 7954 to 8150 tokens, 1.5%, and
+`both` drew 1.5% heavier than `fixed`. The step times then have to be divided by what each run actually carried
+(the ladder's +83% becomes +81%), and `natural`, which nothing rescales, cannot be compared at all without it.
+
+`hetero_data2ep_32dev.sh` runs **two whole epochs** instead and reports the second. Three properties follow from
+the sampler, and none of them needs a code change:
+
+- `len(dataloader)` is `640 / (micro_batch_size x dp_size)` = 20, so `train_steps` is 20 and `train_iters=40`
+  is exactly two epochs. Nothing is dropped and nothing is partial.
+- a whole epoch consumes all 640 samples, so the consumed work **is** the dataset's mean, and every scenario was
+  built to the same mean. Equal work by construction, no normalisation, and `natural` joins the ladder.
+- the `single` sampler is sequential and `index_mapping` is `None`, so `set_epoch` only rewinds
+  `consumed_samples`: epoch 2 replays epoch 1 sample for sample, and step `20 + k` carries the same 32 samples
+  as step `k`. Comparing the epochs measures the warm-up on identical data, which no amount of `start_step`
+  can do.
+
+A recorded step is numbered `global_step + 1`, so a 40-step run records steps **1 to 40**, epoch 1 is **1 to
+20** and epoch 2 is **21 to 40**. The plan records from step 1 on both recorders, and that is what keeps the two
+concerns from cancelling each other: at the configuration's own `start_step: 3` the first steps of a run are
+never recorded, so epoch 1 is incomplete in the records and any skip that clears the epoch boundary has to eat
+into epoch 2 -- which throws away the equal work the second epoch was for. From 1 everything is recorded, and
+`SKIP=20` drops epoch 1 whole and keeps epoch 2 whole: all 20 steps, all 640 samples, nothing dropped inside the
+epoch that is measured. The cost is two extra recorded steps per run, a few hundred device events. `start_step:
+0` is rejected by the configuration, and rightly: the step counter starts at 1, so that window could never open.
+
+Step 21 opens the second epoch and is kept. Keeping it is sound: a new epoch calls `iter(train_dataloader)`,
+which respawns the 4 data-worker processes per rank, but that cost falls *between* steps, and a step is timed by
+its own device span -- `step_ms` and `inter_step_ms` are separate, and the report prints the host gap as its own
+column. Check it anyway on the first run: `step <mean> ms (steps <min> to <max>)` and `step_ms_cv` would show
+step 21 as an outlier, and the gap column would show the respawn.
+
+The warm-up is then read from the records already gathered, at no device cost. `--steps FIRST:LAST` keeps the
+training steps in a range, both ends included, and names the epochs directly:
+
+```bash
+C=$(ls -dt /home/pl/a3_runs/hetero_data2ep_32dev_* | head -1)
+A=examples/qwen3_vl_30b_perf/analyze_hetero.py
+python3 $A --sweep --steps 21:40 $C/*/hetero    # epoch 2 entire: what the plan reports
+python3 $A --sweep --steps  1:20 $C/*/hetero    # epoch 1 entire: the same samples, warm-up included
+python3 $A --sweep --steps  1:40 $C/*/hetero    # both epochs
+```
+
+The two epochs run the same 640 samples in the same order, so the first two tables differ by the warm-up and by
+nothing else. If they agree to better than the noise floor (0.1%), `start_step 3` was always enough and the
+14-step ladder needed no warm-up correction, leaving the epochs worth it for the equal work alone. If they
+disagree, the difference *is* the warm-up, and epoch 2 is the number to quote.
 
 ## Reading the report
 

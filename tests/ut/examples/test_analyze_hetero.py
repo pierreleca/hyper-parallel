@@ -117,8 +117,11 @@ def _record(ids: dict, step: int, batch: dict, scale: float = 1.0) -> dict:
 
 
 def _write_run(directory: pathlib.Path, ranks: int = 4, steps: int = 8, speeds: dict = None, seed: int = 0,
-               shared: bool = False) -> dict:
-    """Write rank files for a run; return the module ids. With ``shared`` every rank of a step gets the same sample."""
+               shared: bool = False, first_step: int = 1) -> dict:
+    """Write rank files for a run; return the module ids. With ``shared`` every rank of a step gets the same sample.
+
+    ``first_step`` numbers the first recorded step, as the recorder's ``start_step`` does.
+    """
     rng = random.Random(seed)
     modules = _modules()
     ids = {
@@ -129,7 +132,7 @@ def _write_run(directory: pathlib.Path, ranks: int = 4, steps: int = 8, speeds: 
     for rank in range(ranks):
         lines = [{"kind": "header", "rank": rank, "world_size": ranks, "host": "h", "device_type": "npu",
                   "time_source": "device", "spatial_merge_size": 2, "modules": modules}]
-        for step in range(1, steps + 1):
+        for step in range(first_step, first_step + steps):
             if shared:
                 rng = random.Random(seed * 1000 + step)
             tokens = rng.randint(1000, 9000)
@@ -297,3 +300,46 @@ def test_sweep_rows_line_up_runs(tmp_path):
     report.report_sweep(summaries, lines)
     assert len(lines) == 4 and "fixed" in lines[2] and "skewed" in lines[3]
     assert report.sweep_row(summaries[1])[4] > report.sweep_row(summaries[0])[4]
+
+
+def test_steps_range_keeps_the_named_training_steps(tmp_path):
+    """``steps_range`` keeps the steps whose own index is in it, both ends included."""
+    _write_run(tmp_path, ranks=3, steps=8)
+    run = report.Run(str(tmp_path), steps_range=(3, 5))
+    assert sorted(run.steps) == [0, 1, 2]
+    for rank in run.ranks:
+        assert [record["step"] for record in run.steps[rank]] == [3, 4, 5]
+
+
+def test_steps_range_does_not_depend_on_where_recording_started(tmp_path):
+    """A range names training steps, so a recorder that skipped the first steps selects the same ones."""
+    _write_run(tmp_path / "from_one", ranks=2, steps=12, first_step=1)
+    _write_run(tmp_path / "from_four", ranks=2, steps=9, first_step=4)
+    for name in ("from_one", "from_four"):
+        run = report.Run(str(tmp_path / name), steps_range=(8, 12))
+        assert [record["step"] for record in run.steps[0]] == [8, 9, 10, 11, 12]
+
+
+def test_steps_range_and_skip_select_differently(tmp_path):
+    """``skip`` counts from the start of the records, a range names the steps; they are not the same."""
+    _write_run(tmp_path, ranks=1, steps=10, first_step=4)
+    by_skip = [record["step"] for record in report.Run(str(tmp_path), skip=4).steps[0]]
+    by_range = [record["step"] for record in report.Run(str(tmp_path), steps_range=(4, 13)).steps[0]]
+    assert by_skip == [8, 9, 10, 11, 12, 13]
+    assert by_range == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+
+
+def test_steps_range_outside_the_run_says_what_was_recorded(tmp_path):
+    """An empty selection fails with the range the records do hold, not an empty report."""
+    _write_run(tmp_path, ranks=2, steps=6, first_step=1)
+    with pytest.raises(SystemExit, match="no step in 50:60 .recorded 1 to 6."):
+        report.Run(str(tmp_path), steps_range=(50, 60))
+
+
+def test_analyse_over_one_epoch_of_a_two_epoch_run(tmp_path):
+    """The reports of a named epoch cover its steps alone, whichever epoch is asked for."""
+    _write_run(tmp_path / "hetero", ranks=4, steps=12, first_step=1)
+    first = report.analyse(str(tmp_path / "hetero"), 0, 4, [2], 3, None, None, (1, 6))[1]
+    second = report.analyse(str(tmp_path / "hetero"), 0, 4, [2], 3, None, None, (7, 12))[1]
+    assert first["overview"]["steps"] == 6 and second["overview"]["steps"] == 6
+    assert first["overview"]["step_ms"] != second["overview"]["step_ms"]
