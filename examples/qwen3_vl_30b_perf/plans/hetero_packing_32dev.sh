@@ -1,47 +1,55 @@
-# What packing is worth. Both arms put two samples on every rank. The baseline pads them into two rows
-# of the longer one's length; the candidate concatenates them into one row and tells attention where the
-# boundary is. Same samples, same step, fewer tokens.
+# What packing is worth. Each rank takes samples until it holds a token budget, instead of taking one
+# sample whatever its length, so a rank's unit of work stops being a sample and becomes a budget.
 #
-#   examples/qwen3_vl_30b_perf/prepare_hetero_data.py --scenario both --num-samples 640 \
-#     --mean-len 4096 --max-len 8192 --mean-visual 1024 \
-#     --output-dir /home/pl/data/qwen3_vl_30b_perf/hetero_short_n640 \
-#     --processor-path /home/pl/Qwen3-VL-30B-A3B-Instruct
-#   DATASET=short examples/qwen3_vl_30b_perf/hetero_campaign.sh plans/hetero_packing_32dev.sh
+# This plan runs the PACKED arm. Its baseline is the unpacked ladder on the same dataset, which a
+# campaign of its own produces, because a campaign carries one CONFIG and the two arms need two:
+# _target_ cannot be changed from the command line, so packing lives in its own configuration file.
 #
-# Why a shorter corpus, and why only two samples a rank. Peak memory is linear in the tokens one rank
-# holds, about 6.7 GiB plus 1.89 per thousand tokens, and a rank has 61.3. Packing does not reduce the
-# token count, it removes the padding, so both arms must fit:
+#   # the baseline, with the ordinary configuration
+#   DATASET=both examples/qwen3_vl_30b_perf/hetero_campaign.sh plans/hetero_baseline_32dev.sh
 #
-#   two packed samples of mean 4096      ~8200 tokens -> ~22 GiB
-#   two padded samples, worst case 8192 ~16400 tokens -> ~38 GiB
-#   four padded samples, worst case     ~32800 tokens -> ~69 GiB, over the die
+#   # this arm
+#   DATASET=both examples/qwen3_vl_30b_perf/hetero_campaign.sh plans/hetero_packing_32dev.sh
 #
-# So four samples a rank cannot be padded at this length, and the full-length corpus cannot be packed two
-# at a time either. Raise the count only with the length lowered to match.
+#   # then join them: the baseline plan's both_a and both_b are the unpacked repeats on this dataset
+#   python examples/qwen3_vl_30b_perf/compare_runs.py \
+#     --baseline  /home/pl/a3_runs/<baseline campaign>/both_a/hetero \
+#                 /home/pl/a3_runs/<baseline campaign>/both_b/hetero \
+#     --candidate /home/pl/a3_runs/<this campaign>/packed_1/hetero \
+#                 /home/pl/a3_runs/<this campaign>/packed_2/hetero
 #
-# This comparison is not paired. The packed row is one sequence with one fingerprint where the padded arm
-# has two, so compare_runs.py falls back to the rate over the whole run and the interval is the wide one.
-# Run hetero_baseline_32dev.sh on the same dataset first to know what that interval is.
+# NOT paired. A packed row is one sequence with one fingerprint where the unpacked arm has one per
+# sample, so compare_runs.py cannot match the steps and reports work per second with the wide
+# interval. Run plans/hetero_baseline_32dev.sh first so that interval is known.
 #
-# Correctness is not what this measures: examples/qwen3_vl_30b_perf/check_packing.py proves on the host
-# that a packed row gives the same logits as the documents run alone. What the cluster adds is whether the
-# Ascend variable-length kernel agrees, which shows up as a loss that tracks the baseline's or does not.
-CONFIG=examples/qwen3_vl_30b_perf/train_32dev_a3_hetero.yaml
-DATASET="${DATASET:-short}"
-SAMPLES_PER_RANK="${SAMPLES_PER_RANK:-2}"
+# What to read in the report, beyond the step time. The recorder now writes, per row, how many
+# documents it held, the shortest and longest of them, and the pairs attention really scored. The
+# number to watch is the drop in busiest/mean: unpacked, a step costs its longest sample, so on a
+# corpus of this spread the busiest die does about twice the mean die's work. Packed, every die runs
+# about one budget, and what is left is the packing remainder.
+#
+# Correctness is not what this measures. examples/qwen3_vl_30b_perf/check_packing.py proves on the
+# host that a packed row gives the logits of its documents run alone. What the cluster adds is
+# whether the Ascend variable-length kernel agrees, and that shows up as a loss that tracks the
+# baseline's or does not.
+#
+# Sizing, for when the knobs are turned. The token budget is micro_batch_size x max_seq_len, and
+# max_seq_len is also the truncation ceiling, so they move together. Peak memory is about 6.7 GiB
+# plus 1.89 per thousand tokens a rank holds: a 16384 budget is about 38 GiB of the 61 a die has, and
+# a 32768 one would not fit. Raising micro_batch_size also forces global_batch_size up, because the
+# sampler insists global is divisible by micro x 32.
+CONFIG=examples/qwen3_vl_30b_perf/train_32dev_a3_packing.yaml
+DATASET="${DATASET:-both}"
 DATA="/home/pl/data/qwen3_vl_30b_perf/hetero_${DATASET}_n640/vlm_conversations.json"
-BATCH="--training.micro_batch_size=$SAMPLES_PER_RANK --training.global_batch_size=$((SAMPLES_PER_RANK * 32))"
-COMMON="--dataset.data_path=$DATA --training.train_iters=20 $BATCH"
-PADDED="--dataloader.collate_fn.packing=false"
-PACKED="--dataloader.collate_fn.packing=true --model.packed_position_ids=true"
+# Well inside what every rank can produce: a token budget turns an equal number of samples into an
+# unequal number of rows, and the trainer now stops every rank together on the first to run out, so a
+# long run would simply end early rather than hang.
+COMMON="--dataset.data_path=$DATA --training.train_iters=12"
 LIGHT="--hetero_profile.hooks=false --ep_instrument.enabled=false"
 HOOKED="--ep_instrument.enabled=false"
 RUNS=(
-  "padded_1 $COMMON $LIGHT $PADDED"
-  "packed_1 $COMMON $LIGHT $PACKED"
-  "padded_2 $COMMON $LIGHT $PADDED"
-  "packed_2 $COMMON $LIGHT $PACKED"
-  "padded_hooks $COMMON $HOOKED $PADDED"
-  "packed_hooks $COMMON $HOOKED $PACKED"
+  "packed_1 $COMMON $LIGHT"
+  "packed_2 $COMMON $LIGHT"
+  "packed_hooks $COMMON $HOOKED"
 )
-COMPARE=("packed_1,packed_2:padded_1,padded_2" "packed_hooks:padded_hooks")
+COMPARE=("packed_2:packed_1")

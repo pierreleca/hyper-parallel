@@ -21,6 +21,17 @@ import textwrap
 
 _ROOT = pathlib.Path(__file__).parents[3]
 _CONFIG = _ROOT / "examples" / "qwen3_vl_30b_perf" / "train_32dev_a3_hetero.yaml"
+_PACKING_CONFIG = _ROOT / "examples" / "qwen3_vl_30b_perf" / "train_32dev_a3_packing.yaml"
+# The packing configuration is a copy, because the config system loads one file and refuses to
+# change a _target_ from the command line. These are the only keys it is allowed to differ in.
+_PACKING_DELTAS = {
+    "dataloader._target_": ("hyper_parallel.data.batching.FixedBatchDataLoader",
+                            "hyper_parallel.data.batching.DynamicBatchDataLoader"),
+    "dataloader.min_buffered_samples": (None, 2),
+    "dataloader.collate_fn.packing": (False, True),
+    "model.packed_position_ids": (False, True),
+    "dataset.data_transform.max_seq_len": (20000, 16384),
+}
 
 # Run in a subprocess: resolving the configuration imports its targets, which need a torch_npu stand-in, and that
 # must not leak into the other tests of the process.
@@ -60,6 +71,36 @@ def _resolve(*overrides: str) -> list:
     )
     assert result.returncode == 0, result.stderr[-2000:]
     return result.stdout.strip().splitlines()[-8:]
+
+
+def _flatten(node, prefix=""):
+    """Return the configuration as a flat mapping of dotted path to leaf value."""
+    flat = {}
+    if isinstance(node, dict):
+        for key, value in node.items():
+            flat.update(_flatten(value, f"{prefix}{key}."))
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            flat.update(_flatten(value, f"{prefix}{index}."))
+    else:
+        flat[prefix.rstrip(".")] = node
+    return flat
+
+
+def test_the_packing_config_is_the_study_config_plus_the_documented_deltas():
+    """The copied packing configuration may differ only in the keys its header names."""
+    import yaml  # pylint: disable=C0415
+
+    base = _flatten(yaml.safe_load(_CONFIG.read_text(encoding="utf-8")))
+    packing = _flatten(yaml.safe_load(_PACKING_CONFIG.read_text(encoding="utf-8")))
+
+    differing = {key for key in set(base) | set(packing) if base.get(key) != packing.get(key)}
+    expected = set(_PACKING_DELTAS)
+    assert differing == expected, (f"the packing config drifted: unexpected={sorted(differing - expected)}, "
+                                  f"missing={sorted(expected - differing)}")
+    for key, (was, now) in _PACKING_DELTAS.items():
+        assert base.get(key) == was, f"{key} in the study config: expected={was}, got={base.get(key)}"
+        assert packing.get(key) == now, f"{key} in the packing config: expected={now}, got={packing.get(key)}"
 
 
 def test_configuration_resolves_with_the_defaults():
