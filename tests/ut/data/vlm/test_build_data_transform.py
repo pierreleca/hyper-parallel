@@ -27,6 +27,7 @@ import torch
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.vlm.build_data_transform import (
     PADDING_MODES,
+    TEXT_ONLY_MODES,
     VLMChatTransform,
     build_vlm_data_transform,
 )
@@ -35,14 +36,24 @@ from tests.common.mark_utils import arg_mark
 _SEQ_FIELDS = ("input_ids", "attention_mask", "labels", "mm_token_type_ids")
 
 
+class _StubImageProcessor:
+    """Patch geometry of the Qwen3-VL image processor, which the placeholder is sized from."""
+
+    merge_size = 2
+    patch_size = 16
+    temporal_patch_size = 2
+
+
 class _StubProcessor:
     """Processor stand-in: encodes four tokens per message, with or without modality outputs."""
 
     chat_template = "{{ messages }}"
+    image_token_id = 151655
 
     def __init__(self, *, with_images: bool = True) -> None:
         """Record whether the encodings carry image outputs."""
         self.with_images = with_images
+        self.image_processor = _StubImageProcessor()
 
     def apply_chat_template(self, messages: Any, **kwargs: Any) -> dict[str, Any]:
         """Return a deterministic encoding of ``messages``, ignoring every template option."""
@@ -220,6 +231,112 @@ class TestVlmTransformTextOnly(unittest.TestCase):
 
         got = int(cut["input_ids"].shape[0])
         self.assertEqual(got, 8, f"image-free truncation mismatch: expected=8, got={got}")
+
+
+class TestVlmTransformVisionPlaceholder(unittest.TestCase):
+    """``text_only="placeholder"`` gives an image-free sample one blank image."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_keep_is_the_default_policy(self):
+        """Verify a text-only sample stays image-free unless a placeholder is asked for.
+
+        Feature: VLM text-only placeholder.
+        Description: Transform an image-free record with the default policy.
+        Expectation: No image fields, and the policy reads "keep".
+        """
+        transform = VLMChatTransform(_StubProcessor(with_images=False), max_seq_len=64)
+
+        sample = transform({"messages": [{"role": "user", "content": "a"},
+                                         {"role": "assistant", "content": "b"}]})
+
+        self.assertEqual(transform.text_only, "keep",
+                         f"default policy mismatch: expected=keep, got={transform.text_only}")
+        self.assertNotIn("pixel_values", sample, "default policy added an image")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_the_placeholder_is_one_merged_token_of_blank_patches(self):
+        """Verify the inserted image is the smallest the vision tower accepts.
+
+        Feature: VLM text-only placeholder.
+        Description: Transform an image-free record with the placeholder policy.
+        Expectation: A one-block grid, merge-squared pixel rows, each of the patch volume.
+        """
+        transform = VLMChatTransform(_StubProcessor(with_images=False), max_seq_len=64,
+                                     padding="none", text_only="placeholder")
+
+        sample = transform({"messages": [{"role": "user", "content": "a"},
+                                         {"role": "assistant", "content": "b"}]})
+
+        grid = sample["image_grid_thw"].tolist()
+        self.assertEqual(grid, [[1, 2, 2]], f"grid mismatch: expected=[[1, 2, 2]], got={grid}")
+        # 3 channels x 2 temporal patches x 16 x 16 pixels is one row of the tower's input.
+        self.assertEqual(tuple(sample["pixel_values"].shape), (4, 1536),
+                         f"pixel shape mismatch: expected=(4, 1536), got={tuple(sample['pixel_values'].shape)}")
+        self.assertEqual(float(sample["pixel_values"].abs().sum()), 0.0,
+                         f"placeholder is not blank: sum={float(sample['pixel_values'].abs().sum())}")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_the_placeholder_token_matches_the_feature_row_count(self):
+        """Verify exactly one image token is inserted, as the model's consistency check requires.
+
+        Feature: VLM text-only placeholder.
+        Description: Transform an image-free record and count the image tokens and the merged tokens.
+        Expectation: One image token, marked as an image, and excluded from the loss.
+        """
+        transform = VLMChatTransform(_StubProcessor(with_images=False), max_seq_len=64,
+                                     padding="none", text_only="placeholder")
+
+        sample = transform({"messages": [{"role": "user", "content": "a"},
+                                         {"role": "assistant", "content": "b"}]})
+
+        grid = sample["image_grid_thw"]
+        merged_tokens = int(grid.prod(-1).sum()) // _StubImageProcessor.merge_size ** 2
+        image_tokens = int((sample["input_ids"] == _StubProcessor.image_token_id).sum())
+        self.assertEqual(image_tokens, merged_tokens,
+                         f"token count mismatch: expected={merged_tokens}, got={image_tokens}")
+        self.assertEqual(int(sample["mm_token_type_ids"][0]), 1,
+                         f"placeholder not marked as an image: got={int(sample['mm_token_type_ids'][0])}")
+        self.assertEqual(int(sample["labels"][0]), IGNORE_INDEX,
+                         f"placeholder is trained on: label={int(sample['labels'][0])}")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_a_record_with_images_gets_no_placeholder(self):
+        """Verify the placeholder policy leaves image-bearing records alone.
+
+        Feature: VLM text-only placeholder.
+        Description: Transform a record whose processor returns one image.
+        Expectation: The processor's own grid survives, with no extra blank image.
+        """
+        transform = VLMChatTransform(_StubProcessor(with_images=True), max_seq_len=64,
+                                     padding="none", text_only="placeholder")
+
+        sample = transform({"messages": [{"role": "user", "content": "a"},
+                                         {"role": "assistant", "content": "b"}]})
+
+        grid = sample["image_grid_thw"].tolist()
+        self.assertEqual(grid, [[1, 2, 2]], f"grid mismatch: expected=[[1, 2, 2]], got={grid}")
+        self.assertEqual(int(sample["image_grid_thw"].shape[0]), 1,
+                         f"extra image added: rows={int(sample['image_grid_thw'].shape[0])}")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_an_unknown_text_only_mode_is_refused(self):
+        """Verify a misspelled text-only policy fails at construction.
+
+        Feature: VLM text-only placeholder.
+        Description: Construct the transform with an unsupported text_only value.
+        Expectation: ValueError naming the value, and the supported set has two members.
+        """
+        with self.assertRaises(ValueError) as caught:
+            VLMChatTransform(_StubProcessor(), text_only="dummy")
+
+        self.assertIn("dummy", str(caught.exception), f"error does not name the value: {caught.exception}")
+        self.assertEqual(len(TEXT_ONLY_MODES), 2,
+                         f"text-only modes changed: got={TEXT_ONLY_MODES}")
 
 
 if __name__ == "__main__":

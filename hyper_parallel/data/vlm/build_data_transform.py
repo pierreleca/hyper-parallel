@@ -25,7 +25,10 @@ from hyper_parallel.data.constants import IGNORE_INDEX
 
 _SEQ_FIELDS = ("input_ids", "attention_mask", "labels", "mm_token_type_ids")
 PADDING_MODES = ("max_length", "none")
+TEXT_ONLY_MODES = ("keep", "placeholder")
 _MODAL_FIELDS = ("pixel_values", "image_grid_thw")
+# Images are RGB; the processor carries the patch geometry but not the channel count.
+_IMAGE_CHANNELS = 3
 
 
 def _template_reads(chat_template: Any, variable: str) -> bool:
@@ -55,13 +58,77 @@ class VLMChatTransform:
         ValueError: If ``padding`` is not one of :data:`PADDING_MODES`.
     """
 
-    def __init__(self, processor: Any, *, max_seq_len: int = 256, padding: str = "max_length") -> None:
-        """Store the processor, the target sequence length and the padding policy."""
+    def __init__(
+            self,
+            processor: Any,
+            *,
+            max_seq_len: int = 256,
+            padding: str = "max_length",
+            text_only: str = "keep",
+    ) -> None:
+        """Store the processor, the target sequence length and the padding and text-only policies."""
         if padding not in PADDING_MODES:
             raise ValueError(f"padding must be one of {PADDING_MODES}, but got {padding!r}")
+        if text_only not in TEXT_ONLY_MODES:
+            raise ValueError(f"text_only must be one of {TEXT_ONLY_MODES}, but got {text_only!r}")
         self.processor = processor
         self.max_seq_len = max_seq_len
         self.padding = padding
+        self.text_only = text_only
+
+    def _image_token_id(self) -> int:
+        """Return the id of the image placeholder token.
+
+        Raises:
+            ValueError: If the processor exposes neither the id nor the token to look it up with.
+        """
+        token_id = getattr(self.processor, "image_token_id", None)
+        if token_id is not None:
+            return int(token_id)
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        image_token = getattr(self.processor, "image_token", None)
+        if tokenizer is None or image_token is None:
+            raise ValueError("text_only='placeholder' needs the processor's image token to build one")
+        return int(tokenizer.convert_tokens_to_ids(image_token))
+
+    def _vision_placeholder(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the smallest image the vision tower accepts: one merged token of blank patches.
+
+        Raises:
+            ValueError: If the processor carries no image processor to read the patch geometry from.
+        """
+        image_processor = getattr(self.processor, "image_processor", None)
+        if image_processor is None:
+            raise ValueError("text_only='placeholder' needs the processor's image_processor for the geometry")
+        merge = int(image_processor.merge_size)
+        patch = int(image_processor.patch_size)
+        temporal = int(image_processor.temporal_patch_size)
+        # A grid of one merge block is the smallest the tower's patch merger accepts; the tower reads
+        # pixel_values as (-1, channels, temporal_patch, patch, patch), so a row is their product.
+        grid = torch.tensor([[1, merge, merge]], dtype=torch.long)
+        pixel_values = torch.zeros(merge * merge, _IMAGE_CHANNELS * temporal * patch * patch)
+        return pixel_values, grid
+
+    def _add_vision_placeholder(self, sample: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Prepend one blank image to an image-free sample so its rank still runs the vision tower.
+
+        With the tower sharded over every rank, a rank whose sample holds no image would not join the
+        all-gather of the tower's weights and the others would wait for it. One blank image keeps every
+        rank on the same path, at the cost of a single token that is masked out of the loss.
+        """
+        pixel_values, grid = self._vision_placeholder()
+        heads = {
+            "input_ids": self._image_token_id(),
+            "attention_mask": 1,
+            "mm_token_type_ids": 1,
+            "labels": IGNORE_INDEX,
+        }
+        for field, value in heads.items():
+            column = sample[field]
+            sample[field] = torch.cat([column.new_full((1,), value), column])
+        sample["pixel_values"] = pixel_values
+        sample["image_grid_thw"] = grid
+        return sample
 
     @staticmethod
     def _normalize_messages(messages: Any, images: Any = None) -> Any:
@@ -215,6 +282,8 @@ class VLMChatTransform:
         for field in _MODAL_FIELDS:
             if field in full:
                 sample[field] = full[field]
+        if self.text_only == "placeholder" and "pixel_values" not in sample:
+            sample = self._add_vision_placeholder(sample)
         return self._truncate_and_pad(sample)
 
 
@@ -223,6 +292,7 @@ def build_vlm_data_transform(
         processor: Any = None,
         max_seq_len: int = 256,
         padding: str = "max_length",
+        text_only: str = "keep",
         **transform_options: Any,
 ) -> VLMChatTransform:
     """Build the VLM sample transform.
@@ -232,15 +302,18 @@ def build_vlm_data_transform(
         max_seq_len: Target sequence length for truncation and padding.
         padding: ``"max_length"`` pads every sample to ``max_seq_len``; ``"none"`` keeps each sample at
             its own length, which needs a collator that pads the micro-batch.
+        text_only: ``"keep"`` emits a conversation without images as a sample without image fields;
+            ``"placeholder"`` gives it one blank image, so every rank runs the vision tower.
         **transform_options: Reserved model-specific transform options.
 
     Returns:
         The configured :class:`VLMChatTransform`.
 
     Raises:
-        ValueError: If ``processor`` is not provided, or ``padding`` is not one of :data:`PADDING_MODES`.
+        ValueError: If ``processor`` is not provided, or a policy is outside :data:`PADDING_MODES`
+            or :data:`TEXT_ONLY_MODES`.
     """
     del transform_options
     if processor is None:
         raise ValueError("processor is required for the VLM data transform")
-    return VLMChatTransform(processor, max_seq_len=max_seq_len, padding=padding)
+    return VLMChatTransform(processor, max_seq_len=max_seq_len, padding=padding, text_only=text_only)
