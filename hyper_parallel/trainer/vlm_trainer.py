@@ -22,6 +22,7 @@ from typing import Any, Dict
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.vlm import build_processor, build_vlm_get_batch
+from hyper_parallel.trainer.runtime.distributed import all_reduce
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
@@ -205,14 +206,56 @@ class VLMTrainer:
 
         return total_loss, total_loss_dict
 
-    def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        """Execute one VLM training step."""
+    def prefetch_micro_batches(self, data_iterator: Any) -> list:
+        """Read every micro-batch of one step before any of them runs.
+
+        Nothing here is collective, so a rank whose data has run out raises :exc:`StopIteration`
+        without having left its peers waiting. That makes this the point at which the ranks can agree
+        to stop; see :meth:`data_exhausted_anywhere`.
+
+        Args:
+            data_iterator: The training data iterator.
+
+        Returns:
+            One ``(model_inputs, loss_inputs)`` pair per micro-batch of the step.
+        """
+        return [self.base.get_batch(data_iterator) for _ in range(self.base.num_micro_batches)]
+
+    def data_exhausted_anywhere(self, exhausted: bool) -> bool:
+        """Return whether any data-parallel rank has run out, so they all stop on the same step.
+
+        A rank reaching the end of its data is a local event, but leaving the step loop is not: the
+        step that follows is full of collectives, and a rank that has left will not join them. With a
+        fixed batch size every rank runs out on the same step and the question never arises. With a
+        token budget it does, because an equal number of samples packs into an unequal number of
+        rows: a rank holding long samples fills more rows from the same samples than one holding
+        short ones, so the ranks reach the end several steps apart.
+
+        Args:
+            exhausted: Whether this rank's data iterator is finished.
+
+        Returns:
+            True when any rank of the data-parallel group is finished.
+        """
+        group = self.base.mesh.dp_cp_mesh.get_group() if self.base.mesh.dp_cp_mesh is not None else None
+        if group is None:
+            return exhausted
+        return bool(all_reduce(1.0 if exhausted else 0.0, op="max", group=group))
+
+    def train_step(self, data_iterator: Any, training_batches: Any = None) -> Dict[str, float]:
+        """Execute one VLM training step.
+
+        Args:
+            data_iterator: The training data iterator, read when ``training_batches`` is not given.
+            training_batches: Micro-batches already read by :meth:`prefetch_micro_batches`.
+
+        Returns:
+            The step's metrics.
+        """
         config = self.base.config
-        first_training_batch = self.base.get_batch(data_iterator)
+        if training_batches is None:
+            training_batches = self.prefetch_micro_batches(data_iterator)
         num_micro_steps = self.base.num_micro_batches
-        training_batches = [first_training_batch]
-        for _ in range(1, num_micro_steps):
-            training_batches.append(self.base.get_batch(data_iterator))
 
         self.on_step_begin(
             micro_batches=[model_inputs for model_inputs, _ in training_batches]
@@ -274,11 +317,17 @@ class VLMTrainer:
             start_step = self.base.state.global_step - epoch * self.base.train_steps
             train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
             for _ in range(start_step, train_steps):
+                # Read the step's micro-batches first: that is collective-free, so the ranks can
+                # agree to stop before any of them enters a step the others have left.
                 try:
-                    self.train_step(data_iterator)
+                    training_batches = self.prefetch_micro_batches(data_iterator)
+                    exhausted = False
                 except StopIteration:
+                    training_batches, exhausted = None, True
+                if self.data_exhausted_anywhere(exhausted):
                     logger.info("epoch:%s Dataloader finished with drop_last %s", epoch, config.dataloader.drop_last)
                     break
+                self.train_step(data_iterator, training_batches=training_batches)
 
             self.on_epoch_end()
             self.base.state.epoch = epoch + 1
