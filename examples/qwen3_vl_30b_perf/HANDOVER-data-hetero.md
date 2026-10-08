@@ -112,13 +112,20 @@ Three unit tests guard it.
 
 ## Three things that would have broken, found and fixed
 
-**Ranks would have hung.** A token budget turns an equal number of samples into an unequal number of
-rows: simulated on the study's spread, 32 ranks produce between **7 and 14** micro-batches from the
-same 20 samples. The step loop caught `StopIteration` per rank and broke, so the first rank to run out
-would leave while the others were still in that step's collectives. There is no number of steps every
-rank can reach. Fixed in `vlm_trainer.py`: reading a step's micro-batches is collective-free, so it is
-the point at which the ranks can still agree — `data_exhausted_anywhere` reduces the flag with max
-over the data-parallel group and they stop together.
+**Ranks would have hung, and the obvious fix would have dropped a third of the epoch.** A token
+budget turns an equal number of samples into an unequal number of rows: on this study's spread, 32
+ranks produce between **9 and 16** rows from the same 20 samples. The step loop caught
+`StopIteration` per rank and broke, so the first rank to run out would leave while the others were
+still in that step's collectives, and there is no number of steps every rank can reach.
+
+Stopping them together fixes the hang but consumes only **69% of the epoch**, because the ranks that
+still held data are cut off. So the epoch instead runs until the *last* rank is done, and a rank that
+finished early replays its last micro-batch with the labels masked: it joins every collective and
+moves the weights by nothing, since a micro-batch's loss is weighted by its supervised tokens and
+this one keeps a single token out of the step's hundreds of thousands. One token and not none —
+every label masked makes the model's cross-entropy a mean over nothing, and the weighting then
+multiplies NaN by zero. The whole epoch is consumed, at the cost of 17% of rank-steps being padded
+work.
 
 **The heterogeneity report would have said there is no heterogeneity.** A packed row is one sequence
 to every shape-based measure: `batch_size` reads 1 and the spread between its documents disappears, so
@@ -158,8 +165,11 @@ twice, so a hook firing once would desynchronise.
   share — already true today with `padding: none`, and worth fixing before raising
   `global_batch_size`.
 - The token budget balances `input_ids` length, which does not balance the vision tower: its cost
-  follows `pixel_values`, and on `natural` a sample carries eleven images. A token-balanced row is not
-  a compute-balanced one.
+  follows `pixel_values`, and on `natural` a sample carries eleven images. This caps the gain but
+  does not threaten the target: the tower is 6.1% of `natural`'s step, so even at four times
+  imbalanced it adds 18 points of imbalance against the 131 the run carries today, and the modelled
+  gain stays between +55% and +120%. Weighting a sample by `tokens + 0.31 x visual` in the budget
+  would close most of it, and costs no reordering.
 - `global_batch_size: 32` becomes decorative under a token budget — a step consumes a variable number
   of samples. Compare loss against consumed samples, never against step number, and never set
   `train_samples`.
