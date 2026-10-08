@@ -26,6 +26,7 @@ from typing import Any
 
 import torch
 
+from hyper_parallel.data.batching.build_dataloader import TextTokenBatcher
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.vlm.packing import (
     build_packed_position_ids,
@@ -162,6 +163,109 @@ class TestVlmPackingCollator(unittest.TestCase):
             collator([])
         with self.assertRaises(ValueError):
             collator([{"labels": torch.arange(3)}])
+
+
+class TestPackingNeverSplitsASample(unittest.TestCase):
+    """No document is ever cut between two rows: the invariant the whole feature rests on.
+
+    A split sample's second half would begin a row with no prompt in front of it, and document masking
+    puts the first half out of reach, so the model would be trained to answer a question it was never
+    shown. Packing therefore refuses to split, and pays for it in fill rate instead.
+    """
+
+    @staticmethod
+    def _runs(row: torch.Tensor) -> list[tuple[int, int]]:
+        """Return the (token value, run length) pairs of a packed row, each sample having its own value."""
+        values = row.reshape(-1).tolist()
+        runs = []
+        start = 0
+        for index in range(1, len(values) + 1):
+            if index == len(values) or values[index] != values[start]:
+                runs.append((values[start], index - start))
+                start = index
+        return runs
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_the_collator_lays_every_sample_down_whole_and_contiguous(self):
+        """Verify a packed row holds each sample's tokens unbroken and in order.
+
+        Feature: VLM sequence packing.
+        Description: Pack three samples whose tokens each carry a distinct value.
+        Expectation: Three runs, of the three original lengths, in the order given.
+        """
+        lengths = [4, 7, 3]
+        samples = [{"input_ids": torch.full((length,), 10 + index, dtype=torch.long),
+                    "labels": torch.full((length,), 10 + index, dtype=torch.long)}
+                   for index, length in enumerate(lengths)]
+
+        batch = build_vlm_packing_collator()(samples)
+
+        runs = self._runs(batch["input_ids"])
+        expected = [(10, 4), (11, 7), (12, 3)]
+        self.assertEqual(runs, expected, f"row is not the samples laid end to end: "
+                                         f"expected={expected}, got={runs}")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_the_boundaries_locate_every_sample_exactly(self):
+        """Verify cu_seq_lens slices the row back into the samples it was built from.
+
+        Feature: VLM sequence packing.
+        Description: Pack three samples and slice the row at every boundary.
+        Expectation: Each slice holds one sample's tokens and nothing else.
+        """
+        lengths = [4, 7, 3]
+        samples = [{"input_ids": torch.full((length,), 10 + index, dtype=torch.long),
+                    "labels": torch.full((length,), 10 + index, dtype=torch.long)}
+                   for index, length in enumerate(lengths)]
+
+        batch = build_vlm_packing_collator()(samples)
+
+        row = batch["input_ids"].reshape(-1)
+        bounds = batch["cu_seq_lens"].tolist()
+        for index, (start, end) in enumerate(zip(bounds[:-1], bounds[1:])):
+            document = row[start:end].tolist()
+            expected = [10 + index] * lengths[index]
+            self.assertEqual(document, expected,
+                             f"document {index} mismatch: expected={expected}, got={document}")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_token_budget_selection_keeps_every_sample_whole(self):
+        """Verify the budget batcher defers a sample that does not fit instead of cutting it.
+
+        Feature: VLM sequence packing.
+        Description: Drive the token batcher with lengths that cannot fill the budget exactly, one of
+            them larger than the whole budget, and pack whatever it hands over.
+        Expectation: Every sample appears once, whole, and the over-budget one has a row to itself.
+        """
+        budget = 1000
+        lengths = [300, 400, 450, 1700, 200, 150, 380, 900]
+        batcher = TextTokenBatcher(token_budget=budget, min_buffered_samples=1)
+        collate = build_vlm_packing_collator()
+
+        rows = []
+        for index, length in enumerate(lengths):
+            batcher.put_item({"input_ids": torch.full((length,), 10 + index, dtype=torch.long),
+                              "labels": torch.full((length,), 10 + index, dtype=torch.long)})
+            while batcher.is_ready_for_micro_batch():
+                rows.append(collate(batcher.get_micro_batch()))
+        while not batcher.empty():
+            rows.append(collate(batcher.get_micro_batch()))
+
+        seen: dict[int, int] = {}
+        for row in rows:
+            for value, run in self._runs(row["input_ids"]):
+                self.assertNotIn(value - 10, seen,
+                                 f"sample {value - 10} appears in more than one row")
+                seen[value - 10] = run
+        for index, length in enumerate(lengths):
+            self.assertEqual(seen.get(index), length,
+                             f"sample {index} was cut or lost: expected={length}, got={seen.get(index)}")
+        over_budget = [int(row["input_ids"].shape[-1]) for row in rows if int(row["input_ids"].shape[-1]) > budget]
+        self.assertEqual(over_budget, [1700],
+                         f"the over-budget sample did not get a row of its own: got={over_budget}")
 
 
 class TestPackedPositionIds(unittest.TestCase):
