@@ -91,42 +91,83 @@ def test_exhaustion_is_local_without_a_data_parallel_group():
     trainer = _trainer(1, [])
 
     for exhausted in (True, False):
-        answer = VLMTrainer.data_exhausted_anywhere(trainer, exhausted)
+        answer = VLMTrainer.data_exhausted_everywhere(trainer, exhausted)
         assert answer is exhausted, f"single-process answer mismatch: expected={exhausted}, got={answer}"
 
 
-def test_one_rank_running_out_stops_every_rank():
-    """A rank with data left still stops, because a rank that has left will join no collective.
+def test_one_rank_running_out_does_not_end_the_epoch():
+    """A rank that finishes early keeps going, so the data the others still hold is not thrown away.
 
     With a fixed batch size every rank runs out on the same step. With a token budget they do not: an
-    equal number of samples packs into an unequal number of rows, so the ranks reach the end several
-    steps apart and the first to leave would strand the others in the next step's collectives.
+    equal number of samples packs into an unequal number of rows, so stopping at the first rank to
+    finish would drop what the others still hold -- nearly a third of this study's epoch.
     """
     VLMTrainer = _vlm_trainer()
     group = object()
     trainer = _trainer(1, [], group=group)
     calls = []
 
-    def _max_over_group(value, op=None, group=None):
-        """Stand in for the real all-reduce: another rank reports exhaustion."""
+    def _min_over_group(value, op=None, group=None):
+        """Stand in for the real all-reduce: another rank still has data."""
         calls.append((value, op, group))
-        return max(value, 1.0)
+        return min(value, 0.0)
 
-    with mock.patch("hyper_parallel.trainer.vlm_trainer.all_reduce", _max_over_group):
-        answer = VLMTrainer.data_exhausted_anywhere(trainer, False)
+    with mock.patch("hyper_parallel.trainer.vlm_trainer.all_reduce", _min_over_group):
+        answer = VLMTrainer.data_exhausted_everywhere(trainer, True)
 
-    assert answer is True, f"a rank with data left did not stop: got={answer}"
-    assert calls and calls[0][1] == "max", f"the flag must be reduced with max: got={calls}"
+    assert answer is False, f"the epoch ended with data left on another rank: got={answer}"
+    assert calls and calls[0][1] == "min", f"the flag must be reduced with min: got={calls}"
     assert calls[0][2] is group, f"the flag must be reduced over the data-parallel group: got={calls}"
 
 
-def test_no_rank_running_out_lets_the_step_proceed():
-    """When every rank has data, the loop carries on."""
+def test_the_epoch_ends_when_every_rank_has_run_out():
+    """Once no rank has data, the loop stops."""
     VLMTrainer = _vlm_trainer()
     group = object()
     trainer = _trainer(1, [], group=group)
 
     with mock.patch("hyper_parallel.trainer.vlm_trainer.all_reduce", lambda value, op=None, group=None: value):
-        answer = VLMTrainer.data_exhausted_anywhere(trainer, False)
+        answer = VLMTrainer.data_exhausted_everywhere(trainer, True)
 
-    assert answer is False, f"the loop stopped with data left everywhere: got={answer}"
+    assert answer is True, f"the loop carried on with no data anywhere: got={answer}"
+
+
+def test_padded_work_keeps_one_supervised_token():
+    """A finished rank replays its last micro-batch supervised on one token, so it weighs nothing.
+
+    Every label masked would make the model's cross-entropy a mean over nothing, and the loss
+    weighting multiplies that by zero, which leaves NaN rather than nothing.
+    """
+    import torch  # pylint: disable=C0415
+
+    VLMTrainer = _vlm_trainer()
+    labels = torch.tensor([[-100, -100, 7, 8, 9]])
+    template = [({"input_ids": torch.ones(1, 5, dtype=torch.long), "labels": labels},
+                 {"labels": labels, "loss_mask": labels >= 0})]
+
+    padded = VLMTrainer.padding_micro_batches(_trainer(1, []), template)
+
+    model_inputs, loss_inputs = padded[0]
+    supervised = int((loss_inputs["labels"] != -100).sum())
+    assert supervised == 1, f"padded work must keep exactly one supervised token: got={supervised}"
+    kept = loss_inputs["labels"][0, 2].item()
+    assert kept == 7, f"the kept token must be the first supervised one: expected=7, got={kept}"
+    assert int(loss_inputs["loss_mask"].sum()) == 1, \
+        f"the loss mask must follow the labels: got={int(loss_inputs['loss_mask'].sum())}"
+    # The model computes the loss from the labels it is handed, so they must agree with the weighting.
+    assert int((model_inputs["labels"] != -100).sum()) == 1, \
+        f"the model's labels must be masked too: got={int((model_inputs['labels'] != -100).sum())}"
+    assert model_inputs["input_ids"].shape == (1, 5), \
+        f"padded work must keep the shape of real work: got={tuple(model_inputs['input_ids'].shape)}"
+
+
+def test_padded_work_without_a_template_is_refused():
+    """A rank that never read a micro-batch was handed no data, which is not a ragged epoch."""
+    VLMTrainer = _vlm_trainer()
+
+    try:
+        VLMTrainer.padding_micro_batches(_trainer(1, []), None)
+    except ValueError as error:
+        assert "configuration" in str(error), f"the error should name the cause: got={error}"
+        return
+    raise AssertionError("a missing template was accepted")

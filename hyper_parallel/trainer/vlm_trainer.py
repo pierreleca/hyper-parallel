@@ -19,8 +19,11 @@ __all__ = ["VLMTrainer"]
 from collections import defaultdict
 from typing import Any, Dict
 
+import torch
+
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.data.batching import calculate_num_micro_batches
+from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.vlm import build_processor, build_vlm_get_batch
 from hyper_parallel.trainer.runtime.distributed import all_reduce
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
@@ -221,26 +224,78 @@ class VLMTrainer:
         """
         return [self.base.get_batch(data_iterator) for _ in range(self.base.num_micro_batches)]
 
-    def data_exhausted_anywhere(self, exhausted: bool) -> bool:
-        """Return whether any data-parallel rank has run out, so they all stop on the same step.
+    def data_exhausted_everywhere(self, exhausted: bool) -> bool:
+        """Return whether every data-parallel rank has run out, which is when the epoch ends.
 
         A rank reaching the end of its data is a local event, but leaving the step loop is not: the
         step that follows is full of collectives, and a rank that has left will not join them. With a
         fixed batch size every rank runs out on the same step and the question never arises. With a
         token budget it does, because an equal number of samples packs into an unequal number of
         rows: a rank holding long samples fills more rows from the same samples than one holding
-        short ones, so the ranks reach the end several steps apart.
+        short ones.
+
+        Stopping at the first rank to finish would therefore throw away the data the others still
+        hold -- on this study's spread, nearly a third of the epoch. So the epoch runs until the last
+        rank is done and the ranks that finished early keep joining the collectives with the padded
+        work of :meth:`padding_micro_batches`.
 
         Args:
             exhausted: Whether this rank's data iterator is finished.
 
         Returns:
-            True when any rank of the data-parallel group is finished.
+            True when every rank of the data-parallel group is finished.
         """
         group = self.base.mesh.dp_cp_mesh.get_group() if self.base.mesh.dp_cp_mesh is not None else None
         if group is None:
             return exhausted
-        return bool(all_reduce(1.0 if exhausted else 0.0, op="max", group=group))
+        return bool(all_reduce(1.0 if exhausted else 0.0, op="min", group=group))
+
+    def padding_micro_batches(self, template: Any) -> list:
+        """Return micro-batches that join every collective and move the weights by nothing.
+
+        A rank whose data has run out still has to enter the step, because the ranks that still have
+        data will not get through their collectives without it. It replays its last micro-batch with
+        the labels masked, so the work is real and the gradient is not: a micro-batch's loss is
+        weighted by its supervised tokens, and this one keeps a single token out of the step's
+        hundreds of thousands.
+
+        One token and not none. A batch with every label masked makes the model's cross-entropy a
+        mean over nothing, which is NaN, and the weighting then multiplies NaN by zero and poisons
+        the step; the loss path only guards the case where *every* rank has no supervised token.
+
+        Args:
+            template: The last micro-batches this rank read.
+
+        Returns:
+            Micro-batches of the same shapes, supervised on one token.
+
+        Raises:
+            ValueError: If this rank never read a micro-batch, which means it was handed no data.
+        """
+        if not template:
+            raise ValueError(
+                "a rank ran out of data before its first step while others had some; the sampler "
+                "handed it nothing, which is a configuration problem rather than a ragged epoch"
+            )
+        padded = []
+        for model_inputs, loss_inputs in template:
+            labels = loss_inputs.get("labels")
+            if not isinstance(labels, torch.Tensor):
+                padded.append((model_inputs, loss_inputs))
+                continue
+            masked = torch.full_like(labels, IGNORE_INDEX)
+            supervised = (labels != IGNORE_INDEX).nonzero()
+            if supervised.numel():
+                position = tuple(supervised[0].tolist())
+                masked[position] = labels[position]
+            model_padded = {**model_inputs}
+            if isinstance(model_padded.get("labels"), torch.Tensor):
+                model_padded["labels"] = masked
+            loss_padded = {**loss_inputs, "labels": masked}
+            if isinstance(loss_padded.get("loss_mask"), torch.Tensor):
+                loss_padded["loss_mask"] = masked >= 0
+            padded.append((model_padded, loss_padded))
+        return padded
 
     def train_step(self, data_iterator: Any, training_batches: Any = None) -> Dict[str, float]:
         """Execute one VLM training step.
@@ -316,17 +371,22 @@ class VLMTrainer:
 
             start_step = self.base.state.global_step - epoch * self.base.train_steps
             train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
+            template = None
             for _ in range(start_step, train_steps):
                 # Read the step's micro-batches first: that is collective-free, so the ranks can
-                # agree to stop before any of them enters a step the others have left.
+                # agree about the epoch before any of them enters a step the others have left.
                 try:
                     training_batches = self.prefetch_micro_batches(data_iterator)
                     exhausted = False
                 except StopIteration:
                     training_batches, exhausted = None, True
-                if self.data_exhausted_anywhere(exhausted):
+                if self.data_exhausted_everywhere(exhausted):
                     logger.info("epoch:%s Dataloader finished with drop_last %s", epoch, config.dataloader.drop_last)
                     break
+                if exhausted:
+                    training_batches = self.padding_micro_batches(template)
+                else:
+                    template = training_batches
                 self.train_step(data_iterator, training_batches=training_batches)
 
             self.on_epoch_end()

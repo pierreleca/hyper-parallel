@@ -41,10 +41,11 @@
 CONFIG=examples/qwen3_vl_30b_perf/train_32dev_a3_packing.yaml
 DATASET="${DATASET:-both}"
 DATA="/home/pl/data/qwen3_vl_30b_perf/hetero_${DATASET}_n640/vlm_conversations.json"
-# Well inside what every rank can produce: a token budget turns an equal number of samples into an
-# unequal number of rows, and the trainer now stops every rank together on the first to run out, so a
-# long run would simply end early rather than hang.
-COMMON="--dataset.data_path=$DATA --training.train_iters=12"
+# Enough steps to reach the end: a token budget turns an equal number of samples into an unequal
+# number of rows, so the ranks finish several steps apart. The epoch now runs until the last of them
+# is done, with the ranks that finished early joining the collectives on padded work, so the whole
+# epoch is consumed. On this spread that is about 16 steps for 20 samples a rank.
+COMMON="--dataset.data_path=$DATA --training.train_iters=20"
 LIGHT="--hetero_profile.hooks=false --ep_instrument.enabled=false"
 HOOKED="--ep_instrument.enabled=false"
 RUNS=(
