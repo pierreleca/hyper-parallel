@@ -158,6 +158,10 @@ dataset:
     _target_: hyper_parallel.data.vlm.build_vlm_data_transform
     max_seq_len: 20000
     padding: none
+    # Every sample of these datasets holds an image, so "keep" costs nothing. A corpus built with
+    # --text-only-share needs "placeholder": the tower is sharded over all 32 dies, and a rank whose
+    # sample holds no image would not join the all-gather of its weights.
+    text_only: keep
 
 dataloader:
   _target_: hyper_parallel.data.batching.FixedBatchDataLoader

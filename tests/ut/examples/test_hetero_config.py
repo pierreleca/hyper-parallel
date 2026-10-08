@@ -41,7 +41,8 @@ _SCRIPT = textwrap.dedent("""
     print(config.hetero_profile.enabled, config.hetero_profile.output_dir, config.hetero_profile.start_step)
     print(config.ep_instrument.enabled, config.ep_instrument.segment_peaks, config.activation_checkpoint.mode)
     print(config.dataset.data_path)
-    print(config.dataset.data_transform._target_path, config.dataset.data_transform.padding)
+    print(config.dataset.data_transform._target_path, config.dataset.data_transform.padding,
+          config.dataset.data_transform.text_only)
     print(config.model._target_path)
     print(config.hetero_profile.hooks, config.hetero_profile.enabled, config.ep_instrument.enabled,
           config.training.train_iters, config.training.global_batch_size)
@@ -69,7 +70,7 @@ def test_configuration_resolves_with_the_defaults():
     assert lines[2] == "True False full"
     assert "build_vlm_data_transform" in lines[4], lines[4]
     # padding none is what makes a rank's work depend on its sample; the default would hide it.
-    assert lines[4].endswith(" none"), lines[4]
+    assert lines[4].endswith(" none keep"), lines[4]
     assert "cropped_qwen3_vl" in lines[5]
 
 
@@ -92,6 +93,16 @@ def test_the_flags_of_the_plans_are_accepted():
     off = _resolve("--hetero_profile.enabled=false", "--ep_instrument.enabled=false",
                    "--training.global_batch_size=64", "--training.train_iters=10")
     assert off[6] == "True False False 10 64"
+
+
+def test_the_data_transform_plans_switch_their_policies():
+    """The padding and text-only plans reach the sample transform through the command line."""
+    padded = _resolve("--dataset.data_transform.padding=max_length",
+                      "--dataset.data_transform.max_seq_len=16384")
+    assert padded[4].endswith(" max_length keep"), padded[4]
+
+    placeholder = _resolve("--dataset.data_transform.text_only=placeholder")
+    assert placeholder[4].endswith(" none placeholder"), placeholder[4]
 
 
 def test_the_profile_plan_names_the_ranks_it_profiles():
