@@ -255,19 +255,25 @@ class VLMTrainer:
 
         A rank whose data has run out still has to enter the step, because the ranks that still have
         data will not get through their collectives without it. It replays its last micro-batch with
-        the labels masked, so the work is real and the gradient is not: a micro-batch's loss is
-        weighted by its supervised tokens, and this one keeps a single token out of the step's
-        hundreds of thousands.
+        **every** label masked, which makes the work real and the gradient exactly nothing: the
+        cross-entropy writes a gradient only at the positions it supervises, and this batch
+        supervises none, so no replayed sample reaches the weights twice.
 
-        One token and not none. A batch with every label masked makes the model's cross-entropy a
-        mean over nothing, which is NaN, and the weighting then multiplies NaN by zero and poisons
-        the step; the loss path only guards the case where *every* rank has no supervised token.
+        Nothing here relies on the loss weighting being small, because there is nothing to weigh.
+        ``count_loss_token`` counts no supervised token, so the batch contributes nothing to the
+        step's denominator either, and the step's reported loss stays the token-weighted mean over
+        the ranks that did have data.
+
+        The forward does produce NaN -- a mean over no supervised token -- and that NaN never leaves
+        the forward: :class:`~hyper_parallel.components.losses.model_output.ModelOutputLoss` replaces
+        the loss of a batch with no valid label by zero, and the gradient was already zero rather
+        than NaN. ``check_padded_work.py`` asserts both on the host.
 
         Args:
             template: The last micro-batches this rank read.
 
         Returns:
-            Micro-batches of the same shapes, supervised on one token.
+            Micro-batches of the same shapes, supervising nothing.
 
         Raises:
             ValueError: If this rank never read a micro-batch, which means it was handed no data.
@@ -284,10 +290,6 @@ class VLMTrainer:
                 padded.append((model_inputs, loss_inputs))
                 continue
             masked = torch.full_like(labels, IGNORE_INDEX)
-            supervised = (labels != IGNORE_INDEX).nonzero()
-            if supervised.numel():
-                position = tuple(supervised[0].tolist())
-                masked[position] = labels[position]
             model_padded = {**model_inputs}
             if isinstance(model_padded.get("labels"), torch.Tensor):
                 model_padded["labels"] = masked

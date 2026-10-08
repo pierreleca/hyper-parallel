@@ -15,15 +15,20 @@ Every default is unchanged — `padding="max_length"`, `text_only="keep"`, `pack
 
 ## Run these, in this order
 
-**1. Prove packing on the host. No cluster, no checkpoint, seconds.**
+**1. Prove it on the host. No cluster, no checkpoint, seconds.**
 
 ```bash
-python examples/qwen3_vl_30b_perf/check_packing.py
+PYTHONPATH=. python examples/qwen3_vl_30b_perf/check_packing.py
+PYTHONPATH=.:examples/qwen3_vl_30b_perf python examples/qwen3_vl_30b_perf/check_padded_work.py
 ```
 
-Six documents — four carrying images of different grid shapes, two text-only — run alone and then
-packed into one row. Last run: `2.811e-01` without position ids, **`1.937e-07`** with them. It fails
-if either number is the wrong way round, so it cannot pass by doing nothing.
+The first: six documents — four carrying images of different grid shapes, two text-only — run alone
+and then packed into one row. Last run: `2.811e-01` without position ids, **`1.937e-07`** with them.
+It fails if either number is the wrong way round, so it cannot pass by doing nothing.
+
+The second: a rank's padded work trains on nothing. Every parameter gradient bit-exact zero, with
+the router's load-balancing term off and on, no supervised token counted, the forward's NaN
+contained — and it fails if the real batch it is compared against moves no weight.
 
 **2. Price padding.** Paired comparison, the tight interval.
 
@@ -120,12 +125,22 @@ still in that step's collectives, and there is no number of steps every rank can
 
 Stopping them together fixes the hang but consumes only **69% of the epoch**, because the ranks that
 still held data are cut off. So the epoch instead runs until the *last* rank is done, and a rank that
-finished early replays its last micro-batch with the labels masked: it joins every collective and
-moves the weights by nothing, since a micro-batch's loss is weighted by its supervised tokens and
-this one keeps a single token out of the step's hundreds of thousands. One token and not none —
-every label masked makes the model's cross-entropy a mean over nothing, and the weighting then
-multiplies NaN by zero. The whole epoch is consumed, at the cost of 17% of rank-steps being padded
-work.
+finished early replays its last micro-batch with **every** label masked: it joins every collective
+and moves the weights by nothing. The whole epoch is consumed, at the cost of 17% of rank-steps being
+padded work.
+
+Nothing is trained twice, and the claim is exact rather than small. A replayed sample is a real
+forward over real tokens, so the question is whether any of it reaches the weights: it does not,
+because the cross-entropy writes a gradient only at the positions it supervises and this batch
+supervises none. On the real model, with the router's load-balancing term both off and on, **every
+parameter gradient is bit-exact zero** — `check_padded_work.py`, which fails if the real batch does
+not move the weights, so it cannot pass by doing nothing. The batch also counts no supervised token,
+so it does not dilute the step's denominator and the reported loss stays the token-weighted mean over
+the ranks that had data.
+
+The forward does produce NaN, a mean over no supervised token, and it never leaves the forward:
+`ModelOutputLoss` already replaces the loss of a batch with no valid label by zero. The gradient was
+never NaN to begin with.
 
 **The heterogeneity report would have said there is no heterogeneity.** A packed row is one sequence
 to every shape-based measure: `batch_size` reads 1 and the spread between its documents disappears, so

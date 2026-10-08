@@ -132,11 +132,13 @@ def test_the_epoch_ends_when_every_rank_has_run_out():
     assert answer is True, f"the loop carried on with no data anywhere: got={answer}"
 
 
-def test_padded_work_keeps_one_supervised_token():
-    """A finished rank replays its last micro-batch supervised on one token, so it weighs nothing.
+def test_padded_work_supervises_no_token_at_all():
+    """A finished rank replays its last micro-batch supervising nothing, so no sample trains twice.
 
-    Every label masked would make the model's cross-entropy a mean over nothing, and the loss
-    weighting multiplies that by zero, which leaves NaN rather than nothing.
+    Keeping even one token would train on a replayed sample a second time. Masking every one of them
+    is exact rather than merely small: the cross-entropy writes a gradient only where it supervises a
+    token, so the parameter gradients stay at zero -- ``check_padded_work.py`` asserts that on the
+    real model, including with the router's load-balancing term on.
     """
     import torch  # pylint: disable=C0415
 
@@ -149,16 +151,36 @@ def test_padded_work_keeps_one_supervised_token():
 
     model_inputs, loss_inputs = padded[0]
     supervised = int((loss_inputs["labels"] != -100).sum())
-    assert supervised == 1, f"padded work must keep exactly one supervised token: got={supervised}"
-    kept = loss_inputs["labels"][0, 2].item()
-    assert kept == 7, f"the kept token must be the first supervised one: expected=7, got={kept}"
-    assert int(loss_inputs["loss_mask"].sum()) == 1, \
+    assert supervised == 0, f"padded work must supervise no token: got={supervised}"
+    assert int(loss_inputs["loss_mask"].sum()) == 0, \
         f"the loss mask must follow the labels: got={int(loss_inputs['loss_mask'].sum())}"
     # The model computes the loss from the labels it is handed, so they must agree with the weighting.
-    assert int((model_inputs["labels"] != -100).sum()) == 1, \
+    assert int((model_inputs["labels"] != -100).sum()) == 0, \
         f"the model's labels must be masked too: got={int((model_inputs['labels'] != -100).sum())}"
     assert model_inputs["input_ids"].shape == (1, 5), \
         f"padded work must keep the shape of real work: got={tuple(model_inputs['input_ids'].shape)}"
+    # The template is what the rank really read; padding must not alter it in place.
+    assert int((labels != -100).sum()) == 3, \
+        f"the template was masked in place: got={int((labels != -100).sum())}"
+
+
+def test_padded_work_counts_no_token_for_the_loss_weighting():
+    """A padded micro-batch must not dilute the step's token denominator either."""
+    import torch  # pylint: disable=C0415
+
+    from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token  # pylint: disable=C0415
+
+    VLMTrainer = _vlm_trainer()
+    labels = torch.tensor([[-100, -100, 7, 8, 9]])
+    template = [({"input_ids": torch.ones(1, 5, dtype=torch.long), "labels": labels},
+                 {"labels": labels, "loss_mask": labels >= 0})]
+
+    _, loss_inputs = VLMTrainer.padding_micro_batches(_trainer(1, []), template)[0]
+
+    assert int(count_loss_token(template[0][1])["foundation_tokens"]) > 0, \
+        "the template counted no token, so this test proves nothing"
+    counted = int(count_loss_token(loss_inputs)["foundation_tokens"])
+    assert counted == 0, f"padded work must count no supervised token: got={counted}"
 
 
 def test_padded_work_without_a_template_is_refused():
