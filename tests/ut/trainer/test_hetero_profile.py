@@ -179,6 +179,39 @@ def test_batch_workload_tolerates_missing_fields():
     assert (work["tokens"], work["batch_size"], work["images"], work["patches"]) == (10, 2, 0, 0)
 
 
+def test_batch_workload_describes_the_documents_of_a_packed_row():
+    """A packed row reports its documents, their spread and the pairs attention really scores."""
+    lengths = [2000, 8000, 6000]
+    total = sum(lengths)
+    batch = {
+        "input_ids": torch.zeros(1, total, dtype=torch.long),
+        "labels": torch.zeros(1, total, dtype=torch.long),
+        "cu_seq_lens": torch.tensor([0, 2000, 10000, 16000], dtype=torch.int32),
+    }
+    work = batch_workload(batch)
+    assert work["documents"] == 3, f"document count mismatch: expected=3, got={work['documents']}"
+    assert (work["doc_tokens_min"], work["doc_tokens_max"]) == (2000, 8000), \
+        (f"document spread mismatch: expected=(2000, 8000), "
+         f"got={(work['doc_tokens_min'], work['doc_tokens_max'])}")
+    # Documents cannot see each other, so attention costs the sum of the squares and not the square
+    # of the sum: 1.04e8 against the 2.56e8 the row's length alone would suggest.
+    expected_pairs = sum(length ** 2 for length in lengths)
+    assert work["text_attn_pairs"] == expected_pairs, \
+        f"attention pairs mismatch: expected={expected_pairs}, got={work['text_attn_pairs']}"
+    assert work["batch_size"] == 1, f"a packed row is one sequence: got={work['batch_size']}"
+
+
+def test_batch_workload_leaves_an_unpacked_batch_without_packed_fields():
+    """A batch with no boundaries reports none, so an unpacked run reads exactly as before."""
+    batch = {
+        "input_ids": torch.zeros(2, 5, dtype=torch.long),
+        "attention_mask": torch.ones(2, 5, dtype=torch.long),
+    }
+    work = batch_workload(batch)
+    for field in ("documents", "doc_tokens_min", "doc_tokens_max", "text_attn_pairs"):
+        assert field not in work, f"unpacked batch reports {field}: got={work.get(field)}"
+
+
 def test_wrapper_segments_do_not_change_a_role():
     """A checkpoint wrapper in the path leaves the module's role alone."""
     path = "model.language_model.layers.3._checkpoint_wrapped_module.self_attn"

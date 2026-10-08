@@ -154,6 +154,41 @@ def _scalar(value: Any) -> int:
     return int(value.item()) if isinstance(value, torch.Tensor) else int(value)
 
 
+def _packed_workload(batch: Mapping[str, Any]) -> dict[str, Any]:
+    """Describe the documents of a packed row, or nothing when the batch is not packed.
+
+    A packed row is one sequence to every shape-based measure: ``batch_size`` reads 1 and the spread
+    between its documents disappears, so a report built on per-row statistics would say a packed run
+    is perfectly uniform. These fields put the documents back.
+
+    ``text_attn_pairs`` is the attention cost of the row. Attention is quadratic in a sequence, and a
+    packed row is several sequences that cannot see each other, so the cost is the sum of the squares
+    and not the square of the sum: four equal documents cost a quarter of what their total length
+    suggests. The vision tower is already accounted this way, per image.
+
+    Args:
+        batch: One micro-batch of model inputs.
+
+    Returns:
+        The document count, the spread of their lengths and the row's attention cost, or an empty
+        mapping when the batch carries no ``cu_seq_lens``.
+    """
+    bounds = batch.get("cu_seq_lens")
+    if not isinstance(bounds, torch.Tensor) or bounds.numel() < 2:
+        return {}
+    ends = bounds.detach().cpu().reshape(-1).tolist()
+    lengths = [int(end) - int(start) for start, end in zip(ends[:-1], ends[1:])]
+    if not lengths:
+        return {}
+    return {
+        "documents": len(lengths),
+        "doc_tokens_min": min(lengths),
+        "doc_tokens_max": max(lengths),
+        "doc_tokens_mean": sum(lengths) / len(lengths),
+        "text_attn_pairs": sum(length * length for length in lengths),
+    }
+
+
 def batch_workload(batch: Mapping[str, Any], spatial_merge_size: int = 2, max_grids: int = 64) -> dict[str, Any]:
     """Describe the work of one micro-batch from its model inputs.
 
@@ -190,6 +225,7 @@ def batch_workload(batch: Mapping[str, Any], spatial_merge_size: int = 2, max_gr
     media = batch.get("mm_token_type_ids")
     if isinstance(media, torch.Tensor):
         result["image_tokens"] = _scalar((media > 0).sum())
+    result.update(_packed_workload(batch))
 
     patches = attn_pairs = images = videos = 0
     grids: list[list[int]] = []

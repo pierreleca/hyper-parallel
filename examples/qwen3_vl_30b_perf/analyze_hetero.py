@@ -450,12 +450,17 @@ def feature_vector(row: dict, component: str) -> list[float]:
     Tokens and patches are in thousands; the quadratic terms are in millions, which keeps the fit well conditioned.
     The experts' time follows the pairs the rank *receives* (its group's choices for its experts), not the sample
     it holds, when the routing was recorded.
+
+    The attention term is the pairs attention actually scores. A packed row is several documents that cannot
+    see each other, so that is the sum of their squared lengths and not the square of the row's length; the
+    recorder reports it as ``text_attn_pairs`` and the square of the total is only the single-document case.
     """
     tokens = row.get("real_tokens", 0) / 1e3
     if component == "vision":
         return [row.get("patches", 0) / 1e3, row.get("vision_attn_pairs", 0) / 1e6]
     if component in ("text_layer", "text_attn"):
-        return [tokens, tokens * tokens]
+        pairs = row.get("text_attn_pairs")
+        return [tokens, (pairs / 1e6 if pairs is not None else tokens * tokens)]
     if component == "text_experts" and row.get("recv_pairs") is not None:
         return [row["recv_pairs"] / 1e6]
     return [tokens]
