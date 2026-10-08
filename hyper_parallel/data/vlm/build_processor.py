@@ -18,8 +18,6 @@ __all__ = ["build_processor"]
 
 from typing import Any
 
-from transformers import AutoProcessor
-
 
 def build_processor(pretrained_model_name_or_path: str, **kwargs: Any) -> Any:
     """Build the Qwen3-VL processor and surface the tokenizer chat template.
@@ -34,6 +32,10 @@ def build_processor(pretrained_model_name_or_path: str, **kwargs: Any) -> Any:
     Returns:
         The constructed processor.
     """
+    # Deferred: AutoProcessor pulls torchvision, so a module-level import would make the whole
+    # data.vlm package unimportable wherever that is missing, including the unit-test executors.
+    from transformers import AutoProcessor  # pylint: disable=C0415
+
     processor = AutoProcessor.from_pretrained(
         pretrained_model_name_or_path, trust_remote_code=True, **kwargs
     )
