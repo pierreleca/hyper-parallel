@@ -214,6 +214,26 @@ class Composer:
         self.counter += 1
         return record, stats
 
+    def text_only(self, length: int) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Build a sample of about ``length`` tokens that carries no image at all.
+
+        A corpus of these is what tells a text-only sample apart from a short one: the vision tower runs
+        on some ranks of a step and not on others, which is the case the variable-length transform used to
+        refuse.
+
+        Args:
+            length: Target tokens of the sample, all of them text.
+
+        Returns:
+            The record and its statistics, shaped as :meth:`synthetic` returns them.
+        """
+        messages, used = self._text(max(length, MIN_TEXT_TOKENS), 0)
+        record = {"messages": messages, "images": []}
+        stats = {"tokens": used, "visual_tokens": 0, "images": 0, "text_tokens": used,
+                 "turns": len(messages) // 2}
+        self.counter += 1
+        return record, stats
+
     def natural(self, length: int) -> tuple[dict[str, Any], dict[str, Any]]:
         """Build a sample of about ``length`` tokens from consecutive conversations of one subset."""
         subset = self.rng.choice(sorted(self.by_subset))
@@ -319,7 +339,12 @@ def build_samples(args: argparse.Namespace, composer: Composer, rng: random.Rand
     )
     records, stats = [], []
     for index, (length, visual) in enumerate(targets):
-        record, record_stats = composer.natural(length) if scenario.natural else composer.synthetic(length, visual)
+        if rng.random() < args.text_only_share:
+            record, record_stats = composer.text_only(length)
+        elif scenario.natural:
+            record, record_stats = composer.natural(length)
+        else:
+            record, record_stats = composer.synthetic(length, visual)
         record["sample_id"] = index
         record_stats.update(sample_id=index, target_tokens=length, target_visual_tokens=visual)
         records.append(record)
@@ -360,6 +385,7 @@ def prepare(args: argparse.Namespace) -> None:
         meta = {
             "source": "HuggingFaceM4/the_cauldron", "subsets": [subset for subset, _ in _SUBSETS],
             "scenario": args.scenario, "num_samples": args.num_samples, "seed": args.seed, "dp_size": args.dp_size,
+            "text_only_share": args.text_only_share,
             "cost": f"tokens + {args.cost_visual} * visual_tokens", "max_len": args.max_len,
             "tokens": describe([item["tokens"] for item in stats]),
             "visual_tokens": describe([item["visual_tokens"] for item in stats]),
@@ -406,6 +432,8 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--max-image-tokens", type=int, default=2048,
                         help="largest image: 2048 tokens is 1448 x 1448 px")
     parser.add_argument("--max-images", type=int, default=16)
+    parser.add_argument("--text-only-share", type=float, default=0.0,
+                        help="share of samples built with no image at all; needs a transform that allows them")
     parser.add_argument("--arrange", nargs="+", choices=ARRANGEMENTS, default=list(ARRANGEMENTS),
                         help="orders to write; random is vlm_conversations.json, "
                              "the others vlm_conversations.<name>.json")
@@ -417,7 +445,10 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--insecure", action="store_true", help="skip TLS certificate verification")
     parser.add_argument("--verify", type=int, default=8,
                         help="records checked with the training transform (0: none); needs the processor")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not 0.0 <= args.text_only_share <= 1.0:
+        parser.error(f"--text-only-share must be in [0, 1], not {args.text_only_share}")
+    return args
 
 
 if __name__ == "__main__":
