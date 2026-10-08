@@ -43,6 +43,9 @@ _MODEL_INPUT_FIELDS = {
     "image_grid_thw",
     "video_grid_thw",
     "video_timestamp",
+    # A packed batch's document boundaries: the model forwards them to the attention kernel,
+    # which reads them as its variable-length sequence ends.
+    "cu_seq_lens",
 }
 _LOSS_INPUT_FIELDS = {"labels", "loss_mask", "stream_loss_mask"}
 

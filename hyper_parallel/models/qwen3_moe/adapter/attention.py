@@ -72,7 +72,27 @@ def run_qwen3_moe_flash_attention(
     ``replacements.replace_qwen3_moe_flash_attention`` hands to
     ``modules.GQAAttention`` so the replaced module keeps the Qwen mask/cache
     calling convention (compressed causal mask, ``sparse_mode`` selection).
+
+    A packed batch carries its document boundaries in the keyword arguments. The dense path below
+    cannot express them: it asks the kernel for one causal mask over the whole row, which would let
+    every document attend to the ones packed before it. Such a batch is therefore handed to the
+    generic wrapper, which already implements the variable-length contract.
     """
+    # Deferred with torch_npu below: the generic wrapper imports torch_npu at module scope, and this
+    # module stays importable on a CPU-only checkout.
+    from hyper_parallel.components.functional.npu_fusion_attention import (  # pylint: disable=C0415
+        npu_fusion_attention_forward,
+        resolve_packed_sequence_lengths,
+    )
+
+    query_lengths, _ = resolve_packed_sequence_lengths(
+        kwargs, query.shape[0] * query.shape[2], key.shape[0] * key.shape[2],
+    )
+    if query_lengths is not None:
+        return npu_fusion_attention_forward(
+            module, query, key, value, attention_mask, dropout=dropout, scaling=scaling, **kwargs,
+        )
+
     # torch_npu is optional outside Ascend environments.
     import torch_npu  # pylint: disable=C0415
 

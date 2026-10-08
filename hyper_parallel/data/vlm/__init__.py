@@ -31,13 +31,23 @@ from hyper_parallel.data.vlm.get_batch import (
     VLMGetBatch,
     build_vlm_get_batch,
 )
+from hyper_parallel.data.vlm.packing import (
+    VLMPackingCollator,
+    build_packed_position_ids,
+    build_vlm_packing_collator,
+    enable_packed_position_ids,
+)
 
 __all__ = [
     "VLMBatchProcessor",
     "VLMGetBatch",
+    "VLMPackingCollator",
+    "build_packed_position_ids",
     "build_processor",
     "build_vlm_collator",
     "build_vlm_data_transform",
     "build_vlm_dataset",
     "build_vlm_get_batch",
+    "build_vlm_packing_collator",
+    "enable_packed_position_ids",
 ]
