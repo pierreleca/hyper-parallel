@@ -1,14 +1,15 @@
 # Data-heterogeneity features: what was built, what is proven, what to run
 
-Two branches, both off `hetero-profile-32dev`, both pushed to `pierre`.
+Two branches, both off `hetero-profile-32dev`, both pushed to `pierre`. The second contains the
+first, so running it is running both. Cost-balanced batching was left out, as asked.
 
 | branch | what it adds | state |
 | --- | --- | --- |
 | `data-hetero-varlen` | variable-length samples, text-only documents | proven on the host, unit tested |
-| `data-hetero-packing` | packing and per-document masking, on top of the above | numerics proven on the host; the Ascend variable-length kernel is untested |
+| `data-hetero-packing` | packing by a token budget, per-document masking | numerics proven on the host; the Ascend variable-length kernel is untested |
 
-`data-hetero-packing` contains `data-hetero-varlen`, so running the second is running both. Cost-balanced
-batching was left out, as asked.
+Every default is unchanged — `padding="max_length"`, `text_only="keep"`, `packing=False`,
+`packed_position_ids=false` — so a run that sets nothing behaves exactly as before.
 
 ---
 
@@ -17,27 +18,22 @@ batching was left out, as asked.
 **1. Prove packing on the host. No cluster, no checkpoint, seconds.**
 
 ```bash
-PYTHONPATH=. python examples/qwen3_vl_30b_perf/check_packing.py
+python examples/qwen3_vl_30b_perf/check_packing.py
 ```
 
-Three documents, two of them carrying images, run alone and then packed into one row. It prints the
-largest logit difference both without position ids and with them, and fails if either is wrong way
-round. Last run: `3.635e-01` without, `1.639e-07` with.
+Six documents — four carrying images of different grid shapes, two text-only — run alone and then
+packed into one row. Last run: `2.811e-01` without position ids, **`1.937e-07`** with them. It fails
+if either number is the wrong way round, so it cannot pass by doing nothing.
 
-**2. Price padding.** The claim on the ideas slide is arithmetic; this measures it.
+**2. Price padding.** Paired comparison, the tight interval.
 
 ```bash
 DATASET=both examples/qwen3_vl_30b_perf/hetero_campaign.sh plans/hetero_padding_32dev.sh
 ```
 
-Six runs: three repeats a side, light recorder, plus one hooked pair. **Paired comparison**, so the
-interval is the tight one — padding changes the shape of a step, never which samples are in it, and the
-recorder's fingerprint weights token ids by position with the pad id at zero, so a padded sample and an
-unpadded one share it. Verified: a 137-token sample padded to 512 and to 16384 gives the same number.
-
-Expect the unpadded arm to win by roughly the ratio of the ceiling to the mean sample. The padded arm
-should also report `busiest/mean` near the control run's 1.09, because padding removes the data
-heterogeneity entirely.
+Padding changes the shape of a step, never which samples are in it, and the recorder's fingerprint
+weights ids by position with the pad id at zero — verified: a 137-token sample padded to 512 or to
+16384 gives the identical number. So `compare_runs.py` pairs the steps.
 
 **3. Text-only documents.** Needs a dataset first.
 
@@ -48,93 +44,142 @@ python examples/qwen3_vl_30b_perf/prepare_hetero_data.py --scenario both --num-s
 DATASET=textonly examples/qwen3_vl_30b_perf/hetero_campaign.sh plans/hetero_textonly_32dev.sh
 ```
 
-The first arm, `keep_1`, is the one that may hang rather than fail, and it is first and alone on purpose.
-Let it time out; the campaign moves on.
+The first arm, `keep_1`, is the one that may stall rather than fail, and it is first and alone on
+purpose. Let it time out; the campaign moves on.
 
-**4. Packing.** Needs a shorter dataset, for the reason in the plan's header.
+**4. Packing.** Two campaigns, because a campaign carries one configuration and the arms need two.
 
 ```bash
-python examples/qwen3_vl_30b_perf/prepare_hetero_data.py --scenario both --num-samples 640 \
-  --mean-len 4096 --max-len 8192 --mean-visual 1024 \
-  --output-dir /home/pl/data/qwen3_vl_30b_perf/hetero_short_n640 \
-  --processor-path /home/pl/Qwen3-VL-30B-A3B-Instruct
-DATASET=short examples/qwen3_vl_30b_perf/hetero_campaign.sh plans/hetero_packing_32dev.sh
+DATASET=both examples/qwen3_vl_30b_perf/hetero_campaign.sh plans/hetero_baseline_32dev.sh
+DATASET=both examples/qwen3_vl_30b_perf/hetero_campaign.sh plans/hetero_packing_32dev.sh
 ```
 
-**Not paired** — a packed row is one sequence with one fingerprint where the padded arm has two, so the
-wide interval applies. Run `hetero_baseline_32dev.sh` on the same dataset first to know what it is.
+then join them with the `compare_runs.py` command in the packing plan's header. **Not paired** — a
+packed row is one sequence with one fingerprint where the unpacked arm has one per sample, so the
+wide interval applies.
 
 ---
 
-## The three things that decided the design
+## Version A against version B, and which is in
 
-**Padding is not free in the experts.** The router scores a pad position like any real token; only
-attention masks it. So padding to a constant costs the ratio of that constant to the mean sample, in the
-decoder *and* in the MoE block.
+The collator is shared; what differs is which dataloader decides what list it gets.
 
-**A packed row needs four rows of position ids, and row 0 must be the text ramp.** `get_rope_index`
-returns three rows — temporal, height, width — and takes no document-boundary argument, so on a packed
-row it emits one continuous ramp. Transformers segments the causal mask wherever row 0 of a four-row
-`[text, T, H, W]` tensor fails to advance by one. The temporal row cannot serve: an image block holds it
-*constant* across all of its tokens, so a mask read from it would cut every image away from the text
-before it. Measured on a small model: `row1 = [0, 1, 2, 0, 1, 2, 2, 2, 2, 4, 5, 6]` for two documents, the
-plateau being the second one's image.
+| | decides the list | row length | the spread |
+| --- | --- | --- | --- |
+| A `FixedBatchDataLoader`, `micro_batch_size: 2` | the sampler: exactly two samples | `L₁ + L₂`, varies ~4× | **survives** |
+| B `DynamicBatchDataLoader`, token budget | the lengths: fill to 16384 | ≈ the budget | **dies** |
 
-**The study's text attention discarded the boundaries.** `run_qwen3_moe_flash_attention` began with
-`del kwargs` and asked the kernel for one causal mask over the whole row with `input_layout="BNSD"`. Any
-packed batch would have been silently wrong. It now hands such a batch to
-`components/functional/npu_fusion_attention.py`, which already implements the TND variable-length
-contract, and is untouched otherwise. **This is the part the host cannot test.**
+**B is what is wired now**, in `train_32dev_a3_packing.yaml`. A was the first attempt and measured the
+weaker thing: it recovers the padding two unequal samples would have needed and leaves the imbalance
+between ranks exactly where it was.
+
+Modelled on the study's spread, 32 dies, budget 16384, counting tokens:
+
+| | steps | busiest/mean | idle | throughput |
+| --- | --- | --- | --- | --- |
+| unpacked, one sample a die | 40 | **2.00** | 50% | — |
+| packed, buffer 2 | 26 | **1.32** | 24% | +53% |
+| packed, buffer 8 | 22 | 1.12 | 11% | +80% |
+| packed, buffer 200 (the library default) | 21 | 1.05 | 5% | +89% |
+
+Read that as a direction, not a number: it assumes a step costs the slowest die's token count, and
+the measured ladder already shows a step is not purely linear in tokens. The point is the mechanism —
+packing changes a die's unit of work from *one sample*, which varies four-fold, to *one token
+budget*, which is fixed.
+
+**The configuration uses buffer 2, not a deeper one, on purpose.** Depth buys fill and costs
+reordering, and 2 is the last depth at which nothing is reordered at all:
+
+| `min_buffered_samples` | token cv | fill | sample drift mean | p95 | max |
+| --- | --- | --- | --- | --- | --- |
+| 1 or 2 | 0.26 | 76% | **0.0** | **0** | **0** |
+| 8 | 0.11 | 89% | 1.3 | 4 | 6 |
+| 200 (default) | 0.06 | 95% | 25.9 | 121 | 197 |
+
+A sample that does not fit is deferred, so a deep buffer effectively picks by length — a
+small-window version of the sorting that was ruled out. At buffer 2 the batcher holds only the two-odd
+samples that reach the budget, takes them in order, and a deferred one simply leads the next row.
+The sequence the sampler chose survives intact; only the row and step boundaries move.
+
+**No sample is ever split.** The batcher takes a sample whole or defers it whole, and a sample larger
+than the whole budget forms a row by itself rather than being cut — which is why rows come out at 76%
+full rather than 100%. That is the price of not splitting, and it is the right price to pay: a split
+document's second half would begin a row with no prompt in front of it and document masking puts the
+first half out of reach, so the model would be trained to answer a question it was never shown.
+Three unit tests guard it.
 
 ---
 
-## What is not done, and the one thing I would not trust
+## Three things that would have broken, found and fixed
 
-**A rank that genuinely skips the vision tower still hangs.** The tower is sharded over all 32 dies, so a
-rank whose sample holds no image does not join the all-gather of the tower's weights. `text_only =
-placeholder` sidesteps this by giving such a sample the smallest image the tower accepts — one merge block
-of blank patches, one image token, label masked — so every rank stays on the same path. That is a
-side-step, not a fix.
+**Ranks would have hung.** A token budget turns an equal number of samples into an unequal number of
+rows: simulated on the study's spread, 32 ranks produce between **7 and 14** micro-batches from the
+same 20 samples. The step loop caught `StopIteration` per rank and broke, so the first rank to run out
+would leave while the others were still in that step's collectives. There is no number of steps every
+rank can reach. Fixed in `vlm_trainer.py`: reading a step's micro-batches is collective-free, so it is
+the point at which the ranks can still agree — `data_exhausted_anywhere` reduces the flag with max
+over the data-parallel group and they stop together.
 
-The fix is to make every rank run the tower whether or not it has an image. I did not build it, and the
-reason is worth recording: the tower must run at the *same point in the forward* on every rank or the
-collective order diverges and the job deadlocks on something unrelated. The real tower runs between the
-embedding and the decoder, and with activation recompute it runs twice, so a hook that fires once would
-desynchronise against ranks that fire twice. That needs a cluster to settle, and guessing it in code that
-looks finished would be worse than leaving it out.
+**The heterogeneity report would have said there is no heterogeneity.** A packed row is one sequence
+to every shape-based measure: `batch_size` reads 1 and the spread between its documents disappears, so
+`real_tokens` cv would have read ~0. The recorder now reads `cu_seq_lens` and reports the document
+count, the shortest and longest of them, and the pairs attention really scored.
 
-**Also untested on hardware:** the variable-length kernel path above, and whether `cu_seq_lens` flowing
-through the model's generic keyword arguments reaches the vision tower harmlessly. The vision attention
-passes its own `cu_seq_lens_q`/`cu_seq_lens_k` explicitly, so an extra unprefixed key should be ignored,
-but that is reasoning, not a measurement.
+**The cost model would have been 2.5× wrong.** Attention is quadratic in a sequence, and a packed row
+is several sequences that cannot see each other, so it scores the sum of the squared lengths, not the
+square of the sum. For documents of 2000, 8000 and 6000 tokens that is 1.04e8 pairs against the 2.56e8
+the row's length suggests. The model takes the measured figure where the recorder supplies it.
 
 ---
 
-## Environment note worth fixing
+## What is not validated, and the one thing I would not trust
 
-`pip show hyper_parallel` in the `hp-cpu` environment points at `/home/pl/dev/hyper-parallel-sapp`, not
-this checkout. Imports resolve to this tree only because the current directory precedes the editable
-finder, which holds for `python -c` and `pytest` but **not** for running a script — a script puts its own
-directory on the path, not the working directory. That is why `check_packing.py` is documented with
-`PYTHONPATH=.`. `AGENTS.md` says to re-run `pip install -e .` from the repository root; I did not, because
-it would repoint the shared environment away from whatever `hyper-parallel-sapp` is being used for.
+**The Ascend variable-length kernel.** `run_qwen3_moe_flash_attention` opened with `del kwargs` and
+hard-coded `input_layout="BNSD"`, so the study's text attention discarded the document boundaries and
+asked the kernel for one causal mask over the whole row — any packed batch would have been silently
+wrong. It now hands such a batch to `components/functional/npu_fusion_attention.py`, which already
+implements the TND contract, and is untouched otherwise. **The host cannot exercise this.** It shows up
+on the cluster as a loss that tracks the baseline's or does not.
+
+**A rank that genuinely skips the vision tower still hangs.** `text_only = placeholder` side-steps it
+with the smallest image the tower accepts — one blank merge block, one image token, label masked,
+checked against the tower's own feature-count rule. The real fix is forcing the tower to run on every
+rank, and it has a trap I could not settle here: the tower must run at the same point in the forward
+on every rank or the collective order diverges, and with activation recompute the real tower runs
+twice, so a hook firing once would desynchronise.
+
+**Smaller, worth knowing:**
+
+- `cu_seq_lens` reaches the model through its generic keyword arguments and so passes the vision
+  tower, which forwards its own `cu_seq_lens_q`/`_k` explicitly. An extra unprefixed key should be
+  ignored there, but that is reasoning, not a measurement.
+- The loss weighting is exact at one micro-batch per step, which is this configuration. Above that,
+  `step_token_counts = current × num_micro_steps` weights each micro-batch 1/M instead of by its token
+  share — already true today with `padding: none`, and worth fixing before raising
+  `global_batch_size`.
+- The token budget balances `input_ids` length, which does not balance the vision tower: its cost
+  follows `pixel_values`, and on `natural` a sample carries eleven images. A token-balanced row is not
+  a compute-balanced one.
+- `global_batch_size: 32` becomes decorative under a token budget — a step consumes a variable number
+  of samples. Compare loss against consumed samples, never against step number, and never set
+  `train_samples`.
 
 ---
 
 ## Upstreaming
 
-The library commits are separable from the example ones, so an MR can take just these:
+The library commits are separable from the example ones:
 
 ```
-9450581a fix(data): defer the VLM processor's transformers import
-581cb270 feat(data): keep VLM samples at their own length, pad the micro-batch
-804da712 feat(data): let a text-only VLM sample carry a blank image placeholder
-7408a4a1 feat(data): pack VLM samples into one row, per document
+fix(data): defer the VLM processor's transformers import
+feat(data): keep VLM samples at their own length, pad the micro-batch
+feat(data): let a text-only VLM sample carry a blank image placeholder
+feat(data): pack VLM samples into one row, per document
+fix(trainer): stop every rank on the same step when the data runs out
 ```
 
 The first is a prerequisite for the others' tests: `build_processor` imported `transformers` at module
 scope, which pulled `torchvision` and made the whole `data.vlm` package unimportable on the unit-test
-executors. Deferring it is what let the collator, the transform and the packing tests exist at all.
-
-Every default is unchanged: `padding="max_length"`, `text_only="keep"`, `packing=False`. A run that sets
-nothing behaves exactly as before.
+executors. Deferring it is what let the collator, transform and packing tests exist at all. The last
+is a genuine bug fix independent of packing — it also covers a ragged final epoch with the fixed
+dataloader.
