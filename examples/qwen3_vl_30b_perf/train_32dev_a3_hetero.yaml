@@ -42,6 +42,9 @@ model:
   pretrained_model_name_or_path: /home/e00642590/Qwen3-VL-30B-A3B-Instruct
   # The whole model: 48 text layers. Crop with --model.num_hidden_layers=N when a shape does not fit.
   num_hidden_layers: 48
+  # Builds the per-document position ids of a packed batch on the way into the forward. Without them a
+  # packed row gets one continuous ramp and every document attends to the ones before it.
+  packed_position_ids: false
   local_files_only: true
   torch_dtype: bfloat16
   # On Ascend, transformers routes flash_attention_2 to torch_npu's
@@ -167,6 +170,11 @@ dataloader:
   _target_: hyper_parallel.data.batching.FixedBatchDataLoader
   collate_fn:
     _target_: hyper_parallel.data.vlm.build_vlm_collator
+    # false pads the micro-batch into a stack of rows, one per sample, at the length of its longest.
+    # true concatenates them into one row instead and records the document boundaries, which needs
+    # model.packed_position_ids below. Peak memory is linear in the tokens a rank holds either way,
+    # so raising micro_batch_size needs the sample length lowered to match.
+    packing: false
   # get_batch omitted: VLMTrainer defaults to build_vlm_get_batch.
   dataloader_type: single
   data_rearrange_map: null

@@ -194,15 +194,19 @@ class TestVlmCollatorPadding(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_packing_is_still_refused(self):
-        """Verify the packing switch keeps reporting that it is not implemented.
+    def test_the_packing_switch_selects_the_packing_collator(self):
+        """Verify the switch returns the collator that concatenates instead of padding.
 
         Feature: VLM micro-batch padding.
-        Description: Build the collator with packing enabled.
-        Expectation: NotImplementedError.
+        Description: Build the collator with packing enabled and collate two samples.
+        Expectation: One packed row carrying the document boundaries.
         """
-        with self.assertRaises(NotImplementedError):
-            build_vlm_collator(packing=True)
+        batch = build_vlm_collator(packing=True)([_sample(5, images=0), _sample(3, images=0)])
+
+        self.assertEqual(tuple(batch["input_ids"].shape), (1, 8),
+                         f"not packed: expected=(1, 8), got={tuple(batch['input_ids'].shape)}")
+        got = batch["cu_seq_lens"].tolist()
+        self.assertEqual(got, [0, 5, 8], f"boundaries mismatch: expected=[0, 5, 8], got={got}")
 
 
 if __name__ == "__main__":

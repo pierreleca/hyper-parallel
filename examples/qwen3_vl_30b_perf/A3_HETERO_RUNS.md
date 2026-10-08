@@ -634,6 +634,7 @@ iterate on the class rules: the *other* class and the pairing lines of the repor
 | --- | --- |
 | `train_32dev_a3_hetero.yaml` | the configuration: 32 dies, the whole model, the recorders on |
 | `prepare_hetero_data.py` | the datasets; the length of a sample is kept by `padding: none` in the configuration |
+| `check_packing.py` | proves on the host that a packed row gives the logits of its documents run alone |
 | `hetero_campaign.sh`, `hetero_campaign_status.sh`, `plans/hetero_*.sh` | the campaign runner (runs, reports, comparisons) and its plans |
 | `analyze_hetero.py` | the heterogeneity report: data, components, cost model, imbalance, ceilings, what-ifs |
 | `compare_runs.py` | baseline against candidate: speedup and interval, pairing, numerics, per-component change |

@@ -16,12 +16,13 @@
 
 __all__ = ["VLMCollator", "build_vlm_collator"]
 
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import torch
 from torch.utils.data import default_collate
 
 from hyper_parallel.data.constants import IGNORE_INDEX
+from hyper_parallel.data.vlm.packing import VLMPackingCollator
 
 _TEXT_FIELDS = {
     "input_ids",
@@ -154,21 +155,24 @@ def build_vlm_collator(
         pad_token_id: int = 0,
         ignore_index: int = IGNORE_INDEX,
         pad_to_length: Optional[int] = None,
-) -> VLMCollator:
+) -> Union[VLMCollator, VLMPackingCollator]:
     """Build the VLM micro-batch collator.
 
     Args:
-        packing: Reserved switch for VeOmni-style text packing.
+        packing: Concatenate the micro-batch into one row instead of padding it into a stack of rows.
+            A packed batch needs the per-document position ids that
+            :func:`hyper_parallel.data.vlm.enable_packed_position_ids` installs, or every document
+            attends to the ones packed before it.
         pad_token_id: Padding value for text input IDs.
         ignore_index: Label value excluded from loss computation.
-        pad_to_length: Pad to this fixed length instead of the micro-batch's longest sample.
+        pad_to_length: Pad to this fixed length instead of the micro-batch's longest sample; when
+            packing, pad the packed row up to it and register the tail as one more document.
 
     Returns:
         A collator producing one VLM micro-batch dictionary.
-
-    Raises:
-        NotImplementedError: If ``packing`` is requested.
     """
     if packing:
-        raise NotImplementedError("The temporary VLM collator does not support packing")
+        return VLMPackingCollator(
+            pad_to_length=pad_to_length, pad_token_id=pad_token_id, ignore_index=ignore_index,
+        )
     return VLMCollator(pad_token_id=pad_token_id, ignore_index=ignore_index, pad_to_length=pad_to_length)

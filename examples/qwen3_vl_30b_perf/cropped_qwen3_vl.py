@@ -32,6 +32,7 @@ from typing import Any
 
 from transformers import AutoConfig, PreTrainedModel
 
+from hyper_parallel.data.vlm import enable_packed_position_ids
 from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.models import HyperAutoModelForImageTextToText
 from hyper_parallel.models.build_options import CompileConfig
@@ -52,6 +53,7 @@ def build_cropped_qwen3_vl(
         compile_config: CompileConfig | dict[str, Any] | None = None,
         activation_checkpoint: str | None = None,
         activation_swap: str = "none",
+        packed_position_ids: bool = False,
 ) -> PreTrainedModel:
     """Create a Qwen3-VL-MoE model with fewer text layers, from its checkpoint.
 
@@ -84,6 +86,7 @@ def build_cropped_qwen3_vl(
         compile_config: Optional Trainer-provided compile configuration.
         activation_checkpoint: Activation checkpoint mode.
         activation_swap: Activation swap mode.
+        packed_position_ids: Build the per-document position ids of a packed batch on the way in.
 
     Returns:
         A parallelized, cropped Qwen3-VL-MoE model with checkpoint weights.
@@ -125,7 +128,7 @@ def build_cropped_qwen3_vl(
     config.use_cache = False
     text_config.use_cache = False
 
-    return HyperAutoModelForImageTextToText.from_pretrained(
+    model = HyperAutoModelForImageTextToText.from_pretrained(
         pretrained_model_name_or_path,
         config=config,
         local_files_only=local_files_only,
@@ -139,6 +142,12 @@ def build_cropped_qwen3_vl(
         activation_checkpoint=activation_checkpoint,
         activation_swap=activation_swap,
     )
+    if packed_position_ids:
+        # A packed batch carries no position ids, and the model would build one continuous ramp over
+        # the whole row: every document would attend to the ones before it. The hook builds them per
+        # document, and leaves an unpacked batch untouched.
+        enable_packed_position_ids(model)
+    return model
 
 
 __all__ = ["build_cropped_qwen3_vl"]
