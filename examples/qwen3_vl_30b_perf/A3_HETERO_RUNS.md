@@ -205,11 +205,11 @@ Each directory holds the images, `vlm_conversations.json` (the draw order), `vlm
 and `meta.json`. The builder prints, per order, how far the slowest rank of a step is above the mean *by its
 cost estimate*, before any run: a balanced order should be near 1.0, a random one well above.
 
-Every sample has at least one image on purpose. The vision tower is sharded over all ranks, so a rank that
-skipped it (a text-only sample) would not join the all-gather of its weights and the others would wait for ever.
-`variable_length_transform.py` refuses a sample that would lose all its images to truncation for the same reason.
-The stock transform pads every sample to `max_seq_len`; this one does not, which is what lets the text shape
-differ between ranks.
+Every sample has at least one image unless `--text-only-share` asks for some without. The vision tower is
+sharded over all ranks, so a rank that skipped it (a text-only sample) would not join the all-gather of its
+weights and the others would wait for ever; running the tower on every rank is what makes such a sample safe.
+The transform's default pads every sample to `max_seq_len`, which would make every rank run the same text
+shape; the configuration sets `padding: none`, and that is what lets the shape differ between ranks.
 
 ## Runs
 
@@ -633,7 +633,7 @@ iterate on the class rules: the *other* class and the pairing lines of the repor
 | File | Role |
 | --- | --- |
 | `train_32dev_a3_hetero.yaml` | the configuration: 32 dies, the whole model, the recorders on |
-| `prepare_hetero_data.py`, `variable_length_transform.py` | the datasets, and the transform that keeps each sample's length |
+| `prepare_hetero_data.py` | the datasets; the length of a sample is kept by `padding: none` in the configuration |
 | `hetero_campaign.sh`, `hetero_campaign_status.sh`, `plans/hetero_*.sh` | the campaign runner (runs, reports, comparisons) and its plans |
 | `analyze_hetero.py` | the heterogeneity report: data, components, cost model, imbalance, ceilings, what-ifs |
 | `compare_runs.py` | baseline against candidate: speedup and interval, pairing, numerics, per-component change |

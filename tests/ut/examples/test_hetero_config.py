@@ -41,7 +41,7 @@ _SCRIPT = textwrap.dedent("""
     print(config.hetero_profile.enabled, config.hetero_profile.output_dir, config.hetero_profile.start_step)
     print(config.ep_instrument.enabled, config.ep_instrument.segment_peaks, config.activation_checkpoint.mode)
     print(config.dataset.data_path)
-    print(config.dataset.data_transform._target_path)
+    print(config.dataset.data_transform._target_path, config.dataset.data_transform.padding)
     print(config.model._target_path)
     print(config.hetero_profile.hooks, config.hetero_profile.enabled, config.ep_instrument.enabled,
           config.training.train_iters, config.training.global_batch_size)
@@ -67,7 +67,9 @@ def test_configuration_resolves_with_the_defaults():
     assert lines[0] == "32 2 16 1 32"
     assert lines[1].startswith("True /home/pl/runs/qwen3_vl_30b_perf/a3_32dev_hetero/hetero 3")
     assert lines[2] == "True False full"
-    assert "variable_length_transform" in lines[4]
+    assert "build_vlm_data_transform" in lines[4], lines[4]
+    # padding none is what makes a rank's work depend on its sample; the default would hide it.
+    assert lines[4].endswith(" none"), lines[4]
     assert "cropped_qwen3_vl" in lines[5]
 
 

@@ -279,9 +279,10 @@ def measure(json_path: Path, processor_path: str, max_seq_len: int, indices: Seq
     # Heavy optional imports, only needed for the verification.
     from hyper_parallel.data.vlm import build_processor  # pylint: disable=C0415
     from hyper_parallel.data.vlm.dataset import VLMDataset  # pylint: disable=C0415
-    from variable_length_transform import build_variable_length_vlm_transform  # pylint: disable=C0415
+    from hyper_parallel.data.vlm import build_vlm_data_transform  # pylint: disable=C0415
 
-    transform = build_variable_length_vlm_transform(processor=build_processor(processor_path), max_seq_len=max_seq_len)
+    transform = build_vlm_data_transform(
+        processor=build_processor(processor_path), max_seq_len=max_seq_len, padding="none")
     dataset = VLMDataset(str(json_path))
     reports = []
     for index in indices:

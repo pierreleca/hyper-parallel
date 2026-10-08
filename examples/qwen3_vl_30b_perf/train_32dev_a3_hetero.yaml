@@ -149,13 +149,15 @@ dataset:
   model_assets:
     chat_template: null
     tokenizer: null
-  # Keeps each sample at its own length: the stock transform pads every sample to max_seq_len, so every
-  # rank would run the same text shape. micro_batch_size must stay 1 (the collator stacks text fields).
-  # max_seq_len is only a ceiling (nothing is padded to it): the builder's --max-len (16384) sets the longest
-  # sample, and the slack keeps its token estimate from ever truncating one.
+  # padding: none keeps each sample at its own length. With the default "max_length" every sample is
+  # padded to max_seq_len, so every rank runs the same text shape and the pad positions are routed
+  # through the experts like real tokens, which hides the data heterogeneity these runs measure.
+  # max_seq_len is then only a ceiling (nothing is padded to it): the builder's --max-len (16384) sets
+  # the longest sample, and the slack keeps its token estimate from ever truncating one.
   data_transform:
-    _target_: examples.qwen3_vl_30b_perf.variable_length_transform.build_variable_length_vlm_transform
+    _target_: hyper_parallel.data.vlm.build_vlm_data_transform
     max_seq_len: 20000
+    padding: none
 
 dataloader:
   _target_: hyper_parallel.data.batching.FixedBatchDataLoader
