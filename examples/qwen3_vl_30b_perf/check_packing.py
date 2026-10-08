@@ -141,11 +141,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     model, config = build_model()
-    documents = [
-        make_document(config, 6, [1, 2, 2], seed=11),
-        make_document(config, 5, None, seed=12),
-        make_document(config, 4, [1, 4, 4], seed=13),
-    ]
+    # A mix worth exercising: four images of different grids and two text-only documents, so the
+    # grids must be consumed in the order their placeholders appear and a document with none must be
+    # skipped over rather than handed someone else's grid.
+    specifications = [(6, [1, 2, 2]), (5, None), (4, [1, 4, 4]), (3, None), (7, [1, 2, 4]), (4, [1, 4, 2])]
+    documents = [make_document(config, text_tokens, grid, seed=20 + index)
+                 for index, (text_tokens, grid) in enumerate(specifications)]
     print(f"{len(documents)} documents of "
           f"{[int(document['input_ids'].numel()) for document in documents]} tokens")
 
