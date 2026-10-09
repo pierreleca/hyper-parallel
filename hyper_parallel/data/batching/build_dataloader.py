@@ -107,8 +107,20 @@ def _normalize_source_samples(source_item: Any) -> list[Mapping[str, Any]]:
 def _restore_index_buffer(
         source_dataset: Any,
         saved_buffer: Sequence[Any],
+        sample_cost: Callable[[Mapping[str, Any]], int],
 ) -> list[tuple[Mapping[str, Any], int]]:
-    """Rebuild buffered ModelSamples from output index and sample index."""
+    """Rebuild buffered ModelSamples from output index and sample index.
+
+    Args:
+        source_dataset: Dataset replaying source items behind the streaming cursor.
+        saved_buffer: Checkpointed ``(output_index, sample_idx)`` entries.
+        sample_cost: What one sample spends of the token budget, which must be the same
+            measure the checkpoint was written with; ``load_state_dict`` rejects a buffer
+            whose costs do not add up to the saved total, so changing it mid-run is caught.
+
+    Returns:
+        One ``(model_sample, cost)`` pair per checkpointed entry.
+    """
     restored_buffer = []
     cached_output_index: Any = object()
     cached_model_samples: list[Mapping[str, Any]] = []
@@ -129,11 +141,7 @@ def _restore_index_buffer(
                 f"Buffered sample_idx={resolved_sample_idx} is out of range for output_index={output_index!r}"
             ) from exc
 
-        sample_length = int(model_sample["input_ids"].shape[-1])
-        if sample_length <= 0:
-            raise ValueError("Dynamic batching samples must contain at least one token")
-
-        restored_buffer.append((model_sample, sample_length))
+        restored_buffer.append((model_sample, sample_cost(model_sample)))
 
     return restored_buffer
 
@@ -313,10 +321,18 @@ class TextTokenBatcher:
         token_budget: Target packed-token limit for one forward-backward batch.
             A single sample may exceed this limit and forms a batch by itself.
         min_buffered_samples: Minimum candidate samples buffered before batching.
+        visual_token_weight: Extra budget a multimodal token spends on top of the text
+            token it already is, in text-token equivalents. Zero, the default, charges
+            every token alike and is what a text corpus wants. A positive weight makes
+            the budget track the cost of a sample rather than its length: an image's
+            placeholder run occupies one position each in ``input_ids`` but also drives
+            the vision encoder, which the length alone does not see. Rows then hold fewer
+            physical tokens than the budget, never more, so the memory ceiling still holds.
     """
 
     token_budget: int
     min_buffered_samples: int
+    visual_token_weight: float = 0.0
     buffer: list[tuple[Mapping[str, Any], int]] = field(default_factory=list, init=False)
     buffer_output_indices: list[Any | None] = field(default_factory=list, init=False)
     buffer_token_count: int = field(default=0, init=False)
@@ -329,12 +345,40 @@ class TextTokenBatcher:
         if self.min_buffered_samples <= 0:
             raise ValueError("min_buffered_samples must be positive")
 
-    def put_item(self, model_sample: Mapping[str, Any], output_index_entry: Any | None = None) -> None:
-        """Append one ModelSample and its token length."""
+        if self.visual_token_weight < 0.0:
+            raise ValueError("visual_token_weight must not be negative")
+
+    def sample_cost(self, model_sample: Mapping[str, Any]) -> int:
+        """Return what one sample spends of the token budget.
+
+        Args:
+            model_sample: One transformed sample.
+
+        Returns:
+            The sample's text length, plus its multimodal tokens weighted by
+            ``visual_token_weight`` when that is set and the sample declares them.
+
+        Raises:
+            ValueError: If the sample carries no token.
+        """
         sample_length = int(model_sample["input_ids"].shape[-1])
         if sample_length <= 0:
             raise ValueError("Dynamic batching samples must contain at least one token")
 
+        if not self.visual_token_weight:
+            return sample_length
+
+        # Absent on a text corpus, and on a text-only sample of a multimodal one.
+        modal_token_types = model_sample.get("mm_token_type_ids")
+        if modal_token_types is None:
+            return sample_length
+
+        visual_tokens = int((modal_token_types != 0).sum())
+        return sample_length + int(round(self.visual_token_weight * visual_tokens))
+
+    def put_item(self, model_sample: Mapping[str, Any], output_index_entry: Any | None = None) -> None:
+        """Append one ModelSample and what it spends of the budget."""
+        sample_length = self.sample_cost(model_sample)
         buffered_sample = (model_sample, sample_length)
         self.buffer.append(buffered_sample)
         self.buffer_output_indices.append(output_index_entry)
@@ -411,6 +455,7 @@ class _IndexBufferDynamicBatchRuntime:
             self,
             saved_buffer: Sequence[Any],
             saved_by_idx: bool,
+            sample_cost: Callable[[Mapping[str, Any]], int],
     ) -> tuple[list[tuple[Mapping[str, Any], int]], list[Any]]:
         """Rebuild buffered ModelSamples from output index and sample index."""
         if not saved_by_idx:
@@ -419,7 +464,7 @@ class _IndexBufferDynamicBatchRuntime:
 
             return [], []
 
-        restored_buffer = _restore_index_buffer(self.source_dataset, saved_buffer)
+        restored_buffer = _restore_index_buffer(self.source_dataset, saved_buffer, sample_cost)
         restored_indices = list(saved_buffer)
         return restored_buffer, restored_indices
 
@@ -453,13 +498,14 @@ class _FullBufferDynamicBatchRuntime:
             self,
             saved_buffer: Sequence[Any],
             saved_by_idx: bool,
+            sample_cost: Callable[[Mapping[str, Any]], int],
     ) -> tuple[list[tuple[Mapping[str, Any], int]], list[Any]]:
         """Restore full samples that cannot be fetched behind the cursor."""
         if saved_by_idx:
             if saved_buffer and self.replay_dataset is None:
                 raise ValueError("An index-buffer checkpoint requires a replayable Dataset")
 
-            restored_buffer = _restore_index_buffer(self.replay_dataset, saved_buffer)
+            restored_buffer = _restore_index_buffer(self.replay_dataset, saved_buffer, sample_cost)
         else:
             restored_buffer = list(saved_buffer)
         restored_indices = [None] * len(restored_buffer)
@@ -482,6 +528,8 @@ class DynamicBatchDataLoader:
             Mapping Datasets default to true and iterable Datasets default to false.
         max_seq_len: Maximum sample length used to derive the token budget.
         min_buffered_samples: Minimum candidate samples buffered before batching.
+        visual_token_weight: Extra budget a multimodal token spends, in text-token
+            equivalents; see :class:`TextTokenBatcher`. Zero charges every token alike.
         drop_last: Compatibility option retained from fixed DataLoader configuration.
             Dynamic buffers are always drained when the source is exhausted.
         use_background_prefetcher: Trainer-side prefetch policy.
@@ -502,6 +550,7 @@ class DynamicBatchDataLoader:
             save_by_idx: bool | None = None,
             max_seq_len: int | None,
             min_buffered_samples: int = 200,
+            visual_token_weight: float = 0.0,
             drop_last: bool = True,
             use_background_prefetcher: bool = False,
             num_workers: int = 0,
@@ -533,6 +582,7 @@ class DynamicBatchDataLoader:
         self.batcher = TextTokenBatcher(
             token_budget=token_budget,
             min_buffered_samples=min_buffered_samples,
+            visual_token_weight=visual_token_weight,
         )
         is_iterable = _is_iterable_dataset(dataset)
         if batch_sampler is not None:
@@ -639,6 +689,7 @@ class DynamicBatchDataLoader:
         restored_buffer, restored_indices = self._runtime.restore_buffer(
             saved_buffer,
             previous_save_by_idx,
+            self.batcher.sample_cost,
         )
 
         restored_token_count = sum(sample_length for _, sample_length in restored_buffer)

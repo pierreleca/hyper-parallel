@@ -63,6 +63,10 @@ then join them with the `compare_runs.py` command in the packing plan's header. 
 packed row is one sequence with one fingerprint where the unpacked arm has one per sample, so the
 wide interval applies.
 
+The packing campaign runs four arms: `packed_1` and `packed_2` are the repeat pair,
+`packed_costaware` adds `--dataloader.visual_token_weight=0.31`, and `packed_hooks` carries the
+per-component hooks. The campaign compares `packed_costaware` against the pooled repeats itself.
+
 ---
 
 ## Version A against version B, and which is in
@@ -183,8 +187,13 @@ twice, so a hook firing once would desynchronise.
   follows `pixel_values`, and on `natural` a sample carries eleven images. This caps the gain but
   does not threaten the target: the tower is 6.1% of `natural`'s step, so even at four times
   imbalanced it adds 18 points of imbalance against the 131 the run carries today, and the modelled
-  gain stays between +55% and +120%. Weighting a sample by `tokens + 0.31 x visual` in the budget
-  would close most of it, and costs no reordering.
+  gain stays between +55% and +120%. The `packed_costaware` arm now measures whether closing it is
+  worth it: `dataloader.visual_token_weight` charges a multimodal token that many extra text tokens
+  of the budget, and the arm runs at 0.31 — 6.1% of a step over a visual share of about a fifth of
+  the tokens. It reorders nothing, and a weighted row holds fewer real tokens than the budget, never
+  more, so memory only improves. Default 0.0 is exactly the unweighted behaviour.
+  If the arm needs more than 20 steps to drain, read its throughput over the 20 it ran rather than
+  raising `train_iters`: the comparison is work per second, not epochs.
 - `global_batch_size: 32` becomes decorative under a token budget — a step consumes a variable number
   of samples. Compare loss against consumed samples, never against step number, and never set
   `train_samples`.

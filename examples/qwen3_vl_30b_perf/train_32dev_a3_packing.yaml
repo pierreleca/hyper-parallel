@@ -194,6 +194,10 @@ dataloader:
   # pixel values included, would sit in host memory before the first row. 2 is also the depth at
   # which no sample is deferred past another, so the order the sampler chose is left intact.
   min_buffered_samples: 2
+  # visual_token_weight (default 0.0, so absent here) charges a multimodal token this many extra
+  # text tokens of the budget. The budget counts input_ids, which prices an image's placeholder run
+  # like text while it also drives the vision encoder. plans/hetero_packing_32dev.sh runs one arm at
+  # 0.31 from the command line; weighting shrinks a row's real tokens, so memory only improves.
   collate_fn:
     _target_: hyper_parallel.data.vlm.build_vlm_collator
     # false pads the micro-batch into a stack of rows, one per sample, at the length of its longest.

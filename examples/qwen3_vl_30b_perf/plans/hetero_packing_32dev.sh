@@ -48,9 +48,19 @@ DATA="/home/pl/data/qwen3_vl_30b_perf/hetero_${DATASET}_n640/vlm_conversations.j
 COMMON="--dataset.data_path=$DATA --training.train_iters=20"
 LIGHT="--hetero_profile.hooks=false --ep_instrument.enabled=false"
 HOOKED="--ep_instrument.enabled=false"
+# The budget counts input_ids, which does not price the vision encoder: an image's placeholder run
+# takes one position each like a text token, and also drives the tower. 0.31 is what the measured run
+# implies -- the tower is 6.1% of a step on `natural` against a visual share of about a fifth of the
+# tokens -- so a visual token is charged 1.31 text tokens. Rows then hold fewer real tokens than the
+# budget, never more, so the memory ceiling is unchanged. The arm answers whether the vision residual
+# the plain budget leaves is worth closing; 0.0 is the default and is what packed_1 and packed_2 run.
+COSTAWARE="--dataloader.visual_token_weight=0.31"
 RUNS=(
   "packed_1 $COMMON $LIGHT"
   "packed_2 $COMMON $LIGHT"
+  "packed_costaware $COMMON $LIGHT $COSTAWARE"
   "packed_hooks $COMMON $HOOKED"
 )
-COMPARE=("packed_2:packed_1")
+# packed_2:packed_1 is the repeat interval. The cost-aware arm is NOT paired with it -- weighting
+# changes which samples share a row, so the fingerprints do not match and the wide interval applies.
+COMPARE=("packed_2:packed_1" "packed_costaware:packed_1,packed_2")

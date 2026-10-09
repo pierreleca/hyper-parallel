@@ -331,5 +331,96 @@ class TestPackedPositionIds(unittest.TestCase):
                 )
 
 
+class TestVisualTokenWeight(unittest.TestCase):
+    """The token budget can charge a multimodal token more than a text token."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_the_default_weight_charges_every_token_alike(self):
+        """Verify an unset weight leaves the cost at the sample's length.
+
+        Feature: Cost-weighted token budget.
+        Description: Cost a sample carrying images with the default weight.
+        Expectation: The cost equals the number of tokens, images or not.
+        """
+        batcher = TextTokenBatcher(token_budget=100, min_buffered_samples=1)
+
+        plain = batcher.sample_cost(_sample(10))
+        with_image = batcher.sample_cost(_sample(10, images=1))
+
+        self.assertEqual(plain, 10, f"text cost mismatch: expected=10, got={plain}")
+        self.assertEqual(with_image, 10, f"image cost mismatch: expected=10, got={with_image}")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_a_weight_charges_the_multimodal_tokens_extra(self):
+        """Verify the weight is added per multimodal token, text tokens unchanged.
+
+        Feature: Cost-weighted token budget.
+        Description: Cost a text-only and an image-bearing sample at weight 0.5.
+        Expectation: Text costs its length; the image's two tokens add one more.
+        """
+        batcher = TextTokenBatcher(token_budget=100, min_buffered_samples=1, visual_token_weight=0.5)
+
+        plain = batcher.sample_cost(_sample(10))
+        with_image = batcher.sample_cost(_sample(10, images=1))
+
+        self.assertEqual(plain, 10, f"a text-only sample must not be charged extra: got={plain}")
+        self.assertEqual(with_image, 11, f"two image tokens at 0.5 must add one: expected=11, got={with_image}")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_a_weighted_row_holds_no_more_physical_tokens_than_the_budget(self):
+        """Verify weighting shrinks a row, so the memory ceiling the budget sets still holds.
+
+        Feature: Cost-weighted token budget.
+        Description: Fill a budget of 24 from image-bearing samples, unweighted and weighted.
+        Expectation: The weighted row holds fewer tokens, and at most the budget.
+        """
+        budget = 24
+
+        def _row_tokens(weight):
+            batcher = TextTokenBatcher(token_budget=budget, min_buffered_samples=1,
+                                       visual_token_weight=weight)
+            for _ in range(8):
+                batcher.put_item(_sample(8, images=1))
+            return sum(int(sample["input_ids"].shape[-1]) for sample in batcher.get_micro_batch())
+
+        unweighted, weighted = _row_tokens(0.0), _row_tokens(2.0)
+
+        self.assertEqual(unweighted, budget, f"the unweighted row must fill the budget: got={unweighted}")
+        self.assertLess(weighted, unweighted,
+                        f"weighting must shrink the row: unweighted={unweighted}, weighted={weighted}")
+        self.assertLessEqual(weighted, budget,
+                             f"a weighted row must not exceed the budget in real tokens: got={weighted}")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_a_negative_weight_is_refused(self):
+        """Verify a negative weight raises rather than making a sample cost less than its length.
+
+        Feature: Cost-weighted token budget.
+        Description: Build a batcher with a negative weight.
+        Expectation: ValueError.
+        """
+        with self.assertRaises(ValueError):
+            TextTokenBatcher(token_budget=100, min_buffered_samples=1, visual_token_weight=-0.1)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_a_text_corpus_without_modality_metadata_still_costs(self):
+        """Verify a sample with no ``mm_token_type_ids`` costs its length even when weighted.
+
+        Feature: Cost-weighted token budget.
+        Description: Cost a bare text sample at a non-zero weight.
+        Expectation: The cost equals the number of tokens.
+        """
+        batcher = TextTokenBatcher(token_budget=100, min_buffered_samples=1, visual_token_weight=0.31)
+
+        cost = batcher.sample_cost({"input_ids": torch.arange(7, dtype=torch.long)})
+
+        self.assertEqual(cost, 7, f"a text sample must cost its length: expected=7, got={cost}")
+
+
 if __name__ == "__main__":
     unittest.main()
