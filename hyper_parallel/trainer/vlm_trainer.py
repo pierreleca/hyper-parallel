@@ -283,6 +283,11 @@ class VLMTrainer:
                 "a rank ran out of data before its first step while others had some; the sampler "
                 "handed it nothing, which is a configuration problem rather than a ragged epoch"
             )
+        if any(batch is None for batch in template):
+            raise ValueError(
+                "the padding template holds released micro-batches: the step loop nulls each slot of "
+                "the list it is given, so the template must be a copy taken before the step ran"
+            )
         padded = []
         for model_inputs, loss_inputs in template:
             labels = loss_inputs.get("labels")
@@ -388,7 +393,10 @@ class VLMTrainer:
                 if exhausted:
                     training_batches = self.padding_micro_batches(template)
                 else:
-                    template = training_batches
+                    # A copy, because the step loop releases each micro-batch by nulling its slot in
+                    # the list it is handed. Keeping the list itself would leave the template [None]
+                    # as soon as the step ran, and the first rank to run out would read it.
+                    template = list(training_batches)
                 self.train_step(data_iterator, training_batches=training_batches)
 
             self.on_epoch_end()

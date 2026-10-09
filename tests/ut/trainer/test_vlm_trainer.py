@@ -183,6 +183,42 @@ def test_padded_work_counts_no_token_for_the_loss_weighting():
     assert counted == 0, f"padded work must count no supervised token: got={counted}"
 
 
+def test_the_step_loop_releases_its_micro_batches_and_a_copy_survives():
+    """A padding template must be a copy: the step loop nulls the slots of the list it is handed.
+
+    This is the shape of a failure seen on 32 dies -- the template aliased the live list, the step
+    released its micro-batches into it, and the first rank to run out unpacked None. The method under
+    test is the one that does the releasing, so the invariant is checked against it rather than
+    against a restatement of it.
+    """
+    import torch  # pylint: disable=C0415
+
+    VLMTrainer = _vlm_trainer()
+    # Real label tensors: the step loop counts the micro-batch's supervised tokens as it goes.
+    labels = torch.tensor([[1, 2, 3]])
+    batches = [({"input_ids": labels, "labels": labels}, {"labels": labels}) for _ in range(2)]
+    alias, copy = batches, list(batches)
+    loss = SimpleNamespace(item=lambda: 0.0)
+    trainer = SimpleNamespace(base=SimpleNamespace(
+        model_reshard=lambda *_: None,
+        configure_fsdp_gradient_sync=lambda *_: None,
+        forward_backward_step=lambda _: (loss, {}),
+        current_token_counts={}, step_token_counts={},
+    ))
+
+    VLMTrainer._forward_backward_micro_batches(trainer, batches, 2)  # pylint: disable=protected-access
+
+    assert alias == [None, None], f"the step loop must release its micro-batches: got={alias}"
+    assert all(batch is not None for batch in copy), f"a copy must survive the step: got={copy}"
+    # And the guard turns a re-break into a named error rather than a TypeError mid-epoch.
+    try:
+        VLMTrainer.padding_micro_batches(trainer, alias)
+    except ValueError as error:
+        assert "copy" in str(error), f"the error should name the cause: got={error}"
+        return
+    raise AssertionError("a template of released micro-batches was accepted")
+
+
 def test_padded_work_without_a_template_is_refused():
     """A rank that never read a micro-batch was handed no data, which is not a ragged epoch."""
     VLMTrainer = _vlm_trainer()
