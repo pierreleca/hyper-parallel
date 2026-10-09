@@ -244,8 +244,25 @@ fail against the old resolver.
 
 So **every packed arm run before 2026-10-09 is void**, numerics and timing both: they trained with
 documents attending across their boundaries, and they asked the kernel for a full `[S, S]` causal
-mask instead of the compressed `2048 x 2048` one that `sparse_mode` 3 uses. Rerun
-`check_packed_attention.py` first — it must report `TND`, sparse mode 3 — then the arms.
+mask instead of the compressed `2048 x 2048` one that `sparse_mode` 3 uses.
+
+**With the fix, `PASS`, and bit-exactly.** Same die, both dtypes: the row runs `TND` at sparse mode
+3, and a document's attention packed beside four others is **`0.000e+00`** from the same document run
+alone — not within a tolerance, identical. Both legs sit `3.576e-07` from the float32 reference
+(`8.099e-03` in bfloat16, the same figure for each, as bit-equal outputs must give), and collapsing
+the boundaries moves the answer by 3.9. The kernel computes each segment as though it were the only
+one. Attention is therefore out of the picture for any packed-against-dense difference that turns up
+later: what remains to doubt is the rope positions, the loss weighting across documents, and the
+routing of packed tokens.
+
+**One confound to carry into the speed comparison.** The packed path asks for the compressed mask at
+sparse mode 3; the dense path builds a full `[S, S]` mask at sparse mode 0, which hands the kernel no
+structure to skip. Per token, the packed arm then pays about half the dense arm's attention — 4096
+score cells against 8192, since a row of two 8192-token documents costs what each costs alone. At
+attention's measured 9.0% of a `both` step that is some 4 points of apparent packing gain that is
+really the mask mode, and it wants separating: either an arm with the dense path on the compressed
+mask, or the step time of both modes measured on a die. The study's own configuration comments claim
+the mask-free path already runs the causal sparse mode; the code builds the full mask instead.
 
 **A rank that genuinely skips the vision tower still hangs.** `text_only = placeholder` side-steps it
 with the smallest image the tower accepts — one blank merge block, one image token, label masked,
