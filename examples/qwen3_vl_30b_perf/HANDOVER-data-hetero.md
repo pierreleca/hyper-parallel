@@ -31,6 +31,15 @@ The first: six documents — four carrying images of different grid shapes, two 
 and then packed into one row. Last run: `2.811e-01` without position ids, **`1.937e-07`** with them.
 It fails if either number is the wrong way round, so it cannot pass by doing nothing.
 
+Read what it covers precisely, because the device does it differently. Here isolation arrives
+through Transformers' mask: the packed batch carries per-document position ids, Transformers reads
+the restarts in them and builds a block-diagonal causal mask — printed and confirmed, queries of the
+second document see its own tokens and none of the first's — and the eager kernel obeys it. Under
+`attn_implementation: flash_attention_2` that mask is `None` and the kernel is expected to find the
+boundaries itself, from `cu_seq_lens`, which does reach the attention's keyword arguments and routes
+to `npu_fusion_attention_forward` (TND, `sparse_mode` 3, `actual_seq_qlen` from the boundaries). Two
+mechanisms, one checked here and the other on a die, in step 4.
+
 The second: a rank's padded work trains on nothing. Every parameter gradient bit-exact zero, with
 the router's load-balancing term off and on, no supervised token counted, the forward's NaN
 contained — and it fails if the real batch it is compared against moves no weight.
@@ -70,6 +79,30 @@ the packed path must compute what the dense path computes. That makes the steps 
 real packed arm's are not. Run this before reading any packed step time — a loss that fails to track
 here localises the fault in the kernel or the four-row position ids, with nothing else moved. It
 recovers no padding and no imbalance, so expect the baseline's step time.
+
+**Ran 2026-10-09**, `single_1`+`single_2` against `both_a`+`both_b`, 17 paired steps: end to end
+**−0.1%** [−1.0%, +0.6%], loss mean **0.46%** worst **0.91%**, peak 38.5 GiB against 38.5. The twin
+packed runs put the floor at 0.30% and 0.69%, so the packed path lands on the dense path at the
+resolution two runs of one configuration leave. The gradient norm differs by 40% on average and 498%
+at worst, against 15% and 43% between the twins: the forward's rounding moves router decisions, so
+the set of experts carrying gradient differs, which the loss averages away and a global norm does
+not. It certifies nothing either way, which is why the loss is the check.
+
+**What one document per row cannot see.** With a single segment the variable-length path and the
+dense path are the same computation, so the arm cannot tell whether the kernel read the boundaries at
+all. That needs two documents in a row, and no 32-die arm can supply the pairing for it. This does,
+at the level of the operator, on one die, with no model and no checkpoint:
+
+```bash
+PYTHONPATH=. python examples/qwen3_vl_30b_perf/check_packed_attention.py
+PYTHONPATH=. python examples/qwen3_vl_30b_perf/check_packed_attention.py --dtype bfloat16
+```
+
+Five documents, run one at a time through the wrapper's dense path and then concatenated into one
+row through its variable-length path, against each other and against a float32 reference with an
+explicit block-diagonal mask. The control collapses the boundaries to a single segment and must come
+out wrong. On a host without `torch_npu`, or with `--device cpu`, it compares its own two references
+instead and says so.
 
 **5. Packing, for speed.** Two campaigns, because a campaign carries one configuration and the arms
 need two.
@@ -193,8 +226,13 @@ reads `input_ids.shape[0]`; the recorder's `documents` field is the one to trust
 hard-coded `input_layout="BNSD"`, so the study's text attention discarded the document boundaries and
 asked the kernel for one causal mask over the whole row — any packed batch would have been silently
 wrong. It now hands such a batch to `components/functional/npu_fusion_attention.py`, which already
-implements the TND contract, and is untouched otherwise. **The host cannot exercise this.** It shows up
-on the cluster as a loss that tracks the baseline's or does not.
+implements the TND contract, and is untouched otherwise. **The host cannot exercise this**, and the
+single-segment arm of step 4 cannot either: it showed the variable-length path landing on the dense
+path to within the run-to-run floor, which is worth having and is not the same statement, because one
+document a row is a plain causal row whichever path runs. `check_packed_attention.py` is the one that
+settles it, and until it has run on a die the isolation of two documents in one row rests on reading
+the code: TND, `sparse_mode` 3 and `actual_seq_qlen` from the boundaries, with `is_causal` defaulting
+to true through both `GQAAttention` and `_attention_options`.
 
 **A rank that genuinely skips the vision tower still hangs.** `text_only = placeholder` side-steps it
 with the smallest image the tower accepts — one blank merge block, one image token, label masked,
@@ -206,8 +244,11 @@ twice, so a hook firing once would desynchronise.
 **Smaller, worth knowing:**
 
 - `cu_seq_lens` reaches the model through its generic keyword arguments and so passes the vision
-  tower, which forwards its own `cu_seq_lens_q`/`_k` explicitly. An extra unprefixed key should be
-  ignored there, but that is reasoning, not a measurement.
+  tower, which forwards its own `cu_seq_lens_q`/`_k` explicitly. Measured on the host: the key does
+  arrive at the vision attention. It is ignored there, which is now read rather than assumed — the
+  replacement matches `*.language_model.layers.*.self_attn` only, so the tower keeps Transformers'
+  own implementation, and that one names `cu_seq_lens_q` and `cu_seq_lens_k` as parameters and never
+  reads the unprefixed name.
 - The loss weighting is exact at one micro-batch per step, which is this configuration. Above that,
   `step_token_counts = current × num_micro_steps` weights each micro-batch 1/M instead of by its token
   share — already true today with `padding: none`, and worth fixing before raising
