@@ -1,0 +1,286 @@
+# The packing path's correctness arm, NOT a performance arm.
+#
+# This is examples/qwen3_vl_30b_perf/train_32dev_a3_hetero.yaml with exactly two keys flipped:
+# collate_fn.packing and model.packed_position_ids. The dataloader, the sample order, the sequence
+# ceiling and the batch size are the study's, so micro_batch_size stays 1 and every packed row holds
+# a single document.
+#
+# Why that is worth a run of its own. check_packing.py proves on the host that a packed row gives the
+# logits of its documents run alone, but it cannot reach the Ascend variable-length kernel, which the
+# study's text attention now hands a packed batch. One document per row is the case where the packed
+# path and the dense path must agree EXACTLY: one segment, one causal mask, the same samples in the
+# same order as the baseline arm. So the loss is comparable step for step, and compare_runs.py can
+# pair the steps -- which it cannot do for a real packed arm, where a row's fingerprint covers
+# several samples.
+#
+# Run it against the baseline's both_a / both_b. A loss that tracks step for step says the kernel and
+# the four-row position ids are right, and anything the real packed arm then shows comes from
+# regrouping the samples rather than from the maths. A loss that does not match localises the fault
+# here, with nothing else changed.
+#
+# It is not a speed measurement: one document per row recovers none of the padding and none of the
+# imbalance, so expect the baseline's step time.
+#
+# Qwen3-VL-30B-A3B-Instruct on 32 Ascend A3 dies (two 16-die nodes): where the model's and the
+# data's heterogeneity cost step time. FSDP 32 over the dense weights; EP 16 inside each node (8 of the
+# 128 experts per rank, all-to-all intra-node); each expert group FSDP-sharded over the 2 nodes
+# (edp_shard 2). Global rank = node rank x 16 + local rank, so the EP groups are the nodes.
+#
+# What it measures, per rank and step (hetero_profile and ep_instrument, both on):
+# - the data: tokens, images, vision patches and the vision attention cost of every micro-batch,
+#   and how far the ranks of one step differ in them;
+# - the model: the device time of the vision blocks, of each decoder layer with its attention and
+#   MoE block, of the head and the loss, in the forward pass, the recompute and the backward pass,
+#   and the idle time between modules (the wait for weights, exposed communication);
+# - the MoE: routed counts per layer and EP rank, the phases of each block (router, dispatch
+#   all-to-all, experts, combine all-to-all), and the experts the image tokens and the text tokens choose.
+# Reports: analyze_hetero.py (the heterogeneity report), analyze_ep_instrument.py (the EP phases),
+# analyze_npu_trace.py (the Ascend profiler, with profiling.enabled and profiling.ranks).
+#
+# Data: one directory per scenario, built per node by prepare_hetero_data.py (A3_HETERO_RUNS.md): fixed,
+# text, vision, both, longtail, natural, all with the same mean tokens, so a scenario differs from
+# another in spread only. The sampler gives step s the samples 32 s to 32 s + 31, one per rank; the
+# ".balanced" file of a directory holds the same samples ordered so that the ranks of a step get alike ones.
+#
+# Memory: the full model needs 8 bytes per parameter (bf16 weights, gradients and AdamW moments), about
+# 8 GB per die over 32 dies; the rest is activations, set by the longest sample (16384 tokens) and the
+# recompute mode. Expandable segments are needed: without them the cache held 10 GiB it could not hand
+# out as one block (the fp32 logits gradient).
+#
+# Paths, all outside the repository (the code travels as a zip; data and runs stay put): the checkpoint
+# in /home/e00642590/Qwen3-VL-30B-A3B-Instruct on every A3 node (/home/pl/Qwen3-VL-30B-A3B-Instruct on A2),
+# the raw cauldron Parquet files in /home/pl/data/the_cauldron, the prepared datasets in
+# /home/pl/data/qwen3_vl_30b_perf/<name>, the run outputs in /home/pl/runs/qwen3_vl_30b_perf/<run>.
+#
+# Launch with cluster-kit (NPROC_PER_NODE=16 in cluster.env, two nodes selected). REMOTE_ENV_SETUP must
+# export, next to the toolkit and the Python environment:
+#   PYTORCH_NPU_ALLOC_CONF=expandable_segments:True TASK_QUEUE_ENABLE=1
+#   CPU_AFFINITY_CONF=1 HCCL_CONNECT_TIMEOUT=1800
+# Run it with hetero_campaign.sh and a plan (plans/hetero_*.sh); see A3_HETERO_RUNS.md.
+
+model:
+  _target_: examples.qwen3_vl_30b_perf.cropped_qwen3_vl.build_cropped_qwen3_vl
+  # One key: the checkpoint, the HF configuration that the builder crops, and
+  # the processor source that the VLM Trainer reads.
+  pretrained_model_name_or_path: /home/e00642590/Qwen3-VL-30B-A3B-Instruct
+  # The whole model: 48 text layers. Crop with --model.num_hidden_layers=N when a shape does not fit.
+  num_hidden_layers: 48
+  # Builds the per-document position ids of a packed batch on the way into the forward. Without them a
+  # packed row gets one continuous ramp and every document attends to the ones before it.
+  # true makes the model read per-document mrope from cu_seq_lens; needed by packing.
+  packed_position_ids: true
+  local_files_only: true
+  torch_dtype: bfloat16
+  # On Ascend, transformers routes flash_attention_2 to torch_npu's
+  # npu_fusion_attention: varlen over per-image cu_seqlens in the vision tower;
+  # the fused text attention below runs the causal sparse mode.
+  attn_implementation: flash_attention_2
+  # Under EP the sharding planner covers the text decoder but, in the vision
+  # tower, only the LayerNorms, and its coverage check fails. This keeps the
+  # undeclared vision parameters as plain FSDP parameters (the correct layout
+  # at TP = CP = 1) and turns the check into a warning.
+  allow_uncovered_params: true
+  validate_placement: false
+
+training:
+  train_iters: 14
+  global_batch_size: 32
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  # Off: deterministic collectives and kernels change the timing this configuration is here to measure.
+  enable_full_determinism: false
+  logging_steps: 1
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 16
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 32
+  edp_shard_size: 2
+  replicate_params: []
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+# Module replacements run before sharding and checkpoint loading.
+# module_type + exact_type keep the vision tower untouched. Replacement targets
+# must not nest, so the per-head q/k norms inside self_attn stay Transformers
+# RMSNorm modules.
+plan_overrides:
+  # torch_npu.npu_rms_norm for the decoder-layer and final text norms.
+  - match:
+      - "*.language_model.layers.*.input_layernorm"
+      - "*.language_model.layers.*.post_attention_layernorm"
+      - "*.language_model.norm"
+    module_type: transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextRMSNorm
+    exact_type: true
+    replace_module:
+      _target_: hyper_parallel.components.modules.RMSNorm
+  # modules.GQAAttention (fused QKV projection, fused RoPE) driven by the
+  # Qwen3 attention interface: mask-free batches run npu_fusion_attention's
+  # causal sparse mode, which skips fully masked blocks.
+  - match: "*.language_model.layers.*.self_attn"
+    module_type: transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextAttention
+    exact_type: true
+    replace_module:
+      _target_: hyper_parallel.models.qwen3_moe.adapter.replacements.replace_qwen3_moe_flash_attention
+  # Grouped-GEMM routed experts (npu_moe_token_permute + npu_grouped_matmul).
+  - match: "*.language_model.layers.*.mlp.experts"
+    module_type: transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextExperts
+    exact_type: true
+    replace_module:
+      _target_: hyper_parallel.components.modules.GroupedExperts
+  # EP all-to-all dispatch/combine around the grouped experts. Scoped to the
+  # text layers: the vision blocks also own "mlp" modules.
+  - match: "*.language_model.layers.*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn
+      use_grouped_gemm: true
+
+mixed_precision:
+  enabled: false
+
+# Full recompute: the whole model fits at the longest sample (16384 tokens) only this way.
+# "selective" keeps the expensive operators and recomputes the rest (faster, more memory);
+# "off" keeps everything (a cropped model only). The profiler tells the recompute from the
+# forward pass, so every mode is analysed alike.
+activation_checkpoint:
+  mode: "full"
+
+activation_swap: none
+
+compile:
+  enabled: false
+
+dataset:
+  _target_: hyper_parallel.data.vlm.build_vlm_dataset
+  # Built by prepare_hetero_data.py (see the header): one directory per scenario, and in it one JSON
+  # file per order of the same samples (vlm_conversations.json is the random order).
+  data_path: /home/pl/data/qwen3_vl_30b_perf/hetero_both_n640/vlm_conversations.json
+  data_config:
+    source_type: online
+  model_assets:
+    chat_template: null
+    tokenizer: null
+  # padding: none keeps each sample at its own length. With the default "max_length" every sample is
+  # padded to max_seq_len, so every rank runs the same text shape and the pad positions are routed
+  # through the experts like real tokens, which hides the data heterogeneity these runs measure.
+  # max_seq_len is then only a ceiling (nothing is padded to it): the builder's --max-len (16384) sets
+  # the longest sample, and the slack keeps its token estimate from ever truncating one.
+  data_transform:
+    _target_: hyper_parallel.data.vlm.build_vlm_data_transform
+    max_seq_len: 20000
+    padding: none
+    # Every sample of these datasets holds an image, so "keep" costs nothing. A corpus built with
+    # --text-only-share needs "placeholder": the tower is sharded over all 32 dies, and a rank whose
+    # sample holds no image would not join the all-gather of its weights.
+    text_only: keep
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.vlm.build_vlm_collator
+    # false pads the micro-batch into a stack of rows, one per sample, at the length of its longest.
+    # true concatenates them into one row instead and records the document boundaries, which needs
+    # model.packed_position_ids below. Peak memory is linear in the tokens a rank holds either way,
+    # so raising micro_batch_size needs the sample length lowered to match.
+    # true concatenates the micro-batch into one row and records its document boundaries.
+    # With micro_batch_size 1 that row holds exactly ONE document, which is the point of
+    # this configuration: the packed path must then compute what the dense path computes.
+    packing: true
+  # get_batch omitted: VLMTrainer defaults to build_vlm_get_batch.
+  dataloader_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  # Image preprocessing and tokenization of long samples run in worker
+  # processes so they stay off the training critical path.
+  num_workers: 4
+  pin_memory: false
+  prefetch_factor: 2
+
+optimizer:
+  _target_: hyper_parallel.components.optim.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: /home/pl/runs/qwen3_vl_30b_perf/checkpoints
+
+debug:
+  check_nan_inf: false
+  check_dataset: null
+
+# The Ascend profiler, for the two steps of the profile plan. A trace of one step of this model takes
+# gigabytes per rank, so the plan names the ranks it compares instead of profiling all 32 (rank: -1), and
+# the profiler drops its raw collection directory once it has parsed it into ASCEND_PROFILER_OUTPUT, which
+# is what the reports read (trace_view.json). Traces stay on the nodes; delete them once read.
+profiling:
+  enabled: false
+  rank: 0
+  ranks: []
+  start_step: 6
+  end_step: 8
+  trace_dir: /home/pl/runs/qwen3_vl_30b_perf/a3_32dev_hetero/profile
+  record_shapes: false
+  profile_memory: false
+  with_stack: false
+  with_modules: false
+  data_simplification: true
+
+# Expert-parallel imbalance recording. start_step skips the warm-up steps, whose
+# allocator growth and first-touch HCCL links say nothing about the steady state;
+# end_step 0 records to the end of the run.
+ep_instrument:
+  enabled: true
+  output_dir: /home/pl/runs/qwen3_vl_30b_perf/a3_32dev_hetero/instrument
+  start_step: 3
+  end_step: 0
+  # No peak per phase boundary: it resets the allocator's peak counters in the middle of the step,
+  # and hetero_profile reads one peak per step.
+  segment_peaks: false
+  # No barrier before each step: the barrier's communicator costs about 400 MB of HCCL buffers
+  # outside PyTorch's allocator, and the ranks are coupled by the collectives of every layer anyway.
+  align_steps: false
+  record_counts: true
+
+# Per-component device timing and per-micro-batch workload (analyze_hetero.py reads it). The profiler
+# hooks the vision blocks, the decoder layers with their attention and MoE blocks and the head; the
+# cost is a few hundred device events per step. start_step skips the warm-up steps.
+hetero_profile:
+  enabled: true
+  output_dir: /home/pl/runs/qwen3_vl_30b_perf/a3_32dev_hetero/hetero
+  start_step: 3
+  end_step: 0
+  vision_blocks: true
+  sublayers: true
+  routing_by_modality: true
+  memory: true
+  step_peaks: true

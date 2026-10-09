@@ -22,6 +22,7 @@ import textwrap
 _ROOT = pathlib.Path(__file__).parents[3]
 _CONFIG = _ROOT / "examples" / "qwen3_vl_30b_perf" / "train_32dev_a3_hetero.yaml"
 _PACKING_CONFIG = _ROOT / "examples" / "qwen3_vl_30b_perf" / "train_32dev_a3_packing.yaml"
+_SINGLE_CONFIG = _ROOT / "examples" / "qwen3_vl_30b_perf" / "train_32dev_a3_packing_single.yaml"
 # The packing configuration is a copy, because the config system loads one file and refuses to
 # change a _target_ from the command line. These are the only keys it is allowed to differ in.
 _PACKING_DELTAS = {
@@ -31,6 +32,13 @@ _PACKING_DELTAS = {
     "dataloader.collate_fn.packing": (False, True),
     "model.packed_position_ids": (False, True),
     "dataset.data_transform.max_seq_len": (20000, 16384),
+}
+
+# The correctness arm is the study configuration with the packing path on and nothing else moved, so
+# one micro-batch is one document and the packed path must compute what the dense path computes.
+_SINGLE_DELTAS = {
+    "dataloader.collate_fn.packing": (False, True),
+    "model.packed_position_ids": (False, True),
 }
 
 # Run in a subprocess: resolving the configuration imports its targets, which need a torch_npu stand-in, and that
@@ -101,6 +109,32 @@ def test_the_packing_config_is_the_study_config_plus_the_documented_deltas():
     for key, (was, now) in _PACKING_DELTAS.items():
         assert base.get(key) == was, f"{key} in the study config: expected={was}, got={base.get(key)}"
         assert packing.get(key) == now, f"{key} in the packing config: expected={now}, got={packing.get(key)}"
+
+
+def test_the_correctness_config_turns_packing_on_and_moves_nothing_else():
+    """One document per row isolates the packed path, so only the two packing keys may differ.
+
+    The arm's whole value is that the samples, their order and the batch size are the study's: a loss
+    that then fails to track the baseline's localises the fault in the packed path and nowhere else.
+    Any other drift would spoil that, so it fails here.
+    """
+    import yaml  # pylint: disable=C0415
+
+    base = _flatten(yaml.safe_load(_CONFIG.read_text(encoding="utf-8")))
+    single = _flatten(yaml.safe_load(_SINGLE_CONFIG.read_text(encoding="utf-8")))
+
+    differing = {key for key in set(base) | set(single) if base.get(key) != single.get(key)}
+    expected = set(_SINGLE_DELTAS)
+    assert differing == expected, (f"the correctness config drifted: unexpected={sorted(differing - expected)}, "
+                                   f"missing={sorted(expected - differing)}")
+    for key, (was, now) in _SINGLE_DELTAS.items():
+        assert base.get(key) == was, f"{key} in the study config: expected={was}, got={base.get(key)}"
+        assert single.get(key) == now, f"{key} in the correctness config: expected={now}, got={single.get(key)}"
+    # One document per row is the invariant the arm rests on.
+    assert base.get("training.micro_batch_size") == 1, \
+        f"the arm needs one sample per micro-batch: got={base.get('training.micro_batch_size')}"
+    assert single.get("dataloader._target_") == "hyper_parallel.data.batching.FixedBatchDataLoader", \
+        f"a token budget would put several documents in a row: got={single.get('dataloader._target_')}"
 
 
 def test_configuration_resolves_with_the_defaults():

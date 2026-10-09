@@ -57,7 +57,22 @@ DATASET=textonly examples/qwen3_vl_30b_perf/hetero_campaign.sh plans/hetero_text
 The first arm, `keep_1`, is the one that may stall rather than fail, and it is first and alone on
 purpose. Let it time out; the campaign moves on.
 
-**4. Packing.** Two campaigns, because a campaign carries one configuration and the arms need two.
+**4. Is the packed path correct on Ascend?** One document per row, paired against the baseline.
+
+```bash
+DATASET=both examples/qwen3_vl_30b_perf/hetero_campaign.sh plans/hetero_packing_single_32dev.sh
+```
+
+`train_32dev_a3_packing_single.yaml` is the study configuration with exactly two keys flipped,
+`collate_fn.packing` and `model.packed_position_ids`, so `micro_batch_size` stays 1 and every packed
+row holds a single document: the same samples in the same order as `both_a`, one segment per row, and
+the packed path must compute what the dense path computes. That makes the steps **pairable**, which a
+real packed arm's are not. Run this before reading any packed step time — a loss that fails to track
+here localises the fault in the kernel or the four-row position ids, with nothing else moved. It
+recovers no padding and no imbalance, so expect the baseline's step time.
+
+**5. Packing, for speed.** Two campaigns, because a campaign carries one configuration and the arms
+need two.
 
 ```bash
 DATASET=both examples/qwen3_vl_30b_perf/hetero_campaign.sh plans/hetero_baseline_32dev.sh
@@ -164,6 +179,15 @@ the row's length suggests. The model takes the measured figure where the recorde
 ---
 
 ## What is not validated, and the one thing I would not trust
+
+**The loss is a mean over few tokens.** The sample transform encodes the prompt as every message but
+the last, so it supervises **only the final answer** of each conversation — about 25 tokens a sample,
+so roughly 800 a step across the 32 ranks unpacked and 1600 packed. Two consequences. The trainer's
+own `data/step_tokens` and `tokens/s` are therefore tiny and are not comparable with the recorder's
+input-token figures, which are some 300 times larger. And "does the packed loss track the baseline's"
+is a weak test on one step: compare the curve over the whole run, which is what step 4 above is for.
+`data/consumed_samples` counts **rows** rather than samples under a token budget, because the meter
+reads `input_ids.shape[0]`; the recorder's `documents` field is the one to trust.
 
 **The Ascend variable-length kernel.** `run_qwen3_moe_flash_attention` opened with `del kwargs` and
 hard-coded `input_layout="BNSD"`, so the study's text attention discarded the document boundaries and
