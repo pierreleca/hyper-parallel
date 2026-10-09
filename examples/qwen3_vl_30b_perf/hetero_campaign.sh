@@ -87,8 +87,15 @@ case "${1:-}" in
     set -- "$DIR/plan.sh" ;;
 esac
 [[ $# -eq 1 ]] || { echo "usage: $0 <plan.sh> | --resume <campaign dir> [--rerun <run> ...] | --summarize <campaign dir>" >&2; exit 2; }
-PLAN="$(realpath "$1")"
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # this checkout's analysis scripts
+# A plan is named from the working directory, which is this repository's root because the plans set
+# CONFIG from there. A name that does not resolve there is looked up beside this script as well, so
+# `plans/hetero_packing_32dev.sh` and the bare `hetero_packing_32dev` both find it.
+PLAN="$1"
+for candidate in "$PLAN" "$TOOLS/$PLAN" "$TOOLS/plans/$PLAN" "$TOOLS/plans/${PLAN}.sh"; do
+  if [[ -f "$candidate" ]]; then PLAN="$(realpath "$candidate")"; break; fi
+done
+[[ -f "$PLAN" ]] || { echo "no such plan: $1 (looked in . and $TOOLS/plans)" >&2; exit 2; }
 COMPARE=() BASELINE=""
 # shellcheck source=/dev/null
 source "$PLAN"

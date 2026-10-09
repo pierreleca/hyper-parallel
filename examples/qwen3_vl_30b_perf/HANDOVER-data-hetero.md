@@ -15,6 +15,11 @@ Every default is unchanged — `padding="max_length"`, `text_only="keep"`, `pack
 
 ## Run these, in this order
 
+Every command below runs **from the repository root** on the control node, which is where the plans'
+`CONFIG=examples/...` paths resolve. The campaign looks a plan up from there and beside itself, so
+`plans/hetero_packing_32dev.sh` and the bare `hetero_packing_32dev` both work; a checkout without
+that lookup needs the full `examples/qwen3_vl_30b_perf/plans/...` path.
+
 **1. Prove it on the host. No cluster, no checkpoint, seconds.**
 
 ```bash
