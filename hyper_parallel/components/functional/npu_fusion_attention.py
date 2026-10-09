@@ -170,6 +170,12 @@ def resolve_packed_sequence_lengths(
         Cumulative query and key/value sequence ends without leading zeros.
     """
     kwargs = _packed_parameter_kwargs(kwargs)
+    # ``cu_seq_lens`` is read here rather than only out of a ``packed_seq_params`` carrier: a packed
+    # batch reaching a model's forward carries it as a plain keyword, and Transformers passes it on
+    # as one. Resolving it only inside the carrier left such a batch with no boundaries at all, which
+    # is not a degraded mask but a wrong one -- the dense branch asks for a single causal mask over
+    # the whole row, so every document attends to the ones packed before it. Self-attention gives
+    # the queries and the keys the same boundaries, so both lists read the same keyword.
     query_lengths = _coalesce_lengths(
         kwargs,
         (
@@ -177,6 +183,7 @@ def resolve_packed_sequence_lengths(
             ("actual_q_len", False),
             ("actual_seq_qlen", False),
             ("cu_seq_lens_q", True),
+            ("cu_seq_lens", True),
         ),
         name="query sequence lengths",
     )
@@ -187,6 +194,7 @@ def resolve_packed_sequence_lengths(
             ("actual_kv_len", False),
             ("actual_seq_kvlen", False),
             ("cu_seq_lens_k", True),
+            ("cu_seq_lens", True),
         ),
         name="key/value sequence lengths",
     )
@@ -313,7 +321,9 @@ def npu_fusion_attention_forward(
     Note:
         QKV inputs use four-dimensional BNSD layout. Packed inputs are flattened
         to TND when cumulative sequence lengths are supplied through the project
-        ``actual_*`` aliases or Transformers ``cu_seq_lens_*`` names. Float16,
+        ``actual_*`` aliases, Transformers ``cu_seq_lens_*`` names, or a plain
+        ``cu_seq_lens`` covering both sides, which is what a packed batch carries
+        into a model's forward. Float16,
         bfloat16, and float32 inputs have been verified. A boolean mask uses
         ``True`` for positions that participate in attention; an additive mask
         uses zero for those positions.

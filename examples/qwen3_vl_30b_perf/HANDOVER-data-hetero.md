@@ -229,10 +229,23 @@ wrong. It now hands such a batch to `components/functional/npu_fusion_attention.
 implements the TND contract, and is untouched otherwise. **The host cannot exercise this**, and the
 single-segment arm of step 4 cannot either: it showed the variable-length path landing on the dense
 path to within the run-to-run floor, which is worth having and is not the same statement, because one
-document a row is a plain causal row whichever path runs. `check_packed_attention.py` is the one that
-settles it, and until it has run on a die the isolation of two documents in one row rests on reading
-the code: TND, `sparse_mode` 3 and `actual_seq_qlen` from the boundaries, with `is_causal` defaulting
-to true through both `GQAAttention` and `_attention_options`.
+document a row is a plain causal row whichever path runs.
+
+`check_packed_attention.py` settled it, and found the consumer still broken. **Run 2026-10-09 on a
+die: `FAIL`, the row ran in `BNSD` with sparse mode 0 and the packed output stood 3.9 away from the
+separate documents** — one causal mask over the whole row, every document reading the ones packed
+before it. The cause was one layer further down than the `del kwargs` above:
+`resolve_packed_sequence_lengths` mapped the name `cu_seq_lens` onto `cu_seq_lens_q`/`_k` only inside
+`_packed_parameter_kwargs`, which returns its argument untouched when there is no
+`packed_seq_params` carrier. A packed batch carries the plain keyword, so it matched no alias, both
+length lists came back `None`, and the dense branch ran. Fixed by reading the plain keyword in the
+alias list itself, where a conflicting prefixed value still raises; seven unit tests, five of which
+fail against the old resolver.
+
+So **every packed arm run before 2026-10-09 is void**, numerics and timing both: they trained with
+documents attending across their boundaries, and they asked the kernel for a full `[S, S]` causal
+mask instead of the compressed `2048 x 2048` one that `sparse_mode` 3 uses. Rerun
+`check_packed_attention.py` first — it must report `TND`, sparse mode 3 — then the arms.
 
 **A rank that genuinely skips the vision tower still hangs.** `text_only = placeholder` side-steps it
 with the smallest image the tower accepts — one blank merge block, one image token, label masked,
